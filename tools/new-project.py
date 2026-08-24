@@ -77,7 +77,11 @@ def main(argv=None) -> int:
     use = [x.strip() for x in args.libs.split(",") if x.strip()]
     # 校验库名在全局清单存在
     gm = manifest.load_global_manifest(MINE_ROOT)
-    manifest.resolve_libs(gm, use)  # 未定义会抛 KeyError
+    try:
+        manifest.resolve_libs(gm, use)  # 未定义会抛 KeyError
+    except KeyError as e:
+        print(f"错误: {e}", file=sys.stderr)
+        return 2
 
     find_frag, link_frag = _build_find_link(use)
     ctx = {

@@ -15,6 +15,8 @@ def main(argv=None) -> int:
     g.add_argument("--all", action="store_true", help="拉取全局清单全部库")
     p.add_argument("--jobs", type=int, default=4, help="并行 clone 数(默认 4)")
     args = p.parse_args(argv)
+    if args.jobs < 1:
+        p.error("--jobs 必须 ≥ 1")
 
     libs = fetch.collect_libs(args)
     if not libs:

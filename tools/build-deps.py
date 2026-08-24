@@ -30,6 +30,8 @@ def main(argv=None) -> int:
     p.add_argument("--variant", default="all", help="release|debug|all(默认 all)")
     p.add_argument("--jobs", type=int, default=os.cpu_count() or 4, help="ninja -j(默认 CPU 核数)")
     args = p.parse_args(argv)
+    if args.jobs < 1:
+        p.error("--jobs 必须 ≥ 1")
 
     gm = manifest.load_global_manifest(MINE_ROOT)
     libs = _collect_libs(args)
@@ -42,6 +44,12 @@ def main(argv=None) -> int:
     lock = pool.load_lock(MINE_ROOT)
 
     for lib in libs:
+        if not pool.is_fetched(MINE_ROOT, lib.name, lib.tag):
+            ok, msg = fetch.clone_lib(MINE_ROOT, lib)
+            if not ok:
+                summary["failed"].append(f"{manifest.ver_dir(lib.name, lib.tag)} [fetch] {msg}")
+                print(f"  拉取失败: {msg}", file=sys.stderr)
+                continue
         for v in variants:
             key = f"{manifest.ver_dir(lib.name, lib.tag)} [{v}]"
             if pool.is_built(MINE_ROOT, lib.name, lib.tag, v):

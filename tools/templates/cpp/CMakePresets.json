@@ -1,8 +1,8 @@
 {
   "version": 6,
   "configurePresets": [
-    { "name": "debug",   "displayName": "Debug",   "binaryDir": "${sourceDir}/build/debug",   "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",   "CMAKE_PREFIX_PATH": "${sourceDir}/../third_party/_install" } },
-    { "name": "release", "displayName": "Release", "binaryDir": "${sourceDir}/build/release", "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "CMAKE_PREFIX_PATH": "${sourceDir}/../third_party/_install" } }
+    { "name": "debug",   "binaryDir": "${sourceDir}/build/debug",   "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" } },
+    { "name": "release", "binaryDir": "${sourceDir}/build/release", "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" } }
   ],
   "buildPresets": [
     { "name": "debug",   "configurePreset": "debug" },

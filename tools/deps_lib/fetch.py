@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 
@@ -25,9 +26,11 @@ def clone_lib(root: str, lib: LibSpec):
         # 回退:全量克隆后 checkout 任意 ref(含 commit sha)
         r2 = subprocess.run(["git", "clone", lib.repo, src], capture_output=True, text=True)
         if r2.returncode != 0:
+            shutil.rmtree(src, ignore_errors=True)
             return False, (r.stderr + "\n" + r2.stderr).strip()
         r3 = subprocess.run(["git", "-C", src, "checkout", lib.tag], capture_output=True, text=True)
         if r3.returncode != 0:
+            shutil.rmtree(src, ignore_errors=True)
             return False, r3.stderr.strip()
 
     rc = subprocess.run(["git", "-C", src, "rev-parse", "HEAD"], capture_output=True, text=True)
