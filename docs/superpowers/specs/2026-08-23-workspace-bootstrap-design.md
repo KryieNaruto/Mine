@@ -259,9 +259,18 @@ sys.exit(os.system(f'"{sys.executable}" "{ROOT}/tools/fetch-deps.py" --project "
 cmake_minimum_required(VERSION 3.22)
 project(<项目名> CXX)
 
-# 池 install 前缀:优先取缓存变量,否则推导 MINE_ROOT
-set(MINE_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." CACHE PATH "Mine workspace root")
-set(CMAKE_PREFIX_PATH "${MINE_ROOT}/third_party/_install")
+# 池根:优先取缓存变量,否则推导 MINE_ROOT
+set(MINE_ROOT "$ENV{MINE_ROOT}" CACHE PATH "Mine workspace root")
+if(NOT MINE_ROOT)
+  set(MINE_ROOT "${CMAKE_CURRENT_LIST_DIR}/..")
+endif()
+
+# 变体解析:CMAKE_BUILD_TYPE(Release/Debug)→ 池产物子目录(release/debug)
+# 产物在 _install/<name>-<ver>/<variant>/ 下,故按 variant glob 出各库前缀加入 CMAKE_PREFIX_PATH
+string(TOLOWER "${CMAKE_BUILD_TYPE}" _variant)
+file(GLOB _pool_dirs LIST_DIRECTORIES true
+     "${MINE_ROOT}/third_party/_install/*/${_variant}")
+list(APPEND CMAKE_PREFIX_PATH ${_pool_dirs})
 
 # 按需 find_package(由 new-project.py 按 use 集生成)
 find_package(fmt CONFIG REQUIRED)
@@ -272,14 +281,14 @@ add_executable(<项目名> src/main.cpp)
 target_link_libraries(<项目名> PRIVATE fmt::fmt spdlog::spdlog glm::glm)
 ```
 
-**变体对应关系**:项目 `CMAKE_BUILD_TYPE` 必须与池产物变体一致 —— `Debug` preset 链接 `_install/<name>-<ver>/debug`, `Release` preset 链接 `_install/<name>-<ver>/release`。通过 `CMakePresets.json` 固定:
+**变体对应关系**:项目 `CMAKE_BUILD_TYPE` 决定链接哪个池产物变体 —— 由 `string(TOLOWER "${CMAKE_BUILD_TYPE}" _variant)` 得到小写 `release`/`debug`,再 `file(GLOB _install/*/${_variant})` 把该变体下各库前缀加入 `CMAKE_PREFIX_PATH`。`CMakePresets.json` 只固定 `CMAKE_BUILD_TYPE`,不再硬编码前缀路径:
 
 ```json
 {
   "version": 6,
   "configurePresets": [
-    { "name": "debug",   "binaryDir": "${sourceDir}/build/debug",   "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug",   "CMAKE_PREFIX_PATH": "${sourceDir}/../third_party/_install" } },
-    { "name": "release", "binaryDir": "${sourceDir}/build/release", "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "CMAKE_PREFIX_PATH": "${sourceDir}/../third_party/_install" } }
+    { "name": "debug",   "binaryDir": "${sourceDir}/build/debug",   "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" } },
+    { "name": "release", "binaryDir": "${sourceDir}/build/release", "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" } }
   ],
   "buildPresets": [
     { "name": "debug",   "configurePreset": "debug" },
@@ -288,7 +297,7 @@ target_link_libraries(<项目名> PRIVATE fmt::fmt spdlog::spdlog glm::glm)
 }
 ```
 
-**约束与风险**:库的 `find_package` config 在 debug/release 下可能不同(如 MSVC 需要 `-DCMAKE_DEBUG_POSTFIX`);初版在 Linux/GCC 单一 toolchain 下工作,`find_package` 具体 target 名(lib::lib)由各库决定。若某库无 CMake config 或 target 名不同,在项目 CMakeLists 注释说明,或走 `add_library(... INTERFACE)` 兜底。
+**约束与风险**:库的 `find_package` config 在 debug/release 下可能不同(如 MSVC 需要 `-DCMAKE_DEBUG_POSTFIX`);初版在 Linux/GCC 单一 toolchain 下工作,`find_package` 具体 target 名(lib::lib)由各库决定。若某库无 CMake config 或 target 名不同,在项目 CMakeLists 注释说明,或走 `add_library(... INTERFACE)` 兜底。variant 目录依赖 `CMAKE_BUILD_TYPE` 非空;单配置生成器(如 Ninja)下由 preset 显式指定,不会为空。
 
 ## 9. gitignore 策略
 
