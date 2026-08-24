@@ -19,7 +19,24 @@ find_package(absl CONFIG REQUIRED)
 find_package(glm CONFIG REQUIRED)
 find_package(GTest CONFIG REQUIRED)
 find_package(InkStrokeModeler CONFIG REQUIRED)
+find_package(Vulkan REQUIRED)
 # glfw:仅 windowed 目标(easypainter)需要,在 Task 6 目标作用域 find_package;headless/CLI 构建不依赖
+
+# --- shader:glslc 编译 GLSL → SPIR-V,再嵌入 C++ 头(运行期无文件路径依赖) ---
+add_custom_command(
+  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/stroke.vert.spv ${CMAKE_CURRENT_BINARY_DIR}/stroke.frag.spv
+  COMMAND glslc -fshader-stage=vert -o ${CMAKE_CURRENT_BINARY_DIR}/stroke.vert.spv ${CMAKE_CURRENT_SOURCE_DIR}/shaders/stroke.vert
+  COMMAND glslc -fshader-stage=frag -o ${CMAKE_CURRENT_BINARY_DIR}/stroke.frag.spv ${CMAKE_CURRENT_SOURCE_DIR}/shaders/stroke.frag
+  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/shaders/stroke.vert ${CMAKE_CURRENT_SOURCE_DIR}/shaders/stroke.frag
+  VERBATIM)
+add_custom_command(
+  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/stroke_shaders.h
+  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/shaders/embed_shaders.py
+          ${CMAKE_CURRENT_BINARY_DIR}/stroke.vert.spv
+          ${CMAKE_CURRENT_BINARY_DIR}/stroke.frag.spv
+          ${CMAKE_CURRENT_BINARY_DIR}/stroke_shaders.h
+  DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/stroke.vert.spv ${CMAKE_CURRENT_BINARY_DIR}/stroke.frag.spv
+  VERBATIM)
 
 # --- imgui:项目内 vendor,不走池(官方无稳定 install config) ---
 add_library(imgui STATIC
@@ -35,8 +52,18 @@ add_library(easypainter_core STATIC
   src/core/stroke/input_source.h
   src/core/stroke/input_source.cpp
   src/core/stroke/predictor.h
-  src/core/stroke/predictor.cpp)
+  src/core/stroke/predictor.cpp
+  src/core/render/image_io.h
+  src/core/render/image_io.cpp
+  src/core/render/vulkan_context.h
+  src/core/render/vulkan_context.cpp
+  src/core/render/pipeline.h
+  src/core/render/pipeline.cpp
+  src/core/render/offscreen.h
+  src/core/render/offscreen.cpp
+  ${CMAKE_CURRENT_BINARY_DIR}/stroke_shaders.h)
 target_include_directories(easypainter_core PUBLIC src)
+target_include_directories(easypainter_core PRIVATE vendor ${CMAKE_CURRENT_BINARY_DIR})
 
 # ink 导出 targets 不带 include dir(Task 1 实测),手动补池前缀 include(variant 无关)
 set(_ink_inc "${MINE_ROOT}/third_party/_install/ink-stroke-modeler-main/${_variant}/include")
@@ -45,7 +72,7 @@ if(EXISTS "${_ink_inc}")
 endif()
 
 target_link_libraries(easypainter_core PUBLIC
-  InkStrokeModeler::stroke_modeler glm::glm)
+  InkStrokeModeler::stroke_modeler glm::glm Vulkan::Vulkan)
 
 # --- 测试 ---
 enable_testing()
@@ -53,3 +80,7 @@ include(GoogleTest)
 add_executable(stroke_test tests/stroke_test.cpp)
 target_link_libraries(stroke_test PRIVATE easypainter_core GTest::gtest GTest::gtest_main)
 gtest_discover_tests(stroke_test)
+
+add_executable(image_golden_test tests/image_golden_test.cpp)
+target_link_libraries(image_golden_test PRIVATE easypainter_core GTest::gtest GTest::gtest_main)
+gtest_discover_tests(image_golden_test)
