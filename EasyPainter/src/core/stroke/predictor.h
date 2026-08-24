@@ -8,14 +8,19 @@
 namespace easypainter::stroke {
 
 // 预测器参数(映射 ink::stroke_model::StrokeModelParams 的可调字段)。
-// Task 3 据此构造合法可运行的 StrokeModelParams。
+// 默认值对齐 ink 测试 kDefaultParams(cm/秒单位),保证合法可运行与 golden 可复现。
 struct PredictorConfig {
   // 位置弹簧模型:质量/弹簧常数、拖拽常数。
   float spring_mass_constant = 11.f / 32400.f;
   float drag_constant = 72.f;
-  // 最小输出速率(单位时间点数);输入慢于此时会补插值。
-  double min_output_rate = 20.0;
-  // 预测区间(秒),Kalman 预测超出末点的时长。
+  // 采样:最小输出速率(单位时间点数)、笔画结束停止距离。
+  double min_output_rate = 180.0;
+  double end_of_stroke_stopping_distance = 0.001;
+  // wobble 平滑:超时窗口、速度上下限。
+  double wobble_timeout_s = 0.04;
+  float wobble_speed_floor = 1.31f;
+  float wobble_speed_ceiling = 1.44f;
+  // 预测区间(秒);当前用 StrokeEndPredictor,仅保留供 Kalman 扩展。
   double prediction_interval_s = 0.08;
 };
 
