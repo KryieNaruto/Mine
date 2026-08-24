@@ -74,6 +74,10 @@ endif()
 target_link_libraries(easypainter_core PUBLIC
   InkStrokeModeler::stroke_modeler glm::glm Vulkan::Vulkan)
 
+# --- CLI:无头离屏渲染(不依赖 GLFW/窗口) ---
+add_executable(easypainter-cli src/cli/main.cpp src/cli/example_points.h)
+target_link_libraries(easypainter-cli PRIVATE easypainter_core)  # Vulkan 经 core 的 PUBLIC 传递
+
 # --- 测试 ---
 enable_testing()
 include(GoogleTest)
