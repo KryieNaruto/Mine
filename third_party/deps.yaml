@@ -1,0 +1,15 @@
+# 全局三方库清单 —— 唯一事实来源。
+# 项目侧只通过 deps.yaml 的 `use` 列表引用这里的库名。
+default_variant: release
+variants: [release, debug]
+
+libs:
+  fmt:
+    repo: https://github.com/fmtlib/fmt.git
+    tag: "10.2.1"
+    build: cmake
+    options: [FMT_TEST=OFF]
+  glm:
+    repo: https://github.com/g-truc/glm.git
+    tag: "1.0.1"
+    build: cmake

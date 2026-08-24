@@ -1,0 +1,20 @@
+# 第三方池:源码 / 中间构建 / 预编译产物 / 状态锁
+third_party/_src/
+third_party/_build/
+third_party/_install/
+third_party/.pool.lock.json
+
+# 构建产物
+build/
+*.o
+*.a
+*.so
+*.dylib
+
+# Python
+__pycache__/
+*.pyc
+
+# IDE
+.idea/
+.vscode/
