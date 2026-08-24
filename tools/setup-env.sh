@@ -31,6 +31,27 @@ chk() { # name 最低版本 探测命令 详情
   if [ "$ok" = 1 ]; then printf '[OK]   %s: %s\n' "$name" "${v:-已安装}"; else printf '[MISS] %s: 缺失或版本过低\n' "$name"; fi
 }
 
+chk_pc() { # name pkg-config 包名
+  local name="$1" pkg="$2" v=""
+  if pkg-config --exists "$pkg" 2>/dev/null; then
+    v="$(pkg-config --modversion "$pkg" 2>/dev/null || true)"
+    printf '[OK]   %s: %s\n' "$name" "${v:-已安装}"
+  else
+    HARD_MISS=$((HARD_MISS+1)); MISS_DETAILS+=("$name")
+    printf '[MISS] %s: 缺失\n' "$name"
+  fi
+}
+
+chk_cmd() { # name 命令
+  local name="$1" cmd="$2"
+  if has "$cmd"; then
+    printf '[OK]   %s: 已安装\n' "$name"
+  else
+    HARD_MISS=$((HARD_MISS+1)); MISS_DETAILS+=("$name")
+    printf '[MISS] %s: 缺失\n' "$name"
+  fi
+}
+
 probe() {
   info "=== 系统工具链探测 ==="
   HARD_MISS=0; MISS_DETAILS=()
@@ -40,6 +61,18 @@ probe() {
   chk "pkg-config" ""     "pkg-config --version"
   chk "git"        ""     "git --version"
   chk "python3"    "3.8"  "python3 --version"
+  # Vulkan / shaderc / X11 / Wayland(EasyPainter 渲染端 + GLFW 编译所需)
+  chk_pc "vulkan" "vulkan"
+  chk_cmd "glslc" "glslc"
+  chk_pc "x11" "x11"
+  chk_pc "wayland" "wayland"
+}
+
+lavapipe_hint() {
+  # 可选:无 GPU 时给出软件光栅建议,不阻塞
+  if ! ls /dev/dri/* >/dev/null 2>&1; then
+    warn "未检测到 GPU 设备(/dev/dri 为空);离屏渲染可装 mesa-vulkan-drivers(lavapipe)"
+  fi
 }
 
 print_help() {
@@ -60,7 +93,10 @@ attempt_apt() {
   fi
   info "将 sudo apt-get 安装缺失硬依赖(需 root 权限,Ctrl-C 取消):"
   sudo apt-get update && sudo apt-get install -y \
-    cmake ninja-build build-essential pkg-config git python3
+    cmake ninja-build build-essential pkg-config git python3 \
+    libvulkan-dev vulkan-headers glslc \
+    libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
+    libwayland-dev libxkbcommon-dev wayland-protocols
 }
 
 main() {
@@ -77,6 +113,7 @@ main() {
   probe
   if [ "$HARD_MISS" -eq 0 ]; then
     info "硬依赖齐全。"
+    lavapipe_hint
     exit 0
   fi
 

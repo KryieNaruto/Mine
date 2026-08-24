@@ -7,10 +7,56 @@ import os
 import sys
 
 from deps_lib import MINE_ROOT, cmake_driver, fetch, manifest, pool
+from deps_lib.manifest import LibSpec
 
 
 def _collect_libs(args) -> list:
     return fetch.collect_libs(args)
+
+
+def topo_expand(libs: list, global_libs: dict) -> list:
+    """把 depends_on 传递闭包并入需集,返回拓扑先序列表(依赖在前)。
+
+    环检测:访问中再遇 → RuntimeError;缺定义 → RuntimeError。
+    """
+    by_name = {lib.name: lib for lib in libs}
+    order = []
+    state = {}  # 0=未访问 1=访问中 2=完成
+
+    def _spec_of(name: str) -> LibSpec:
+        lib = by_name.get(name)
+        if lib is not None:
+            return lib
+        d = global_libs.get(name)
+        if d is None:
+            raise RuntimeError(f"依赖库 '{name}' 未在全局清单定义")
+        lib = LibSpec(
+            name=name,
+            repo=d["repo"],
+            tag=str(d["tag"]),
+            build=d.get("build", "cmake"),
+            options=d.get("options", []) or [],
+            depends_on=d.get("depends_on", []) or [],
+        )
+        by_name[name] = lib
+        return lib
+
+    def visit(name: str, stack: list) -> None:
+        st = state.get(name, 0)
+        if st == 2:
+            return
+        if st == 1:
+            raise RuntimeError(f"依赖环: {' -> '.join(stack + [name])}")
+        state[name] = 1
+        lib = _spec_of(name)
+        for dep in lib.depends_on:
+            visit(dep, stack + [name])
+        state[name] = 2
+        order.append(lib)
+
+    for lib in libs:
+        visit(lib.name, [lib.name])
+    return order
 
 
 def _target_variants(gm: dict, arg: str) -> list:
@@ -34,7 +80,12 @@ def main(argv=None) -> int:
         p.error("--jobs 必须 ≥ 1")
 
     gm = manifest.load_global_manifest(MINE_ROOT)
-    libs = _collect_libs(args)
+    raw = _collect_libs(args)
+    try:
+        libs = topo_expand(raw, gm.get("libs", {}) or {})
+    except RuntimeError as e:
+        print(f"依赖拓扑错误: {e}", file=sys.stderr)
+        return 2
     variants = _target_variants(gm, args.variant)
     if not libs:
         print("无需要编译的库。")

@@ -14,9 +14,11 @@ class LibSpec:
     tag: str
     build: str = "cmake"
     options: tuple = ()
+    depends_on: tuple = ()
 
     def __post_init__(self):
         object.__setattr__(self, "options", tuple(self.options or ()))
+        object.__setattr__(self, "depends_on", tuple(self.depends_on or ()))
 
 
 def ver_dir(name: str, tag: str) -> str:
@@ -59,6 +61,7 @@ def resolve_libs(global_manifest: dict, use: list) -> list:
             tag=str(d["tag"]),
             build=d.get("build", "cmake"),
             options=d.get("options", []) or [],
+            depends_on=d.get("depends_on", []) or [],
         ))
     return out
 

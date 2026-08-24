@@ -13,3 +13,23 @@ libs:
     repo: https://github.com/g-truc/glm.git
     tag: "1.0.1"
     build: cmake
+  abseil-cpp:
+    repo: https://github.com/abseil/abseil-cpp.git
+    tag: "20260817.0"
+    build: cmake
+    options: [ABSL_BUILD_TESTING=OFF, CMAKE_CXX_STANDARD=20]
+  ink-stroke-modeler:
+    repo: https://github.com/google/ink-stroke-modeler.git
+    tag: "main"
+    build: cmake
+    options: [INK_STROKE_MODELER_FIND_DEPENDENCIES=ON, INK_STROKE_MODELER_FIND_ABSL=ON, INK_STROKE_MODELER_FIND_GTEST=OFF, INK_STROKE_MODELER_BUILD_TESTING=OFF]
+    depends_on: [abseil-cpp]
+  glfw:
+    repo: https://github.com/glfw/glfw.git
+    tag: "3.4"
+    build: cmake
+    options: [GLFW_BUILD_EXAMPLES=OFF, GLFW_BUILD_TESTS=OFF, GLFW_BUILD_DOCS=OFF]
+  googletest:
+    repo: https://github.com/google/googletest.git
+    tag: "v1.15.2"
+    build: cmake

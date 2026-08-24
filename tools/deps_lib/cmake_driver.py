@@ -8,6 +8,19 @@ from . import pool
 from .manifest import LibSpec
 
 
+def _built_prefixes(root: str, variant: str) -> list:
+    """扫描 _install/*/<variant>/,返回含 .built 标记的安装前缀(字典序稳定)。"""
+    install_root = os.path.join(root, "third_party", "_install")
+    if not os.path.isdir(install_root):
+        return []
+    out = []
+    for name in sorted(os.listdir(install_root)):
+        vdir = os.path.join(install_root, name, variant)
+        if os.path.isfile(os.path.join(vdir, ".built")):
+            out.append(vdir)
+    return out
+
+
 def configure_command(root: str, lib: LibSpec, variant: str) -> list:
     src = pool.src_dir(root, lib.name, lib.tag)
     bdir = pool.build_dir(root, lib.name, lib.tag, variant)
@@ -19,6 +32,10 @@ def configure_command(root: str, lib: LibSpec, variant: str) -> list:
     ]
     for opt in lib.options:
         cmd.append("-D" + opt)
+    # 注入池内已建前缀,使 find_package(absl) 等能命中池产物
+    prefixes = _built_prefixes(root, variant)
+    if prefixes:
+        cmd.append("-DCMAKE_PREFIX_PATH=" + ";".join(prefixes))
     return cmd
 
 
