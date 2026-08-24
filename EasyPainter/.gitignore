@@ -1,0 +1,11 @@
+# 构建产物
+build/
+*.o
+*.a
+*.so
+*.spv
+
+# 离屏测试产物 PNG(除非作为 golden 显式提交)
+*.png
+
+# .user-deps 由根 .gitignore 覆盖,此处不重复
