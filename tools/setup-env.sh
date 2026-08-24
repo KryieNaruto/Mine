@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-# 系统工具链检测/安装:cmake / ninja / g++ / pkg-config / git / python3。
-# 只装系统依赖,不碰三方库(拉取/编译由 fetch-deps.py / build-deps.py 负责)。
+# 系统工具链检测:cmake / ninja / g++ / pkg-config / git / python3 + 用户级系统依赖部署状态。
+# 无 sudo 场景:Vulkan/X11/lavapipe/Xvfb 由 tools/install-user-deps.sh 用户级部署到 .user-deps/。
 set -euo pipefail
 
 info() { printf '%s\n' "$*"; }
 warn() { printf 'WARN: %s\n' "$*" >&2; }
 err()  { printf 'ERROR: %s\n' "$*" >&2; }
 has()  { command -v "$1" >/dev/null 2>&1; }
+
+MINE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+USER_DEPS_ENV="$MINE_ROOT/.user-deps/env.sh"
 
 extract_version() {
   local s="$1"
@@ -31,24 +34,12 @@ chk() { # name 最低版本 探测命令 详情
   if [ "$ok" = 1 ]; then printf '[OK]   %s: %s\n' "$name" "${v:-已安装}"; else printf '[MISS] %s: 缺失或版本过低\n' "$name"; fi
 }
 
-chk_pc() { # name pkg-config 包名
-  local name="$1" pkg="$2" v=""
-  if pkg-config --exists "$pkg" 2>/dev/null; then
-    v="$(pkg-config --modversion "$pkg" 2>/dev/null || true)"
-    printf '[OK]   %s: %s\n' "$name" "${v:-已安装}"
+chk_user_deps() {
+  if [ -f "$USER_DEPS_ENV" ]; then
+    printf '[OK]   user-deps: %s\n' "$USER_DEPS_ENV"
   else
-    HARD_MISS=$((HARD_MISS+1)); MISS_DETAILS+=("$name")
-    printf '[MISS] %s: 缺失\n' "$name"
-  fi
-}
-
-chk_cmd() { # name 命令
-  local name="$1" cmd="$2"
-  if has "$cmd"; then
-    printf '[OK]   %s: 已安装\n' "$name"
-  else
-    HARD_MISS=$((HARD_MISS+1)); MISS_DETAILS+=("$name")
-    printf '[MISS] %s: 缺失\n' "$name"
+    HARD_MISS=$((HARD_MISS+1)); MISS_DETAILS+=("user-deps(Vulkan/X11/lavapipe/Xvfb)")
+    printf '[MISS] user-deps: 未部署(Vulkan 头/glslc/X11/lavapipe 用户级依赖)\n'
   fi
 }
 
@@ -61,17 +52,13 @@ probe() {
   chk "pkg-config" ""     "pkg-config --version"
   chk "git"        ""     "git --version"
   chk "python3"    "3.8"  "python3 --version"
-  # Vulkan / shaderc / X11 / Wayland(EasyPainter 渲染端 + GLFW 编译所需)
-  chk_pc "vulkan" "vulkan"
-  chk_cmd "glslc" "glslc"
-  chk_pc "x11" "x11"
-  chk_pc "wayland" "wayland"
+  chk_user_deps
 }
 
 lavapipe_hint() {
   # 可选:无 GPU 时给出软件光栅建议,不阻塞
   if ! ls /dev/dri/* >/dev/null 2>&1; then
-    warn "未检测到 GPU 设备(/dev/dri 为空);离屏渲染可装 mesa-vulkan-drivers(lavapipe)"
+    warn "未检测到 GPU 设备(/dev/dri 为空);离屏渲染依赖 lavapipe(已由 install-user-deps.sh 部署)"
   fi
 }
 
@@ -79,28 +66,19 @@ print_help() {
   cat <<'EOF'
 用法: tools/setup-env.sh [--check] [--help]
 
-  检测/安装系统工具链(cmake/ninja/g++/pkg-config/git/python3)。
-  --check    只探测不安装;硬依赖缺失时非零退出。
+  检测系统工具链(cmake/ninja/g++/pkg-config/git/python3)与用户级系统依赖部署状态。
+  --check    只探测;硬依赖缺失时非零退出。
   -h,--help  打印本帮助。
-  默认       探测;硬依赖缺失且存在 apt-get 时 sudo 自动安装,否则打印指引。
+  默认       探测;缺失时打印修复指引,非零退出(无 sudo 自动安装)。
+
+用户级系统依赖(Vulkan SDK / X11 头 / lavapipe / Xvfb)缺失时,先执行:
+    tools/install-user-deps.sh
+  再于每个构建/运行 shell 中 source .user-deps/env.sh。
 EOF
 }
 
-attempt_apt() {
-  if ! has apt-get; then
-    warn "未检测到 apt-get,无法自动安装。请手动安装缺失项: ${MISS_DETAILS[*]}"
-    return 1
-  fi
-  info "将 sudo apt-get 安装缺失硬依赖(需 root 权限,Ctrl-C 取消):"
-  sudo apt-get update && sudo apt-get install -y \
-    cmake ninja-build build-essential pkg-config git python3 \
-    libvulkan-dev vulkan-headers glslc \
-    libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
-    libwayland-dev libxkbcommon-dev wayland-protocols
-}
-
 main() {
-  local mode="install"
+  local mode="check"
   if [ "$#" -gt 1 ]; then err "参数过多: $*"; exit 2; fi
   if [ "$#" -eq 1 ]; then
     case "$1" in
@@ -112,23 +90,13 @@ main() {
 
   probe
   if [ "$HARD_MISS" -eq 0 ]; then
-    info "硬依赖齐全。"
+    info "硬依赖齐全。构建前先 source .user-deps/env.sh。"
     lavapipe_hint
     exit 0
   fi
 
-  if [ "$mode" = "check" ]; then
-    err "硬依赖缺失 ${HARD_MISS} 项: ${MISS_DETAILS[*]}"
-    exit 1
-  fi
-
-  if attempt_apt; then
-    info "安装完成,重新探测:"
-    probe
-    [ "$HARD_MISS" -eq 0 ] && exit 0
-    err "安装后仍有缺失: ${MISS_DETAILS[*]}"
-    exit 1
-  fi
+  err "硬依赖缺失 ${HARD_MISS} 项: ${MISS_DETAILS[*]}"
+  warn "Vulkan/X11/lavapipe/Xvfb 为无 sudo 用户级部署,请先执行: tools/install-user-deps.sh"
   exit 1
 }
 

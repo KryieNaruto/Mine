@@ -4,6 +4,9 @@ third_party/_build/
 third_party/_install/
 third_party/.pool.lock.json
 
+# 用户级系统依赖部署(无 sudo):Vulkan SDK / X11 头 / lavapipe / Xvfb
+.user-deps/
+
 # 构建产物
 build/
 *.o
