@@ -87,4 +87,7 @@ gtest_discover_tests(stroke_test)
 
 add_executable(image_golden_test tests/image_golden_test.cpp)
 target_link_libraries(image_golden_test PRIVATE easypainter_core GTest::gtest GTest::gtest_main)
+target_include_directories(image_golden_test PRIVATE vendor)
+target_compile_definitions(image_golden_test PRIVATE
+  GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
 gtest_discover_tests(image_golden_test)
