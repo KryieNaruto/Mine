@@ -12,9 +12,13 @@ void render_tuning_panel(stroke::PredictorConfig& cfg, bool& dirty, float latenc
                          stroke::Predictor* predictor) {
   ImGui::Begin("EasyPainter 调参");
   ImGui::Text("最近预测延迟: %.2f ms", latency_ms);
+  // 各滑杆的(min,max)即"可调范围";每个参数的物理含义与调大/调小效果见
+  // predictor.h 中 PredictorConfig 的逐字段注释。
+  // 位置弹簧模型(影响跟手度/平滑度)。
   dirty |= ImGui::SliderFloat("spring_mass_constant", &cfg.spring_mass_constant,
                               0.0001f, 0.01f, "%.5f");
   dirty |= ImGui::SliderFloat("drag_constant", &cfg.drag_constant, 1.f, 200.f, "%.1f");
+  // 采样(输出点密度/笔画收尾)。
   float mor = static_cast<float>(cfg.min_output_rate);
   if (ImGui::SliderFloat("min_output_rate", &mor, 10.f, 500.f, "%.0f")) {
     cfg.min_output_rate = mor;
@@ -26,6 +30,7 @@ void render_tuning_panel(stroke::PredictorConfig& cfg, bool& dirty, float latenc
     cfg.end_of_stroke_stopping_distance = eosd;
     dirty = true;
   }
+  // wobble 平滑(抖动抑制,按速度阈值插值平滑强度)。
   float wob_t = static_cast<float>(cfg.wobble_timeout_s);
   if (ImGui::SliderFloat("wobble_timeout_s", &wob_t, 0.f, 0.2f, "%.3f")) {
     cfg.wobble_timeout_s = wob_t;

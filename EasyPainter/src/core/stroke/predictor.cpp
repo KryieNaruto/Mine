@@ -16,20 +16,28 @@ namespace {
 // 由 PredictorConfig 构造合法可运行的 StrokeModelParams(基准对齐 ink 测试 kDefaultParams)。
 ism::StrokeModelParams BuildParams(const PredictorConfig& cfg) {
   ism::StrokeModelParams p;
+  // wobble 平滑:开启后按速度阈值抑制输入抖动(参数来自 cfg,见 predictor.h)。
   p.wobble_smoother_params.is_enabled = true;
   p.wobble_smoother_params.timeout = ism::Duration(cfg.wobble_timeout_s);
   p.wobble_smoother_params.speed_floor = cfg.wobble_speed_floor;
   p.wobble_smoother_params.speed_ceiling = cfg.wobble_speed_ceiling;
   p.position_modeler_params.spring_mass_constant = cfg.spring_mass_constant;
   p.position_modeler_params.drag_constant = cfg.drag_constant;
+  // 环路收缩抑制(loop contraction mitigation):关闭。
+  // 该功能缓解"快速画圈时弹簧模型越画越小"的收缩效应,但要求法线投影(true)配合;
+  // 当前刻意关闭以对齐 ink 官方 golden(与 kDefaultParams 一致),开启需再提供速度/强度参数。
   p.position_modeler_params.loop_contraction_mitigation_params.is_enabled = false;
   p.position_modeler_params.loop_contraction_mitigation_params.min_speed_sampling_window =
       ism::Duration(0);
   p.sampling_params.min_output_rate = cfg.min_output_rate;
   p.sampling_params.end_of_stroke_stopping_distance =
       static_cast<float>(cfg.end_of_stroke_stopping_distance);
+  // 收尾建模最大迭代 20 次(ink 默认):即使未达 stopping_distance 也强制终止,防死循环。
   p.sampling_params.end_of_stroke_max_iterations = 20;
+  // 非位置状态(压力/倾角/朝向)的投影方式:false = 取原始输入折线上距笔尖最近的点;
+  // 法线投影(true)精度更高,但需与环路收缩配合,当前保持关闭以对齐 golden。
   p.stylus_state_modeler_params.use_stroke_normal_projection = false;
+  // 预测策略:StrokeEndPredictor(仅"快速追平"最后输入,不真正外推未来)。
   p.prediction_params = ism::StrokeEndPredictorParams{};
   return p;
 }
