@@ -1,0 +1,2 @@
+# 运行时在 CWD 生成的默认便签数据文件（GUI 与 CLI 均写入；根 .gitignore 已覆盖 build/ 与 imgui.ini）
+stickynotes.json
