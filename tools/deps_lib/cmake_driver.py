@@ -35,6 +35,10 @@ def configure_command(root: str, lib: LibSpec, variant: str) -> list:
         cmd.append("-D" + opt)
     # 注入池内已建前缀,使 find_package(absl) 等能命中池产物
     prefixes = _built_prefixes(root, variant)
+    # Windows 上额外注入 MSYS2 包根(/mingw64),使 find_package 命中 pacman 预编译包
+    # (如 mingw-w64-x86_64-abseil-cpp 的 abslConfig.cmake)
+    if pool.on_windows() and os.path.isdir("/mingw64/lib/cmake"):
+        prefixes.append("/mingw64")
     if prefixes:
         cmd.append("-DCMAKE_PREFIX_PATH=" + ";".join(prefixes))
     return cmd

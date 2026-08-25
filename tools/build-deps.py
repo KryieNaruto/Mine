@@ -37,6 +37,7 @@ def topo_expand(libs: list, global_libs: dict) -> list:
             build=d.get("build", "cmake"),
             options=d.get("options", []) or [],
             depends_on=d.get("depends_on", []) or [],
+            windows_package=d.get("windows_package", "") or "",
         )
         by_name[name] = lib
         return lib
@@ -95,6 +96,11 @@ def main(argv=None) -> int:
     lock = pool.load_lock(MINE_ROOT)
 
     for lib in libs:
+        # Windows 上由 pacman 预编译包提供的库:不 fetch、不编译,直接视为满足
+        if pool.is_pacman_provided(MINE_ROOT, lib.name):
+            for v in variants:
+                summary["skipped"].append(f"{manifest.ver_dir(lib.name, lib.tag)} [{v}] (pacman)")
+            continue
         if not pool.is_fetched(MINE_ROOT, lib.name, lib.tag):
             ok, msg = fetch.clone_lib(MINE_ROOT, lib)
             if not ok:

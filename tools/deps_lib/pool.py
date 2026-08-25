@@ -3,8 +3,45 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 
 from .manifest import ver_dir
+
+
+def on_windows() -> bool:
+    """是否为 Windows(MSYS2/Git Bash 下 uname -s 报 MSYS*/MINGW*)。"""
+    try:
+        uname = subprocess.run(["uname", "-s"], capture_output=True, text=True, timeout=5).stdout
+        return uname.startswith(("MSYS", "MINGW"))
+    except Exception:
+        return os.name == "nt"
+
+
+def _windows_package(root: str, name: str) -> str:
+    """读 deps.yaml 取该 lib 的 windows_package 字段(Windows 用 pacman 包名)。"""
+    try:
+        import yaml
+        m = yaml.safe_load(open(os.path.join(_tp(root), "deps.yaml"), encoding="utf-8"))
+        lib = (m.get("libs") or {}).get(name, {})
+        return lib.get("windows_package", "") or ""
+    except Exception:
+        return ""
+
+
+def is_pacman_provided(root: str, name: str) -> bool:
+    """Windows 上该 lib 由 MSYS2 pacman 预编译包提供且已安装 → True。"""
+    if not on_windows():
+        return False
+    pkg = _windows_package(root, name)
+    if not pkg:
+        return False
+    # pacman -Q 检查是否已装
+    try:
+        r = subprocess.run(["pacman", "-Q", pkg], capture_output=True, timeout=15)
+        return r.returncode == 0
+    except Exception:
+        return False
 
 
 def _tp(root: str) -> str:
@@ -67,7 +104,10 @@ def _src_fingerprint(root: str, name: str, tag: str) -> str:
 
 
 def is_built(root: str, name: str, tag: str, variant: str) -> bool:
-    """已建且源码指纹一致才视为 built;源码被本地修改(补丁)时触发重编。"""
+    """已建且源码指纹一致才视为 built;源码被本地修改(补丁)时触发重编。
+    Windows 上由 pacman 预编译包提供的 lib(pacman -Q 已装)直接视为 built。"""
+    if is_pacman_provided(root, name):
+        return True
     bfile = os.path.join(install_dir(root, name, tag, variant), ".built")
     if not os.path.isfile(bfile):
         return False

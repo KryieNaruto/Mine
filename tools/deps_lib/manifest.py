@@ -15,6 +15,7 @@ class LibSpec:
     build: str = "cmake"
     options: tuple = ()
     depends_on: tuple = ()
+    windows_package: str = ""  # Windows 用 MSYS2 pacman 预编译包名;非空则 Windows 不源码编译
 
     def __post_init__(self):
         object.__setattr__(self, "options", tuple(self.options or ()))
@@ -62,6 +63,7 @@ def resolve_libs(global_manifest: dict, use: list) -> list:
             build=d.get("build", "cmake"),
             options=d.get("options", []) or [],
             depends_on=d.get("depends_on", []) or [],
+            windows_package=d.get("windows_package", "") or "",
         ))
     return out
 
