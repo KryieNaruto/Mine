@@ -26,6 +26,28 @@ case "$(uname -s)" in
   *)            OS_PLATFORM="linux" ;;
 esac
 
+# --- Windows 但缺 pacman(Git Bash / cmd)→ 定位 MSYS2 并用其 bash 重新执行 ---
+# 根因:在 Git Bash 里 uname 也报 MINGW*,但没有 pacman;必须回到 MSYS2 环境才能跑 pacman。
+if [ "$OS_PLATFORM" = "windows" ] && ! has pacman; then
+  MSYS2_ROOT="${MSYS2_ROOT:-}"
+  local_appdata="${LOCALAPPDATA:-}"; local_appdata="${local_appdata//\\//}"
+  for cand in "$MSYS2_ROOT" "$local_appdata/Programs/MSYS2" \
+              "/c/msys64" "/c/msys2" "/c/tools/msys64" \
+              "/d/msys64" "/d/msys2" "$HOME/msys64" "$HOME/msys2"; do
+    [ -n "$cand" ] || continue
+    if [ -x "$cand/usr/bin/pacman" ] && [ -x "$cand/usr/bin/bash.exe" ]; then
+      info "检测到 MSYS2: $cand,转入其 bash 重新执行本脚本..."
+      SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+      # 显式前置 MSYS2 bin 到 PATH:否则 MSYS2 bash 继承 Git Bash 的 PATH,仍找不到 pacman
+      export PATH="$cand/usr/bin:$cand/bin:$cand/mingw64/bin:$PATH"
+      exec "$cand/usr/bin/bash.exe" "$SELF" "$@"
+    fi
+  done
+  err "未找到 MSYS2(pacman)。请从 MSYS2 终端运行 tools/setup-env.sh,"
+  err "或安装 MSYS2(https://www.msys2.org/)后设置 MSYS2_ROOT 指向其安装目录再试。"
+  exit 1
+fi
+
 # --- 前置工具检查 -----------------------------------------------------------
 if [ "$OS_PLATFORM" = "windows" ]; then
   for c in curl tar unzip sed; do
