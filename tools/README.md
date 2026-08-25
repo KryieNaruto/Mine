@@ -28,3 +28,4 @@
 - 全局清单 `third_party/deps.yaml` 是三方库唯一定义处;项目 `deps.yaml` 只 `use` 引用库名。
 - 池目录:`_src/<name>-<ver>` 源码、`_install/<name>-<ver>/<variant>` 产物;`.built` 文件标记已编译。
 - 源码/产物全部 gitignore,仓库只留清单 + 脚本。
+- golden 渲染测试单一基线:双平台逐像素一致校验;不一致 → 修渲染路径,不建分平台基线。
