@@ -297,7 +297,7 @@ target_link_libraries(<项目名> PRIVATE fmt::fmt spdlog::spdlog glm::glm)
 }
 ```
 
-**约束与风险**:库的 `find_package` config 在 debug/release 下可能不同(如 MSVC 需要 `-DCMAKE_DEBUG_POSTFIX`);初版在 Linux/GCC 单一 toolchain 下工作,`find_package` 具体 target 名(lib::lib)由各库决定。若某库无 CMake config 或 target 名不同,在项目 CMakeLists 注释说明,或走 `add_library(... INTERFACE)` 兜底。variant 目录依赖 `CMAKE_BUILD_TYPE` 非空;单配置生成器(如 Ninja)下由 preset 显式指定,不会为空。
+**约束与风险**:库的 `find_package` config 在 debug/release 下可能不同(如 MSVC 需要 `-DCMAKE_DEBUG_POSTFIX`);脚本跨平台:Linux 分支(现有)+ Windows 分支(MSYS2),见 `2026-08-24-cross-platform-design.md`,`find_package` 具体 target 名(lib::lib)由各库决定。若某库无 CMake config 或 target 名不同,在项目 CMakeLists 注释说明,或走 `add_library(... INTERFACE)` 兜底。variant 目录依赖 `CMAKE_BUILD_TYPE` 非空;单配置生成器(如 Ninja)下由 preset 显式指定,不会为空。
 
 ## 9. gitignore 策略
 

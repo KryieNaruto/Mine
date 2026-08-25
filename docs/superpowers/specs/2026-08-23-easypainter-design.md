@@ -32,8 +32,8 @@
 | 跨库依赖 | 工具层改造：`build-deps.py` 拓扑排序（`depends_on` 先序）+ `cmake_driver` 注入 `CMAKE_PREFIX_PATH` 指向池内已建前缀；清单中 abseil-cpp 排 ink-stroke-modeler 之前 |
 | imgui 接入 | **项目内 vendor**（不走池）：imgui 官方无稳定 install config，vendor `imgui/*.cpp` + `backends/imgui_impl_vulkan.cpp` + `imgui_impl_glfw.cpp` 进 `EasyPainter/vendor/imgui/` |
 | 系统依赖部署 | **无 sudo 用户级部署**：服务器无 root，`tools/install-user-deps.sh` 下载包解压到 `$MINE_ROOT/.user-deps/`（根 `.gitignore` 覆盖）+ 生成 `env.sh`（PATH/PKG_CONFIG_PATH/CMAKE_PREFIX_PATH/CMAKE_INCLUDE_PATH/LD_LIBRARY_PATH/VK_DRIVER_FILES，并 sed 重写解压包内 `/usr` 绝对路径），构建/运行前 `source` |
-| 无 GPU 环境 | 软件光栅 **lavapipe**（`.user-deps` 内部署 + `VK_DRIVER_FILES`），使离屏渲染与图像 golden 在无 GPU 环境也能跑 |
-| windowed 显示 | 无物理显示器，用 **Xvfb/Xvnc 虚拟 X display**（`DISPLAY=:N`）跑 `easypainter`（GLFW 仅 X11 后端） |
+| 无 GPU 环境 | 软件光栅离屏(Linux=lavapipe / Windows=SwiftShader),驱动经 `VK_ICD_FILENAMES` 选,渲染核心平台无关 |
+| windowed 显示 | 无物理显示器，用 **Xvfb/Xvnc 虚拟 X display**（`DISPLAY=:N`）跑 `easypainter`（GLFW 后端由 `VK_USE_PLATFORM_*` 自动选(Win32/X11)） |
 
 ## 3. 三方库清单（进池新增库；imgui/stb 为项目内 vendor；Vulkan/X11 为系统级）
 
@@ -53,7 +53,7 @@
 - **X11 开发头**（GLFW 仅 X11 后端）：`apt-get download` 以下全部 + `dpkg -x` 到部署根——**含传递依赖**：`libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libxext-dev libxcb1-dev libx11-xcb-dev x11proto-dev libxau-dev`（`apt-get download` 不拉依赖，必须显式列全；无 apt 列表时改从 archive.ubuntu.com 直接 curl 指定 .deb）。
 - **重写绝对路径**：`dpkg -x` 后 `sed` 重写所有 `.user-deps/**/*.pc` 的 `prefix/includedir/libdir`（原 `/usr`）为 `.user-deps/` 前缀；lavapipe ICD json 的 `library_path` 同样改写为实际路径。
 - **lavapipe**（无 GPU 软件光栅）：`apt-get download libvulkan-lavapipe` + `dpkg -x`，`VK_DRIVER_FILES` 指向其 ICD json，使离屏渲染（headless 无 surface）与图像 golden 在无 GPU 环境可跑。**运行期传递依赖**：lavapipe 驱动 dlopen 后仍需 `libllvm libgbm1 libdrm2 libexpat1 libzstd1 libz1`，用 `dpkg-deb -f <deb> Depends` 解析并递归下载解压到 `.user-deps/`，由 `LD_LIBRARY_PATH` 覆盖。
-- **windowed 显示**：无物理显示器，用 **Xvfb/Xvnc 虚拟 X display**（`apt-get download xvfb` + `dpkg -x` 部署，或探测 `xvfb-run` 可用性）跑 `easypainter`（GLFW X11 后端），`DISPLAY=:99`。xvfb 运行期仍需 `libxfont2 libpixman-1-0 libgl1 libxshmfence1` 等，同样 `dpkg-deb -f Depends` 递归下载。
+- **windowed 显示**：Linux 无显示器用 Xvfb；Windows 用真窗口；离屏渲染不依赖显示服务
 - **验证**：真实探针——用解压头 configure+编译最小 X11+GLFW 探针（`glfwInit()` 成功）、用 lavapipe 实际 `vkCreateInstance` 成功（非零物理设备）、`glslc` 编一个最小 `.frag→.spv`。
 
 **版本固定说明**：ink-stroke-modeler 无 tag，池按 `main` 拉取、`.pool.lock.json` 记录实际 commit（`requested_tag: main`，`commit: f2388813b0b2`），与 workspace §6 约定一致。
@@ -152,7 +152,7 @@ easypainter-cli --input <采样点文件> --output <out.png> [--width N --height
 | abseil 与 ink 的 find_package 衔接 | `INK_STROKE_MODELER_FIND_DEPENDENCIES=ON` + `CMAKE_PREFIX_PATH` 指向池内 abseil install 前缀 |
 | Vulkan 系统依赖缺失 | `tools/install-user-deps.sh` 部署 Vulkan SDK tar（headers+glslc）到 `.user-deps/`；`setup-env.sh` 探测 env.sh 存在性并指引 |
 | Shader 编译 | `glslc` 编译期把 `.vert/.frag` 编成 SPIR-V（glslc 由 install-user-deps.sh 部署提供）；不做预编译回退 |
-| headless 无显示环境 | 离屏路径不创建 surface，CI 可跑；无物理设备时依赖 lavapipe 软件光栅，缺失则明确报错退出 |
+| headless 无显示环境 | 离屏路径不创建 surface，CI 可跑；软件光栅缺失 → setup-env.sh 明确报错，不给回退 |
 | 跨库依赖（abseil→ink） | 工具层改造：cmake_driver 注入 CMAKE_PREFIX_PATH + build-deps depends_on 拓扑 + 清单 abseil 排前；Task 1 落地并补 tools 测试 |
 | imgui 无 install config | 项目内 vendor（Task 2），不 find_package(imgui) |
 | GLFW 需 X11 头 | 部署脚本下载并解压全部 X11 传递依赖（见 §3 映射表）；glfw 仅 X11 后端 |
