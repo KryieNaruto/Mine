@@ -12,11 +12,11 @@ Pipeline::~Pipeline() {
   if (render_pass_ != VK_NULL_HANDLE) vkDestroyRenderPass(device_, render_pass_, nullptr);
 }
 
-bool Pipeline::init(const VulkanContext& ctx) {
+bool Pipeline::init(const VulkanContext& ctx, VkFormat color_format) {
   device_ = ctx.device();
 
   VkAttachmentDescription color{};
-  color.format = VK_FORMAT_R8G8B8A8_UNORM;
+  color.format = color_format;
   color.samples = VK_SAMPLE_COUNT_1_BIT;
   color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
   color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;

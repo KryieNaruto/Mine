@@ -19,8 +19,10 @@ class Pipeline {
   Pipeline(const Pipeline&) = delete;
   Pipeline& operator=(const Pipeline&) = delete;
 
-  // 创建 render pass + pipeline(shader 从生成的 stroke_shaders.h 取)。成功返回 true。
-  bool init(const VulkanContext& ctx);
+  // 创建 render pass + pipeline(shader 从生成的 stroke_shaders.h 取)。
+  // color_format 默认 R8G8B8A8_UNORM(headless 离屏);windowed 传 swapchain 格式。
+  bool init(const VulkanContext& ctx,
+            VkFormat color_format = VK_FORMAT_R8G8B8A8_UNORM);
 
   // 在已开始的 render pass 内记录一次笔画绘制。顶点 buffer 由调用方创建并负责在
   // 命令提交执行完后释放(避免 use-after-free)。pts 经 (scale, offset) 映到归一化 [0,1]。

@@ -38,6 +38,8 @@ class Predictor {
   std::vector<Vec2> predict(const std::vector<InputEvent>& events);
   // 清除进行中的笔画状态,保留参数。
   void reset();
+  // 更换参数并重建模型器(清空进行中的笔画)。
+  void set_config(const PredictorConfig& cfg);
 
  private:
   struct Impl;

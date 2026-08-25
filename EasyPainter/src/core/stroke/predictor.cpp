@@ -82,4 +82,9 @@ std::vector<Vec2> Predictor::predict(const std::vector<InputEvent>& events) {
 
 void Predictor::reset() { impl_->modeler.Reset(impl_->params); }
 
+void Predictor::set_config(const PredictorConfig& cfg) {
+  impl_->params = BuildParams(cfg);
+  impl_->modeler.Reset(impl_->params);
+}
+
 }  // namespace easypainter::stroke

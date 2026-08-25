@@ -8,4 +8,7 @@ build/
 # 离屏测试产物 PNG(除非作为 golden 显式提交)
 *.png
 
+# ImGui 布局持久化文件(运行产物)
+imgui.ini
+
 # .user-deps 由根 .gitignore 覆盖,此处不重复

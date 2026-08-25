@@ -16,6 +16,10 @@ VulkanContext::~VulkanContext() {
 }
 
 bool VulkanContext::init() {
+  return init_instance({}) && init_device(VK_NULL_HANDLE);
+}
+
+bool VulkanContext::init_instance(const std::vector<const char*>& instance_extensions) {
   VkApplicationInfo app{};
   app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
   app.pApplicationName = kAppName;
@@ -27,11 +31,18 @@ bool VulkanContext::init() {
   VkInstanceCreateInfo ici{};
   ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
   ici.pApplicationInfo = &app;
+  ici.enabledExtensionCount = static_cast<uint32_t>(instance_extensions.size());
+  ici.ppEnabledExtensionNames =
+      instance_extensions.empty() ? nullptr : instance_extensions.data();
   if (vkCreateInstance(&ici, nullptr, &instance_) != VK_SUCCESS) {
     std::fprintf(stderr, "[vulkan] vkCreateInstance failed\n");
     return false;
   }
+  return true;
+}
 
+bool VulkanContext::init_device(VkSurfaceKHR surface,
+                                const std::vector<const char*>& device_extensions) {
   uint32_t n = 0;
   if (vkEnumeratePhysicalDevices(instance_, &n, nullptr) != VK_SUCCESS || n == 0) {
     std::fprintf(stderr, "[vulkan] no physical device\n");
@@ -45,16 +56,21 @@ bool VulkanContext::init() {
   vkGetPhysicalDeviceQueueFamilyProperties(physical_device_, &qn, nullptr);
   std::vector<VkQueueFamilyProperties> qprops(qn);
   vkGetPhysicalDeviceQueueFamilyProperties(physical_device_, &qn, qprops.data());
+
   bool found = false;
   for (uint32_t i = 0; i < qn; ++i) {
-    if (qprops[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
-      queue_family_ = i;
-      found = true;
-      break;
+    if (!(qprops[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) continue;
+    if (surface != VK_NULL_HANDLE) {
+      VkBool32 present = VK_FALSE;
+      vkGetPhysicalDeviceSurfaceSupportKHR(physical_device_, i, surface, &present);
+      if (!present) continue;
     }
+    queue_family_ = i;
+    found = true;
+    break;
   }
   if (!found) {
-    std::fprintf(stderr, "[vulkan] no graphics queue family\n");
+    std::fprintf(stderr, "[vulkan] no suitable queue family\n");
     return false;
   }
 
@@ -69,6 +85,9 @@ bool VulkanContext::init() {
   dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
   dci.queueCreateInfoCount = 1;
   dci.pQueueCreateInfos = &qci;
+  dci.enabledExtensionCount = static_cast<uint32_t>(device_extensions.size());
+  dci.ppEnabledExtensionNames =
+      device_extensions.empty() ? nullptr : device_extensions.data();
   if (vkCreateDevice(physical_device_, &dci, nullptr, &device_) != VK_SUCCESS) {
     std::fprintf(stderr, "[vulkan] vkCreateDevice failed\n");
     return false;
