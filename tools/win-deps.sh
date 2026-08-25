@@ -31,7 +31,7 @@ VULKAN_INC="$(find "$SDK_DIR" -type d -path '*/Include/vulkan' | head -1 || true
 info "① glslc: $GLSLC;vulkan.h: $VULKAN_INC/vulkan.h"
 
 # --- ② SwiftShader(经池构建,见 Task 2;此处仅确保 ICD 路径) ---
-SWSS_ICD="$MINE_ROOT/third_party/_install/swiftshader-main/release/vk_swiftshader_icd.json"
+SWSS_ICD="$MINE_ROOT/third_party/_install/swiftshader-master/release/vk_swiftshader_icd.json"
 [ -f "$SWSS_ICD" ] || die "SwiftShader ICD 未找到: $SWSS_ICD(先执行 tools/fetch-deps.py --project EasyPainter && tools/build-deps.py --project EasyPainter)"
 SWSS_BIN="$(dirname "$SWSS_ICD")"
 

@@ -33,3 +33,8 @@ libs:
     repo: https://github.com/google/googletest.git
     tag: "v1.15.2"
     build: cmake
+  swiftshader:
+    repo: https://github.com/google/swiftshader.git
+    tag: "master"
+    build: cmake
+    options: [SWIFTSHADER_BUILD_TESTS=OFF, SWIFTSHADER_BUILD_HEADLESS=OFF, SWIFTSHADER_BUILD_VULKAN=ON]
