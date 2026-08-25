@@ -103,4 +103,29 @@ TEST(OffscreenRender, MatchesBaselineGolden) {
       << "与基准图像像素差异过大: " << mismatch;
 }
 
+// Y 方向回归:归一化 y=0(图像/窗口坐标原点左上)必须渲染到图像顶部。
+// 此前 stroke.vert 的 p.y=1.0-p.y 在 Vulkan 下构成双重翻转(上下颠倒)。
+TEST(OffscreenRender, YDownTopIsImageTop) {
+  VulkanContext ctx;
+  ASSERT_TRUE(ctx.init());
+  Pipeline pipeline;
+  ASSERT_TRUE(pipeline.init(ctx));
+
+  const std::vector<stroke::Vec2> pts = {{0.2f, 0.1f}, {0.8f, 0.1f}};  // y=0.1 水平线
+  constexpr uint32_t kSize = 64;
+  auto res = render_offscreen(ctx, pipeline, pts, kSize, kSize);
+
+  int min_row = -1, max_row = -1;
+  for (size_t i = 0; i < res.rgba.size(); i += 4) {
+    if (res.rgba[i] > 150 && res.rgba[i + 1] < 100 && res.rgba[i + 2] < 100) {
+      const int row = static_cast<int>(i / 4 / kSize);
+      if (min_row < 0) min_row = row;
+      max_row = row;
+    }
+  }
+  ASSERT_GE(min_row, 0) << "未找到笔画像素";
+  // y=0.1 的水平线应落在图像顶部 30% 内;颠倒时落在底部(约 0.9H)。
+  EXPECT_LT(max_row, static_cast<int>(kSize) * 3 / 10);
+}
+
 }  // namespace easypainter::render

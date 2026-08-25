@@ -88,4 +88,5 @@ cmake --build EasyPainter/tools/build
 **图像 golden（`tests/data/golden_render.png`）**：由 `easypainter-cli` 在 lavapipe
 软件光栅上生成（`--width 320 --height 240` 内置示例点），再经 `render_offscreen`
 重渲逐像素比对。生成环境：lavapipe 25.2.8（`mesa-vulkan-drivers`，ICD
-`lvp_icd.json`）。
+`lvp_icd.json`）。基准按**图像/窗口坐标**约定（原点左上，y 向下）；
+2026-08-24 因修复 `shaders/stroke.vert` 的 Y 双重翻转而重基线。

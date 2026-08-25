@@ -9,6 +9,8 @@ layout(push_constant) uniform PushConsts {
 
 void main() {
   vec2 p = inPos * pc.uScale + pc.uOffset;
-  p.y = 1.0 - p.y;  // 翻转 Y:图像/窗口坐标原点在左上
+  // 输入按图像/窗口坐标(原点左上,y 向下):p.y=0 在图像顶部。
+  // Vulkan 视口变换把 NDC y=-1 映到 framebuffer 顶部行,与 OpenGL 相反;
+  // 故此处不再翻转,直接 p*2-1 即可让 y=0 → 顶部。
   gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
 }
