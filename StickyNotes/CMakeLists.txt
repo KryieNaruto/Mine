@@ -45,5 +45,9 @@ target_link_libraries(stickynotes_app PUBLIC stickynotes_core Qt6::Widgets Qt6::
 add_executable(stickynotes-cli src/cli/main.cpp)
 target_link_libraries(stickynotes-cli PRIVATE stickynotes_app stickynotes_assets)
 
+# 窗口版入口：装配多窗口/控制器/组，自动加载+防抖保存
+add_executable(stickynotes src/app/main.cpp)
+target_link_libraries(stickynotes PRIVATE stickynotes_app stickynotes_assets)
+
 enable_testing()
 add_subdirectory(tests)
