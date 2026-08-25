@@ -115,3 +115,9 @@ gtest_discover_tests(image_golden_test)
 add_executable(bench_test tests/bench_test.cpp)
 target_link_libraries(bench_test PRIVATE easypainter_core GTest::gtest GTest::gtest_main)
 gtest_discover_tests(bench_test)
+
+add_executable(golden_test tests/golden_test.cpp)
+target_link_libraries(golden_test PRIVATE easypainter_core GTest::gtest GTest::gtest_main)
+target_compile_definitions(golden_test PRIVATE
+  GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
+gtest_discover_tests(golden_test)
