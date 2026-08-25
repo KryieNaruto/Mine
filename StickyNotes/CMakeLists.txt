@@ -26,5 +26,20 @@ target_include_directories(stickynotes_assets INTERFACE assets)
 target_compile_definitions(stickynotes_assets INTERFACE
   STICKYNOTES_FONT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts")
 
+# app 层（QtWidgets GUI）：便签控件/无边框窗/调色板
+add_library(stickynotes_app STATIC
+  src/app/palette_dialog.cpp
+  src/app/note_widget.cpp
+  src/app/note_window.cpp
+  src/app/palette_dialog.h
+  src/app/note_widget.h
+  src/app/note_window.h)
+target_include_directories(stickynotes_app PUBLIC src)
+target_link_libraries(stickynotes_app PUBLIC stickynotes_core Qt6::Widgets Qt6::Gui)
+
+# CLI：无头入口（CRUD + offscreen 渲染 PNG）
+add_executable(stickynotes-cli src/cli/main.cpp)
+target_link_libraries(stickynotes-cli PRIVATE stickynotes_app stickynotes_assets)
+
 enable_testing()
 add_subdirectory(tests)
