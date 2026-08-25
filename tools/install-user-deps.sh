@@ -42,6 +42,11 @@ else
   fi
 fi
 
+if [ "$OS_PLATFORM" = "windows" ]; then
+  info "Windows 平台: 依赖部署转交 tools/win-deps.sh"
+  exec "$MINE_ROOT/tools/win-deps.sh" "$@"
+fi
+
 # apt 镜像基址(供 curl 兜底用)
 APT_MIRROR=""
 for src in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
@@ -316,11 +321,6 @@ export LD_LIBRARY_PATH="$SDK_X64/lib:$USBIN/usr/lib/$MULTIARCH\${LD_LIBRARY_PATH
 export VK_DRIVER_FILES="$VK_DRIVER_FILES"
 EOF
 info "⑥ 已生成 $USER_DEPS/env.sh"
-
-if [ "$OS_PLATFORM" = "windows" ]; then
-  info "Windows 平台: 依赖部署转交 tools/win-deps.sh"
-  exec "$MINE_ROOT/tools/win-deps.sh" "$@"
-fi
 
 # ===================== 真实探针(防假绿) ======================================
 PROBE_DIR="$DEB_CACHE/probe"
