@@ -26,14 +26,18 @@ target_include_directories(stickynotes_assets INTERFACE assets)
 target_compile_definitions(stickynotes_assets INTERFACE
   STICKYNOTES_FONT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts")
 
-# app 层（QtWidgets GUI）：便签控件/无边框窗/调色板
+# app 层（QtWidgets GUI）：便签控件/无边框窗/调色板/边缘收齐/组吸附
 add_library(stickynotes_app STATIC
   src/app/palette_dialog.cpp
   src/app/note_widget.cpp
   src/app/note_window.cpp
+  src/app/note_group.cpp
+  src/app/edge_dock_controller.cpp
   src/app/palette_dialog.h
   src/app/note_widget.h
-  src/app/note_window.h)
+  src/app/note_window.h
+  src/app/note_group.h
+  src/app/edge_dock_controller.h)
 target_include_directories(stickynotes_app PUBLIC src)
 target_link_libraries(stickynotes_app PUBLIC stickynotes_core Qt6::Widgets Qt6::Gui)
 

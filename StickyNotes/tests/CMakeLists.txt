@@ -19,6 +19,10 @@ add_executable(widget_test widget_test.cpp)
 target_link_libraries(widget_test PRIVATE stickynotes_app Qt6::Test Qt6::Widgets)
 add_test(NAME widget_test COMMAND widget_test)
 
+add_executable(group_test group_test.cpp)
+target_link_libraries(group_test PRIVATE stickynotes_app Qt6::Test Qt6::Widgets)
+add_test(NAME group_test COMMAND group_test)
+
 add_executable(image_golden_test image_golden_test.cpp)
 target_link_libraries(image_golden_test PRIVATE stickynotes_core Qt6::Test)
 target_compile_definitions(image_golden_test PRIVATE

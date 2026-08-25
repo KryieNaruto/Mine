@@ -19,6 +19,10 @@ public:
   void setDocked(const DockState& d);         // QPropertyAnimation 到 hiddenRect / 回 shownRect
   NoteWidget* noteWidget() const { return widget_; }
 
+signals:
+  void dragStarted();
+  void dragEnded();
+
 private:
   NoteStore& store_;
   QUuid id_;

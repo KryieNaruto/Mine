@@ -27,11 +27,14 @@ NoteWindow::NoteWindow(NoteStore& store, QUuid noteId, QWidget* parent)
   connect(widget_, &NoteWidget::taskToggled, this,
           [this](int i, bool done) { store_.setTaskDone(id_, i, done); });
   connect(widget_, &NoteWidget::dragStart, this,
-          [this](const QPoint& gp) { lastDragGlobal_ = gp; });
+          [this](const QPoint& gp) { lastDragGlobal_ = gp; emit dragStarted(); });
   connect(widget_, &NoteWidget::dragMove, this, [this](const QPoint& gp) {
     QPoint delta = gp - lastDragGlobal_;
     move(pos() + delta);
     lastDragGlobal_ = gp;
+  });
+  connect(widget_, &NoteWidget::dragEnd, this, [this]() {
+    emit dragEnded();
   });
 }
 
