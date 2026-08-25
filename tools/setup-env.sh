@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# 系统工具链检测:cmake / ninja / g++ / pkg-config / git / python3 + 用户级系统依赖部署状态。
-# 无 sudo 场景:Vulkan/X11/lavapipe/Xvfb 由 tools/install-user-deps.sh 用户级部署到 .user-deps/。
+# 一键搭建开发环境(全链路):系统工具链 + 用户级系统依赖(Vulkan/X11/lavapipe/Xvfb/Qt)
+# + 三方库池(fetch-deps + build-deps)。幂等:已装/已编的自动跳过。
+#   --check  只探测并报告缺失项,不安装(CI 用);硬依赖缺失时非零退出。
+#   默认     检测缺失 → 自动安装 → 拉取并预编译三方库 → 最终探针验证。
 set -euo pipefail
 
 # 平台判定:MSYS*/MINGW* → Windows;否则 Linux
@@ -86,21 +88,79 @@ print_help() {
   cat <<'EOF'
 用法: tools/setup-env.sh [--check] [--help]
 
-  检测系统工具链(cmake/ninja/g++/pkg-config/git/python3)与用户级系统依赖部署状态。
-  --check    只探测;硬依赖缺失时非零退出。
-  -h,--help  打印本帮助。
-  默认       探测;缺失时打印修复指引,非零退出(无 sudo 自动安装)。
+  默认(全链路一键):检测系统工具链与用户级系统依赖缺失 → 自动安装
+  (Windows:MSYS2 pacman;Linux:无 sudo dpkg -x 到 .user-deps/usr)→
+  拉取三方库源码并预编译进共享池(fetch-deps --all + build-deps --all)→ 最终探针验证。
+  幂等:已装/已编自动跳过。
 
-用户级系统依赖缺失时,先执行:
-    tools/install-user-deps.sh
-  再于每个构建/运行 shell 中 source .user-deps/env.sh。
-  Linux:          Vulkan SDK / X11 头 / lavapipe / Xvfb。
-  Windows(MSYS2): Vulkan SDK / SwiftShader / Qt6(自动转交 tools/win-deps.sh)。
+  --check    只探测;硬依赖缺失时非零退出(不安装,CI 用)。
+  -h,--help  打印本帮助。
+
+Linux:   无 sudo,全部落盘 $MINE_ROOT/.user-deps/(工具链/Vulkan/X11/lavapipe/Xvfb)。
+Windows: MSYS2 pacman 安装工具链 + Vulkan + Qt6;SwiftShader 走池构建。
+完成后再于每个构建/运行 shell 中 source .user-deps/env.sh。
 EOF
 }
 
+# 池是否已按 default_variant 预编译完(按 deps.yaml 的 libs 逐一检查 .built 标记)。
+# 只查 default_variant(release,标准构建所需);debug 变体由需要时 build-deps 单独补。
+# 返回 0=已就绪(跳过 fetch/build),1=有缺(需构建)。python 子进程反向 exit:
+#   - 发现缺失 → exit 1 → bash 侧 pool_built 返回 1(未就绪)
+#   - 全部已建 → exit 0 → bash 侧 pool_built 返回 0(就绪)
+# 用环境变量传 root 给子进程(heredoc 里不能用变量插值)。
+pool_built() {
+  local py
+  py="$(command -v python3 || true)"
+  [ -n "$py" ] || { return 1; }
+  MINE_ROOT="$MINE_ROOT" "$py" - <<'PYEOF' || return 1
+import os, sys, yaml
+root = os.environ["MINE_ROOT"]
+m = yaml.safe_load(open(os.path.join(root, "third_party", "deps.yaml")))
+variant = m.get("default_variant") or "release"
+for name, spec in (m.get("libs") or {}).items():
+    if not os.path.exists(os.path.join(root, "third_party", "_install", f"{name}-{spec.get('tag','')}", variant, ".built")):
+        sys.exit(1)
+sys.exit(0)
+PYEOF
+}
+
+auto_install() {
+  info "=== 全链路一键搭建开始 ==="
+
+  # 1) 用户级系统依赖(含工具链) —— Linux 无 sudo dpkg -x;Windows 自动转交 win-deps.sh
+  if [ "$OS_PLATFORM" = "windows" ]; then
+    info "Windows: 依赖部署由 install-user-deps.sh 转交 win-deps.sh(pacman)"
+  fi
+  bash "$MINE_ROOT/tools/install-user-deps.sh"
+
+  # 2) 载入用户级环境
+  # shellcheck disable=SC1090
+  [ -f "$USER_DEPS_ENV" ] && . "$USER_DEPS_ENV"
+
+  # 3) 三方库池:未拉则拉,未编则编
+  if ! pool_built; then
+    info "=== 拉取三方库源码 ==="
+    python3 "$MINE_ROOT/tools/fetch-deps.py" --all
+    info "=== 预编译三方库进池 ==="
+    python3 "$MINE_ROOT/tools/build-deps.py" --all
+  else
+    info "=== 三方库池已就绪,跳过 fetch/build ==="
+  fi
+
+  # 4) 最终校验
+  info "=== 最终校验 ==="
+  probe
+  if [ "$HARD_MISS" -eq 0 ]; then
+    info "环境就绪。构建前先: source $USER_DEPS_ENV"
+    lavapipe_hint
+    return 0
+  fi
+  err "仍有硬依赖缺失 ${HARD_MISS} 项: ${MISS_DETAILS[*]}"
+  return 1
+}
+
 main() {
-  local mode="check"
+  local mode="auto"
   if [ "$#" -gt 1 ]; then err "参数过多: $*"; exit 2; fi
   if [ "$#" -eq 1 ]; then
     case "$1" in
@@ -110,16 +170,20 @@ main() {
     esac
   fi
 
-  probe
-  if [ "$HARD_MISS" -eq 0 ]; then
-    info "硬依赖齐全。构建前先 source .user-deps/env.sh。"
-    lavapipe_hint
-    exit 0
+  if [ "$mode" = "check" ]; then
+    probe
+    if [ "$HARD_MISS" -eq 0 ]; then
+      info "硬依赖齐全。构建前先 source .user-deps/env.sh。"
+      lavapipe_hint
+      exit 0
+    fi
+    err "硬依赖缺失 ${HARD_MISS} 项: ${MISS_DETAILS[*]}"
+    warn "Vulkan/X11/lavapipe/Xvfb 为无 sudo 用户级部署。运行 tools/setup-env.sh(无 --check)一键自动安装。"
+    exit 1
   fi
 
-  err "硬依赖缺失 ${HARD_MISS} 项: ${MISS_DETAILS[*]}"
-  warn "Vulkan/X11/lavapipe/Xvfb 为无 sudo 用户级部署,请先执行: tools/install-user-deps.sh"
-  exit 1
+  auto_install
+  # auto_install 内部 return 0/1 成为脚本退出码
 }
 
 main "$@"

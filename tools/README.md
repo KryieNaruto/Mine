@@ -6,14 +6,21 @@
 ## 脚本
 | 脚本 | 作用 |
 |---|---|
-| `setup-env.sh` | 检测/安装系统工具链(cmake/ninja/g++/pkg-config/git/python3) |
+| `setup-env.sh` | 一键搭建:检测缺失→自动安装→拉取并预编译三方库→探针验证 |
+| `install-user-deps.sh` | 无 sudo 用户级系统依赖部署(Vulkan/X11/lavapipe/Xvfb/Qt + 工具链) |
+| `win-deps.sh` | Windows(MSYS2)依赖部署(pacman 工具链 + Vulkan + Qt6,SwiftShader 走池) |
 | `fetch-deps.py` | 拉取三方库源码进 `third_party/_src/`(只拉不编) |
 | `build-deps.py` | 预编译三方库进 `third_party/_install/<name>-<ver>/<variant>/` |
 | `new-project.py` | 新建项目骨架(cpp / python / web) |
 
 ## 常用命令
-    # 新机器还原
+    # 新机器一键还原(全链路,幂等)
+    tools/setup-env.sh
+    # 只检测不安装(CI 用)
     tools/setup-env.sh --check
+
+    # 手动分步(等价于 setup-env.sh 内部流程)
+    tools/install-user-deps.sh        # 工具链 + 用户级系统依赖(Windows 自动转交 win-deps.sh)
     tools/fetch-deps.py --all
     tools/build-deps.py --all          # release + debug 双变体
 

@@ -9,10 +9,9 @@
     └── <项目>/          一项目一文件夹(由 tools/new-project.py 生成)
 
 ## 快速开始
-    # 1. 还原环境(新机器)
-    tools/setup-env.sh
-    tools/fetch-deps.py --all
-    tools/build-deps.py --all
+    # 1. 一键搭建环境(新机器):工具链 + 系统依赖 + 三方库池,一步到位
+    tools/setup-env.sh          # 全链路:检测缺失→自动安装→拉取并预编译三方库→探针验证
+    #   tools/setup-env.sh --check   # 只检测不安装(CI 用)
 
     # 2. 新建项目
     tools/new-project.py cpp myapp --libs fmt,glm

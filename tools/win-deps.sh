@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Windows(MSYS2)依赖部署:Vulkan SDK zip + SwiftShader + Qt6(pacman)。
+# Windows(MSYS2)依赖部署:基础工具链 + Vulkan(pacman)+ SwiftShader(池构建) + Qt6(pacman)。
 # 由 install-user-deps.sh 平台分支调用;也可单独执行。
 set -euo pipefail
 info() { printf '[INFO] %s\n' "$*"; }
@@ -13,59 +13,76 @@ USER_DEPS="$MINE_ROOT/.user-deps"
 DEB_CACHE="$USER_DEPS/.deb-cache"
 mkdir -p "$USER_DEPS" "$DEB_CACHE"
 
-# --- ① Vulkan SDK(zip,含 glslc.exe + vulkan.h) ---
-SDK_URL="https://sdk.lunarg.com/sdk/download/latest/windows/vulkan-sdk-latest.zip"
-SDK_ZIP="$DEB_CACHE/vulkan-sdk-latest.zip"
-SDK_DIR="$USER_DEPS/vulkan-sdk"
-if [ ! -d "$SDK_DIR" ]; then
-  info "① 下载 Vulkan SDK ($SDK_URL)"
-  curl -fL --retry 3 -o "$SDK_ZIP" "$SDK_URL"
-  mkdir -p "$SDK_DIR"
-  unzip -q -o "$SDK_ZIP" -d "$SDK_DIR"
+# --- ① 基础工具链(MSYS2 pacman;覆盖 setup-env.sh 探测的 cmake/ninja/gcc/git/python3) ---
+MISS_TOOLS=()
+has cmake  || MISS_TOOLS+=(mingw-w64-x86_64-cmake)
+has ninja  || MISS_TOOLS+=(mingw-w64-x86_64-ninja)
+has g++    || MISS_TOOLS+=(mingw-w64-x86_64-gcc)
+has git    || MISS_TOOLS+=(git)
+has python3 || MISS_TOOLS+=(mingw-w64-x86_64-python)
+has pkg-config || MISS_TOOLS+=(mingw-w64-x86_64-pkgconf)
+# python3 装了但缺 PyYAML(fetch-deps/build-deps 解析 deps.yaml 需要)
+if has python3 && ! python3 -c 'import yaml' >/dev/null 2>&1; then
+  MISS_TOOLS+=(mingw-w64-x86_64-python-yaml)
 fi
-# 找 glslc.exe 与 include/vulkan/vulkan.h
-GLSLC="$(find "$SDK_DIR" -name 'glslc.exe' -type f | head -1 || true)"
-[ -n "$GLSLC" ] || die "SDK 缺少 glslc.exe"
-SDK_BIN="$(dirname "$GLSLC")"
-VULKAN_INC="$(find "$SDK_DIR" -type d -path '*/Include/vulkan' | head -1 || true)"
-[ -n "$VULKAN_INC" ] || die "SDK 缺少 Include/vulkan/vulkan.h"
-info "① glslc: $GLSLC;vulkan.h: $VULKAN_INC/vulkan.h"
+if [ "${#MISS_TOOLS[@]}" -gt 0 ]; then
+  info "① pacman 安装基础工具链: ${MISS_TOOLS[*]}"
+  pacman -S --needed --noconfirm "${MISS_TOOLS[@]}"
+else
+  info "① 基础工具链齐全"
+fi
 
-# --- ② SwiftShader(经池构建,见 Task 2;此处仅确保 ICD 路径) ---
+# --- ② Vulkan SDK(头 + glslc + loader,均用 MSYS2 原生 pacman 包) ---
+# 注:不用 Lunarg SDK zip —— 其 windows/vulkan-sdk-latest.zip 实际重定向为 .exe 安装包,
+# unzip 会报 "plain executable, not an archive"。MSYS2 的 mingw-w64-x86_64-vulkan-headers/
+# shaderc/vulkan-loader 恰好提供 vulkan.h + glslc.exe + libvulkan,且已在 PATH。
+PAC_VK="mingw-w64-x86_64-vulkan-headers mingw-w64-x86_64-shaderc mingw-w64-x86_64-vulkan-loader"
+info "② pacman 安装 Vulkan 依赖: $PAC_VK"
+pacman -S --needed --noconfirm $PAC_VK
+
+# 定位 glslc.exe 与 vulkan.h(均在 /mingw64,已在 PATH,此处仅校验存在性)
+GLSLC="$(command -v glslc.exe || true)"
+[ -n "$GLSLC" ] || die "未找到 glslc.exe(确认已装 mingw-w64-x86_64-shaderc)"
+GLSLC="$(cygpath -u "$GLSLC" 2>/dev/null || printf '%s' "$GLSLC")"
+VULKAN_INC="$(dirname "$(dirname "$GLSLC")")/include/vulkan"
+[ -f "$VULKAN_INC/vulkan.h" ] || die "未找到 vulkan.h(确认已装 mingw-w64-x86_64-vulkan-headers)"
+info "② glslc: $GLSLC;vulkan.h: $VULKAN_INC/vulkan.h"
+
+# --- ③ SwiftShader(经池构建,见 Task 2;此处仅确保 ICD 路径) ---
 SWSS_ICD="$MINE_ROOT/third_party/_install/swiftshader-master/release/vk_swiftshader_icd.json"
 if [ -f "$SWSS_ICD" ]; then
   SWSS_BIN="$(dirname "$SWSS_ICD")"
-  info "② SwiftShader ICD: $SWSS_ICD"
+  info "③ SwiftShader ICD: $SWSS_ICD"
 else
-  warn "② SwiftShader ICD 未找到: $SWSS_ICD(将由 tools/build-deps.py --all 构建产出;本步先继续生成 env.sh)"
+  warn "③ SwiftShader ICD 未找到: $SWSS_ICD(将由 tools/build-deps.py --all 构建产出;本步先继续生成 env.sh)"
   SWSS_BIN=""
 fi
 
-# --- ③ Qt6(pacman) ---
+# --- ④ Qt6(pacman) ---
 if ! pacman -Q mingw-w64-x86_64-qt6-base >/dev/null 2>&1; then
-  info "③ pacman 安装 Qt6 base"
+  info "④ pacman 安装 Qt6 base"
   pacman -S --needed --noconfirm mingw-w64-x86_64-qt6-base
 else
-  info "③ Qt6 已安装"
+  info "④ Qt6 已安装"
 fi
 
-# --- ④ 生成 env.sh ---
+# --- ⑤ 生成 env.sh ---
+# glslc/vulkan.h/loader 均在 MSYS2 /mingw64(已在 PATH),无需记路径。
 cat > "$USER_DEPS/env.sh" <<EOF
 # Mine Windows(MSYS2)用户级依赖环境(由 win-deps.sh 生成)。
 export MINE_ROOT="$MINE_ROOT"
 export USER_DEPS="$USER_DEPS"
-export PATH="$SDK_BIN:\$PATH"
 export VK_ICD_FILENAMES="$SWSS_ICD"
 export VK_DRIVER_FILES="$SWSS_ICD"
-export CMAKE_PREFIX_PATH="$SDK_BIN/..:$MINE_ROOT/third_party/_install/glfw-3.4/release"
+export CMAKE_PREFIX_PATH="$MINE_ROOT/third_party/_install/glfw-3.4/release"
 EOF
-info "④ 已生成 $USER_DEPS/env.sh"
+info "⑤ 已生成 $USER_DEPS/env.sh"
 
-# --- ⑤ 离屏 Vulkan 探针(SwiftShader 能创建 device) ---
+# --- ⑥ 离屏 Vulkan 探针(SwiftShader 能创建 device) ---
 "$GLSLC" -fshader-stage=fragment -o "$DEB_CACHE/probe.frag.spv" - <<'EOF' || die "glslc 编译失败"
 #version 450
 layout(location=0) out vec4 outColor;
 void main(){ outColor = vec4(1.0,0.0,0.0,1.0); }
 EOF
-info "⑤ glslc 探针通过"
+info "⑥ glslc 探针通过"
 info "完成。使用前: source $USER_DEPS/env.sh"

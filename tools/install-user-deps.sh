@@ -47,6 +47,32 @@ if [ "$OS_PLATFORM" = "windows" ]; then
   exec bash "$MINE_ROOT/tools/win-deps.sh" "$@"
 fi
 
+# --- 0. 系统工具链(无 sudo:dpkg -x 部署到 .user-deps/usr,系统已装则直接用) ---
+# 覆盖 cmake/ninja/g++/pkg-config/git/python3;缺哪个部署哪个。g++ 经实测(探针)可重定位编译。
+deploy_toolchain() {
+  [ "$OS_PLATFORM" = "windows" ] && return 0
+  local miss=()
+  has cmake   || miss+=(cmake)
+  has ninja   || miss+=(ninja-build)
+  has g++     || miss+=(g++ gcc cpp make)
+  has pkg-config || miss+=(pkg-config)
+  has git     || miss+=(git)
+  has python3 || miss+=(python3)
+  [ "${#miss[@]}" -eq 0 ] && { info "0. 系统工具链齐全,跳过"; return 0; }
+  info "0. 系统工具链缺失: ${miss[*]} → 无 sudo 部署到 $USBIN"
+  # -dev 头:编译第三方库与项目需要;g++ 闭包含 host 专属包(x86_64-linux-gnu-g++ 等),
+  # fetch_runtime_deps 的递归 Depends 会自动带入。
+  # python3-yaml:fetch-deps/build-deps 解析 deps.yaml 需要(PyYAML 独立于 python3 的 deb)。
+  miss+=(libc6-dev libstdc++-13-dev libgcc-13-dev linux-libc-dev libc-dev-bin python3-yaml)
+  for p in "${miss[@]}"; do
+    if installed "$p"; then continue; fi
+    info "   → 工具链包 $p"
+    x_deb "$p" || { warn "  工具链包 $p 部署失败(跳过,最终探针会暴露)"; continue; }
+    fetch_runtime_deps "$p" 4 || warn "  工具链包 $p 运行期依赖递归失败(跳过,最终探针会暴露)"
+  done
+  touch "$USBIN/.toolchain-deployed"
+}
+
 # apt 镜像基址(供 curl 兜底用)
 APT_MIRROR=""
 for src in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
@@ -161,6 +187,9 @@ fetch_runtime_deps() {
 }
 
 mkdir -p "$USER_DEPS"
+
+# 工具链部署(系统已装则跳过;缺则无 sudo dpkg -x 到 $USBIN)
+deploy_toolchain
 
 # --- ① Vulkan SDK(headers + glslc + libs) -----------------------------------
 SDK_URL="https://sdk.lunarg.com/sdk/download/latest/linux/vulkan-sdk-latest.tar.xz"
@@ -307,6 +336,14 @@ done
 info "⑥ Qt6 cmake 配置内 /usr 绝对路径已改写 -> $USBIN (运行期 .so 已软链系统库)"
 
 # --- ⑦ 生成 env.sh -----------------------------------------------------------
+# 工具链若为无 sudo 用户级部署,追加编译/运行期重定位路径(探针实测可编译运行)。
+TOOLCHAIN_PATHS=""
+if [ -f "$USBIN/.toolchain-deployed" ]; then
+  TOOLCHAIN_PATHS='
+export CPATH="$USBIN/usr/include:$USBIN/usr/include/$MULTIARCH"
+export LIBRARY_PATH="$USBIN/usr/lib/gcc/$MULTIARCH/13:$USBIN/usr/lib/$MULTIARCH"
+export LD_LIBRARY_PATH="$USBIN/usr/lib/gcc/$MULTIARCH/13:$USBIN/usr/lib/$MULTIARCH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"'
+fi
 cat > "$USER_DEPS/env.sh" <<EOF
 # EasyPainter/StickyNotes 用户级系统依赖环境(由 tools/install-user-deps.sh 生成)。
 # 用法: source $USER_DEPS/env.sh
@@ -318,7 +355,7 @@ export PKG_CONFIG_PATH="$USBIN/usr/lib/$MULTIARCH/pkgconfig:$USBIN/usr/share/pkg
 export CMAKE_PREFIX_PATH="$USBIN/usr:$SDK_X64"
 export CMAKE_INCLUDE_PATH="$USBIN/usr/include/$MULTIARCH/qt6:$USBIN/usr/include:$SDK_X64/include"
 export LD_LIBRARY_PATH="$SDK_X64/lib:$USBIN/usr/lib/$MULTIARCH\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
-export VK_DRIVER_FILES="$VK_DRIVER_FILES"
+export VK_DRIVER_FILES="$VK_DRIVER_FILES"$TOOLCHAIN_PATHS
 EOF
 info "⑥ 已生成 $USER_DEPS/env.sh"
 
