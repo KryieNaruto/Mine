@@ -44,7 +44,7 @@ fi
 
 if [ "$OS_PLATFORM" = "windows" ]; then
   info "Windows 平台: 依赖部署转交 tools/win-deps.sh"
-  exec "$MINE_ROOT/tools/win-deps.sh" "$@"
+  exec bash "$MINE_ROOT/tools/win-deps.sh" "$@"
 fi
 
 # apt 镜像基址(供 curl 兜底用)
