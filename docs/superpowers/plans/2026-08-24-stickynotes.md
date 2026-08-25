@@ -546,14 +546,14 @@ git commit -m "feat(stickynotes): edge-dock + snap pure geometry functions"
 **Interfaces:**
 - Consumes: `NoteStore`、`persistence`、`palette`、`geometry_util`（Task 2/3/4/5）。
 - Produces:
-  - `class NoteWidget : public QWidget`：**持 `Note& note_`（模型引用）+ `NoteStore& store_`**；方法 `void refresh()`、`QColor currentBodyColor() const`（**断言用状态访问器**，解耦 palette-vs-stylesheet）、`void setDocked(bool)`；信号 `titleEdited(QString)`、`colorPicked(QColor)`、`pinToggled(bool)`、`deleteRequested()`、`splitRequested()`、`taskToggled(int, bool)`、`dragStart(QPoint)`、`dragMove(QPoint)`、`dragEnd()`。正文背景随 hover 切换：`leaveEvent`→`fadedBodyColor`（淡化），`enterEvent`→`bodyColorHover`（不透明）。
-  - `class NoteWindow : public QWidget`（**`Qt::FramelessWindowHint`**）：**构造 `NoteWindow(NoteStore&, Note&)`**；`bool pinned() const`、`void setPinned(bool)`（`Qt::WindowStaysOnTopHint`）；`DockState dockState() const`、`void setDocked(DockState)`（`QPropertyAnimation` 到 `hiddenRect`/回 `shownRect`）。所有 `QWidget` 子控件用 **objectName 精确定位**（如 `bodyArea`、`taskCheck0`、`taskLabel0`、`titleEdit`）。
+  - `class NoteWidget : public QWidget`：**持 `QUuid id_` + `NoteStore& store_`（不持 `Note&` 容器引用，防运行期新增便签致 `QVector` 扩容悬垂，闭环 §5.2）**；每次 `refresh()` 用 `store_.find(id_)` 解析当前 `Note&`；方法 `void refresh()`、`QColor currentBodyColor() const`（**断言用状态访问器**，解耦 palette-vs-stylesheet）、`void setDocked(bool)`；信号 `titleEdited(QString)`、`colorPicked(QColor)`、`pinToggled(bool)`、`deleteRequested()`、`splitRequested()`、`addRequested()`、`taskToggled(int, bool)`、`dragStart(QPoint)`、`dragMove(QPoint)`、`dragEnd()`。正文背景随 hover 切换：`leaveEvent`→`fadedBodyColor`（淡化），`enterEvent`→`bodyColorHover`（不透明）。
+  - `class NoteWindow : public QWidget`（**`Qt::FramelessWindowHint`**）：**构造 `NoteWindow(NoteStore&, QUuid noteId)`**（内部建 `NoteWidget(store, noteId)`）；`bool pinned() const`、`void setPinned(bool)`（`Qt::WindowStaysOnTopHint`）；`DockState dockState() const`、`void setDocked(DockState)`（`QPropertyAnimation` 到 `hiddenRect`/回 `shownRect`）。所有 `QWidget` 子控件用 **objectName 精确定位**（如 `bodyArea`、`taskCheck0`、`taskLabel0`、`titleEdit`）。
   - 可执行 `stickynotes-cli`：
     - `--list [store.json]`：打印每 note 的 `id title [pinned] tasks(n/m)`
     - `--add "<title>" [store.json]`：新建 note（默认色）并持久化
     - `--remove <id> [store.json]`
     - `--pin <id> <on|off> [store.json]`
-    - `--render <out.png> [store.json]`：`QT_QPA_PLATFORM=offscreen` 下用 `NoteWidget` 离屏渲染整张便签墙到 PNG；无 store 参数时渲染内置 fixture（含中文标题/任务，用作 golden 基准）
+    - `--render <out.png> [store.json]`：`QT_QPA_PLATFORM=offscreen` 下用 `NoteWidget` 离屏渲染整张便签墙到 PNG；**当传入的 store 为空（0 便签）时渲染内置 fixture**（含中文标题/任务，用作 golden 基准）。**fixture 判定以「store 为空」为准，不以「未传 store 参数」为准**——golden 测试显式传空临时 store.json，杜绝 CWD 残留文件干扰。
     - 缺省 `store.json`：`stickynotes.json`（CWD）
   - `image_golden_test` 通过编译期定义 `STICKYNOTES_CLI="<绝对路径>"`（`$<TARGET_FILE:stickynotes-cli>`）与 `STICKYNOTES_GOLDEN_DIR="<绝对路径>"` 获得 CLI 与 golden 路径。
 
@@ -573,7 +573,7 @@ class WidgetTest : public QObject {
 private slots:
   void framelessAndPinFlags() {
     NoteStore s; QUuid id = s.add(Note{});
-    NoteWindow w(s, *s.find(id));
+    NoteWindow w(s, id);                       // 构造签名 (NoteStore&, QUuid)
     w.show();
     QVERIFY(w.windowFlags() & Qt::FramelessWindowHint);          // R3 无边框（审阅补）
     QVERIFY(!(w.windowFlags() & Qt::WindowStaysOnTopHint));
@@ -585,7 +585,7 @@ private slots:
   void taskDoneShowsStrikeout() {
     NoteStore s; QUuid id = s.add(Note{});
     s.addTask(id, "任务");
-    NoteWindow w(s, *s.find(id));
+    NoteWindow w(s, id);                       // 构造签名 (NoteStore&, QUuid)
     w.show();
     auto* ck = w.findChild<QCheckBox*>("taskCheck0");            // 精确 objectName
     QVERIFY(ck);
@@ -597,7 +597,7 @@ private slots:
   }
   void bodyColorAccessorFadesOnLeave() {
     NoteStore s; QUuid id = s.add(Note{}); s.find(id)->titleColor = QColor("#ffb74d");
-    NoteWindow w(s, *s.find(id)); w.show();
+    NoteWindow w(s, id);                       // 构造签名 (NoteStore&, QUuid) w.show();
     // currentBodyColor() 由内部 hover 状态驱动；离屏下初始为离开态 → 淡化色
     QVERIFY(w.noteWidget()->currentBodyColor().alpha() <= 100);  // 解耦实现方式
     w.noteWidget()->setHoveredForTest(true);                     // 测试辅助：模拟 hover
@@ -605,7 +605,7 @@ private slots:
   }
   void pinnedStillDocks() {
     NoteStore s; QUuid id = s.add(Note{});
-    NoteWindow w(s, *s.find(id)); w.show();
+    NoteWindow w(s, id);                       // 构造签名 (NoteStore&, QUuid) w.show();
     w.setPinned(true);                                           // R2：置顶仍可收齐
     DockState d; d.docked = true; d.hiddenRect = QRect(-252, 300, 260, 320);
     w.setDocked(d);
@@ -649,8 +649,10 @@ private slots:
     qputenv("QT_QPA_PLATFORM", "offscreen");
     QTemporaryDir dir;
     QString out = dir.filePath("render.png");
+    QString emptyStore = dir.filePath("empty.json");
+    { QFile f(emptyStore); f.open(QIODevice::WriteOnly); f.write("{\"notes\":[]}"); }  // 空 store → 走 fixture
     QProcess p;
-    p.start(QString(STICKYNOTES_CLI), {"--render", out});       // 绝对路径（审阅补）
+    p.start(QString(STICKYNOTES_CLI), {"--render", out, emptyStore});  // 绝对路径 + 显式空 store（审阅补）
     QVERIFY(p.waitForFinished(30000));
     QCOMPARE(p.exitStatus(), QProcess::NormalExit);
     QCOMPARE(p.exitCode(), 0);
@@ -682,7 +684,7 @@ QTEST_MAIN(ImageGoldenTest)
 
 - [ ] **Step 8: 生成 golden 基准（人工确认外观）**
 
-`StickyNotes/tools/gen-golden.sh`：`QT_QPA_PLATFORM=offscreen ./build/release/stickynotes-cli --render golden/stickynotes_golden.png`（无 store 参数走 fixture）。运行后 **Read 该 PNG 由主会话人工确认**：中文可读、淡化逻辑对、无边框扁平、任务删除线可见、两便签不重叠。确认后提交。若中文缺字形 → 修字体加载（Noto CJK 必须命中）。
+`StickyNotes/tools/gen-golden.sh`：先写空 store 到临时文件再渲染（**fixture 判定以「store 为空」为准**）：`echo '{"notes":[]}' > "$tmp_store"; QT_QPA_PLATFORM=offscreen ./build/release/stickynotes-cli --render golden/stickynotes_golden.png "$tmp_store"`。运行后 **Read 该 PNG 由主会话人工确认**：中文可读、淡化逻辑对、无边框扁平、任务删除线可见、两便签不重叠。确认后提交。若中文缺字形 → 修字体加载（Noto CJK 必须命中）。
 
 - [ ] **Step 9: 全绿 + Commit**
 
@@ -719,8 +721,8 @@ class GroupTest : public QObject {
 private slots:
   void addRemoveMembers() {
     NoteStore s;
-    QUuid a = s.add(Note{}); NoteWindow w1(s, *s.find(a));       // 与 Task 6 构造签名一致
-    QUuid b = s.add(Note{}); NoteWindow w2(s, *s.find(b));
+    QUuid a = s.add(Note{}); NoteWindow w1(s, a);                // 与 Task 6 构造签名 (NoteStore&, QUuid) 一致
+    QUuid b = s.add(Note{}); NoteWindow w2(s, b);
     NoteGroup g;
     QVERIFY(g.add(&w1)); QVERIFY(g.add(&w2));
     QVERIFY(!g.add(&w1));                 // 重复
@@ -779,6 +781,8 @@ git commit -m "feat(stickynotes): edge-dock controller + note groups (snap/separ
 
 - [ ] **Step 1: 实现 `src/app/main.cpp`**（装配；`QTimer` 防抖 ~500ms 自动 `saveStore` 到 `stickynotes.json`；启动 `loadStore`；每 note 建 `NoteWindow` 并注册到控制器/组）
 
+**运行期新增便签装配（R1 GUI 新增流程，闭环 §5.2 防悬垂）**：标题栏 add 按钮（`NoteWidget::addRequested()` 信号）→ `QUuid id = store_.add(Note{})` → 主程序收到 `NoteStore::changed()` 时，对比已建窗口集合与 `store.notes()`，对**新增 id** 建 `NoteWindow(store, id)` 并注册到 EdgeDockController/NoteGroup；对已删除 id 关闭并注销对应窗口。窗口持 `QUuid`，`refresh()` 用 `find(id)` 解析——运行期增删便签不产生悬垂引用。
+
 - [ ] **Step 2: 编译全部 + 全量测试（测试门目标）**
 
 Run: `cd /home/qiansenwei/workspace/Mine/StickyNotes && cmake -B build -S . -DCMAKE_BUILD_TYPE=Debug && cmake --build build -j && QT_QPA_PLATFORM=offscreen ctest --test-dir build --output-on-failure`
@@ -809,8 +813,9 @@ git commit -m "feat(stickynotes): app entry wiring + README; full test suite gre
 
 **类型/签名一致性（对照审阅反馈逐项核对）**：
 - `NoteStore::add` 返回 `QUuid`（Task 2 接口/权威头文件块/实现说明/测试四处一致，store_test/persistence_test/widget_test/group_test 均用 id 访问，无悬垂引用）。
-- `NoteWindow` 构造统一 `NoteWindow(NoteStore&, Note&)`（Task 6 声明 + widget_test/group_test 一致，group_test 不再 `new NoteWindow` 裸构造）。
+- **`NoteWidget`/`NoteWindow` 持 `QUuid`，不持 `Note&` 容器引用**（Task 6 接口 + Task 8 运行期装配，闭环 §5.2 防悬垂；`refresh()` 用 `find(id_)` 解析）。
+- `NoteWindow` 构造统一 `NoteWindow(NoteStore&, QUuid)`（Task 6 声明 + widget_test/group_test 一致，group_test 不再 `new NoteWindow` 裸构造）。
 - geometry 阈值统一 `threshold=25`/`reveal=8`，测试数据距边 ≤25（dockLeft x=4、dockRight/Bottom 距边 4、Top y=4）。
 - `NoteWidget::currentBodyColor()` 状态访问器（widget_test 断言用，解耦实现）。
-- `image_golden_test` 用编译期绝对路径 `STICKYNOTES_CLI`/`STICKYNOTES_GOLDEN_DIR`（不裸名起进程）。
+- `image_golden_test` 用编译期绝对路径 `STICKYNOTES_CLI`/`STICKYNOTES_GOLDEN_DIR` + `qputenv` 自包含 + 显式空 store（fixture 判定以 store 为空为准，解耦 CWD 残留）。
 - 冒烟脚本 `edge_dock_smoke.sh` 标注「不进测试门」。
