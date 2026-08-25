@@ -82,9 +82,11 @@ target_link_libraries(easypainter-cli PRIVATE easypainter_core)  # Vulkan 经 co
 
 # --- windowed 应用(仅此目标依赖 GLFW;headless/CLI 构建不依赖) ---
 find_package(glfw3 CONFIG REQUIRED)
-find_package(PkgConfig REQUIRED)
-# glfw 导出 target 不带 X11 链接(GLFW 把 X11 当 PRIVATE 依赖),手动经 pkg-config 补
-pkg_check_modules(X11_REQ IMPORTED_TARGET x11 xrandr xinerama xcursor xi xext xrender xfixes)
+if(UNIX AND NOT APPLE)
+  find_package(PkgConfig REQUIRED)
+  # glfw 导出 target 不带 X11 链接(GLFW 把 X11 当 PRIVATE 依赖),手动经 pkg-config 补;仅 Linux
+  pkg_check_modules(X11_REQ IMPORTED_TARGET x11 xrandr xinerama xcursor xi xext xrender xfixes)
+endif()
 
 add_executable(easypainter
   src/app/main.cpp
@@ -97,8 +99,13 @@ add_executable(easypainter
 # imgui_impl_glfw 需 GLFW_INCLUDE_NONE 避免拉入缺失的 GL/gl.h(Vulkan 应用)
 set_source_files_properties(vendor/imgui/backends/imgui_impl_glfw.cpp
   PROPERTIES COMPILE_DEFINITIONS GLFW_INCLUDE_NONE)
-target_link_libraries(easypainter PRIVATE
-  easypainter_core imgui glfw PkgConfig::X11_REQ)
+if(UNIX AND NOT APPLE)
+  target_link_libraries(easypainter PRIVATE
+    easypainter_core imgui glfw PkgConfig::X11_REQ)
+else()
+  target_link_libraries(easypainter PRIVATE
+    easypainter_core imgui glfw)  # Windows: GLFW 自带 Win32 后端,无需 X11
+endif()
 target_compile_definitions(easypainter PRIVATE
   CJK_FONT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/NotoSansCJK-Regular.ttc")
 

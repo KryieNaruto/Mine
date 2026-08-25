@@ -121,7 +121,7 @@ int main(int argc, char** argv) {
 
   render::VulkanContext ctx;
   if (!ctx.init()) {
-    std::fprintf(stderr, "Vulkan 初始化失败(需要 lavapipe 软件光栅)\n");
+    std::fprintf(stderr, "Vulkan 初始化失败(需软件光栅驱动,Linux=lavapipe / Windows=SwiftShader)\n");
     return 1;
   }
   render::Pipeline pipeline;
