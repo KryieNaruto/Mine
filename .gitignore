@@ -24,3 +24,6 @@ __pycache__/
 # IDE
 .idea/
 .vscode/
+
+# Claude Code worktrees
+.claude/worktrees/
