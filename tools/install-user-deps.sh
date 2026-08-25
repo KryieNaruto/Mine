@@ -174,11 +174,14 @@ info "③ .pc 重写完成: $(find "$USBIN" -name '*.pc' | wc -l) 个"
 
 # --- ④ Vulkan loader 链接符号 + lavapipe(无 GPU 软件光栅) --------------------
 VK_DRIVER_FILES=""
-# libvulkan-dev 提供 libvulkan.so 链接符号(探针与项目 find_package(Vulkan) 均需)
-if [ ! -f "$USBIN/usr/lib/$MULTIARCH/libvulkan.so" ] && [ ! -f /usr/lib/$MULTIARCH/libvulkan.so ]; then
-  info "④ 部署 libvulkan-dev(提供 libvulkan.so 链接符号)"
+# libvulkan-dev 提供 libvulkan.so 链接符号(探针与项目 find_package(Vulkan) 均需)。
+# libvulkan1 是运行期 loader(提供 libvulkan.so.1),-dev 符号链依赖之,须一并强制部署,
+# 否则符号链悬空导致 find_library 找不到库。
+if [ ! -f "$USBIN/.vulkan-deployed" ]; then
+  info "④ 部署 libvulkan-dev + libvulkan1(loader 符号链)"
   x_deb "libvulkan-dev"
-  fetch_runtime_deps "libvulkan-dev" 2
+  x_deb "libvulkan1"
+  touch "$USBIN/.vulkan-deployed"
 fi
 # 系统已有 lavapipe 则直接使用(含 lvp_icd.json)
 if [ -f /usr/share/vulkan/icd.d/lvp_icd.json ] && [ -f /usr/lib/$MULTIARCH/libvulkan_lvp.so ]; then
