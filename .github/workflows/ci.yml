@@ -1,0 +1,59 @@
+name: CI
+on: [push, pull_request]
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: 环境部署
+        run: |
+          tools/install-user-deps.sh
+          source .user-deps/env.sh
+          python3 tools/fetch-deps.py --all
+          python3 tools/build-deps.py --all
+      - name: 构建 + 测试
+        run: |
+          source .user-deps/env.sh
+          cmake -B build -S EasyPainter -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j
+          ctest --test-dir build --output-on-failure
+          cmake -B build-sn -S StickyNotes -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-sn -j
+          QT_QPA_PLATFORM=offscreen ctest --test-dir build-sn --output-on-failure
+
+  windows:
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          update: true
+          install: >-
+            base-devel
+            git
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-python
+            mingw-w64-x86_64-qt6-base
+            unzip
+      - name: 环境部署
+        run: |
+          tools/install-user-deps.sh
+          source .user-deps/env.sh
+          python tools/fetch-deps.py --all
+          python tools/build-deps.py --all
+      - name: 构建 + 测试
+        run: |
+          source .user-deps/env.sh
+          cmake -B build -S EasyPainter -DCMAKE_BUILD_TYPE=Release -G Ninja
+          cmake --build build -j
+          ctest --test-dir build --output-on-failure
+          cmake -B build-sn -S StickyNotes -DCMAKE_BUILD_TYPE=Release -G Ninja
+          cmake --build build-sn -j
+          QT_QPA_PLATFORM=offscreen ctest --test-dir build-sn --output-on-failure
