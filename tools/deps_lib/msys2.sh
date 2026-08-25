@@ -54,9 +54,11 @@ msys2_install_to() {
   rm -f "$dl"
 }
 
-# msys2_enter <root> : 前置 MSYS2 bin 到 PATH 并 exec 其 bash 重跑当前脚本。
+# msys2_enter <root> [args...] : 前置 MSYS2 bin 到 PATH 并 exec 其 bash 重跑当前脚本。
+# root 是第 1 个参数,重跑脚本时要剥掉,只传原始 args(避免路径被当成脚本参数)。
 msys2_enter() {
   local root="$1"
+  shift
   info "转入 MSYS2: $root 重新执行..."
   export PATH="$root/usr/bin:$root/bin:$root/mingw64/bin:$PATH"
   exec "$root/usr/bin/bash.exe" "$SELF_PATH" "$@"
