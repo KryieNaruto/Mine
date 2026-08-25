@@ -63,6 +63,7 @@ def build_lib(root: str, lib: LibSpec, variant: str, jobs: int) -> tuple:
 
     with open(os.path.join(idir, ".built"), "w", encoding="utf-8") as f:
         f.write(f"variant={variant}\n")
+        f.write(f"src={pool._src_fingerprint(root, lib.name, lib.tag)}\n")
     return True, ""
 
 

@@ -49,5 +49,37 @@ def is_fetched(root: str, name: str, tag: str) -> bool:
     return os.path.isdir(src_dir(root, name, tag))
 
 
+def _src_fingerprint(root: str, name: str, tag: str) -> str:
+    """源码 git 指纹:HEAD 短哈希 + dirty 补丁指纹(本地改源码后触发重编)。"""
+    src = src_dir(root, name, tag)
+    try:
+        import subprocess
+        head = subprocess.run(
+            ["git", "-C", src, "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+        dirty = subprocess.run(
+            ["git", "-C", src, "diff", "--stat"], capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+        return f"{head}|{len(dirty)}"
+    except Exception:
+        return ""
+
+
 def is_built(root: str, name: str, tag: str, variant: str) -> bool:
-    return os.path.isfile(os.path.join(install_dir(root, name, tag, variant), ".built"))
+    """已建且源码指纹一致才视为 built;源码被本地修改(补丁)时触发重编。"""
+    bfile = os.path.join(install_dir(root, name, tag, variant), ".built")
+    if not os.path.isfile(bfile):
+        return False
+    fp = _src_fingerprint(root, name, tag)
+    if not fp:
+        return True  # 无 git 元数据(如手工放置)时退化为只看 .built
+    try:
+        with open(bfile, "r", encoding="utf-8") as f:
+            content = f.read()
+        if "src=" not in content:
+            # 旧格式 .built:源码 dirty(本地补丁)则重编,否则视为已建
+            return "0" == fp.split("|", 1)[1]
+        return ("src=" + fp) in content
+    except Exception:
+        return False
