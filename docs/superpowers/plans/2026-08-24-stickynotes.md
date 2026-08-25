@@ -276,7 +276,7 @@ struct Note {
 class NoteStore : public QObject {
   Q_OBJECT
 public:
-  Note& add(const Note& note);
+  QUuid add(const Note& note);   // 返回新 id，不返回容器引用（防 QVector 扩容悬垂）
   void remove(QUuid id);
   Note* find(QUuid id);
   QVector<Note>& notes() { return notes_; }
@@ -645,6 +645,8 @@ class ImageGoldenTest : public QObject {
   Q_OBJECT
 private slots:
   void cliRenderMatchesGolden() {
+    // 自包含：子进程必须离屏，显式设置而非依赖 ctest 全局 env 前缀（单独运行不假红）
+    qputenv("QT_QPA_PLATFORM", "offscreen");
     QTemporaryDir dir;
     QString out = dir.filePath("render.png");
     QProcess p;
@@ -726,6 +728,17 @@ private slots:
     QVERIFY(g.remove(&w1));
     QCOMPARE(g.members().size(), 1);
   }
+  void moveByMovesMembers() {            // 闭环 spec §5.3 R6「组几何平移单测」
+    NoteStore s;
+    QUuid a = s.add(Note{}); NoteWindow w1(s, *s.find(a)); w1.show();
+    QUuid b = s.add(Note{}); NoteWindow w2(s, *s.find(b)); w2.show();
+    w1.move(100, 100); w2.move(400, 100);
+    NoteGroup g; g.add(&w1); g.add(&w2);
+    QPoint p1 = w1.pos(), p2 = w2.pos();
+    g.moveBy(50, 30);
+    QCOMPARE(w1.pos(), p1 + QPoint(50, 30));     // 组内成员随组整体平移
+    QCOMPARE(w2.pos(), p2 + QPoint(50, 30));
+  }
   void snapGeometry() {
     QRect a(100,100,260,320), b(600,200,260,320);
     QRect r = snappedRect(a, b);
@@ -795,7 +808,7 @@ git commit -m "feat(stickynotes): app entry wiring + README; full test suite gre
 **占位符扫描**：无 TBD/TODO、无「占位」「顺序冲突」「类似 Task N」措辞；所有代码块均为具体实现或明确接口签名；GUI 部分以行为规格 + 关键 API 给出（行为已被 widget_test 钉住）。
 
 **类型/签名一致性（对照审阅反馈逐项核对）**：
-- `NoteStore::add` 返回 `QUuid`（Task 2 接口/实现/测试三处一致，store_test/persistence_test/widget_test/group_test 均用 id 访问，无悬垂引用）。
+- `NoteStore::add` 返回 `QUuid`（Task 2 接口/权威头文件块/实现说明/测试四处一致，store_test/persistence_test/widget_test/group_test 均用 id 访问，无悬垂引用）。
 - `NoteWindow` 构造统一 `NoteWindow(NoteStore&, Note&)`（Task 6 声明 + widget_test/group_test 一致，group_test 不再 `new NoteWindow` 裸构造）。
 - geometry 阈值统一 `threshold=25`/`reveal=8`，测试数据距边 ≤25（dockLeft x=4、dockRight/Bottom 距边 4、Top y=4）。
 - `NoteWidget::currentBodyColor()` 状态访问器（widget_test 断言用，解耦实现）。
