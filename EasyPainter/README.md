@@ -53,6 +53,14 @@ DISPLAY=:99 ./build/debug/easypainter
 
 在窗口内按住鼠标左键拖动画笔画；右侧面板滑条调参，`Run bench` 显示延迟/吞吐。
 
+## CJK 字体
+
+窗口端 ImGui 的中文显示依赖项目内 bundle 的
+`assets/fonts/NotoSansCJK-Regular.ttc`（Noto Sans CJK SC 简体中文变体，
+SIL OFL 1.1 许可，来源与许可全文见 `assets/fonts/README.md`）。加载逻辑在
+`src/app/fonts.cpp`（`LoadCjkFont`，字体路径经 `CJK_FONT_PATH` 编译宏注入）。
+字体缺失或加载失败时应用如实报错退出（stderr），不会静默降级为 `?`。
+
 ## 测试
 
 ```bash

@@ -11,6 +11,7 @@
 #include <cstring>
 #include <vector>
 
+#include "app/fonts.h"
 #include "app/gui.h"
 #include "backends/imgui_impl_glfw.h"
 #include "backends/imgui_impl_vulkan.h"
@@ -243,6 +244,11 @@ int main(int argc, char** argv) {
 
   IMGUI_CHECKVERSION();
   ImGui::CreateContext();
+  if (app::LoadCjkFont(ImGui::GetIO().Fonts, app::cjk_font_path(), 18.f) == nullptr) {
+    std::fprintf(stderr, "[app] 无法加载 CJK 字体:%s,界面中文将显示为 '?'。\n",
+                 app::cjk_font_path());
+    return 1;  // 依赖缺失:如实报告阻塞,不静默降级
+  }
   ImGui_ImplGlfw_InitForVulkan(window, true);
   ImGui_ImplVulkan_InitInfo vk_init{};
   vk_init.ApiVersion = VK_API_VERSION_1_0;
@@ -268,6 +274,11 @@ int main(int argc, char** argv) {
   bool drawing = false;
   float latency_ms = 0.f;
   auto last = std::chrono::steady_clock::now();
+
+  // stroke 顶点 buffer 跨帧持有:下一帧 wait fence(GPU 完成)后再销毁,
+  // 防止 lavapipe 异步渲染线程访问已释放内存(此前提交前即销毁导致 SIGSEGV)
+  VkBuffer stroke_vb = VK_NULL_HANDLE;
+  VkDeviceMemory stroke_vb_mem = VK_NULL_HANDLE;
 
   while (!glfwWindowShouldClose(window)) {
     glfwPollEvents();
@@ -306,10 +317,23 @@ int main(int argc, char** argv) {
 
     // 帧渲染
     uint32_t image_index = 0;
+    const VkResult acquire_result =
+        vkAcquireNextImageKHR(ctx.device(), sc.swapchain, UINT64_MAX,
+                              sc.image_ready, VK_NULL_HANDLE, &image_index);
+    // acquire 失败(如窗口失效/显示断开):跳过本帧;fence 未 reset,保持 signaled
+    if (acquire_result != VK_SUCCESS && acquire_result != VK_SUBOPTIMAL_KHR)
+      continue;
+    if (image_index >= sc.views.size())
+      continue;  // 越界防护,防止 framebuffers 越界访问崩溃
     vkWaitForFences(ctx.device(), 1, &sc.in_flight, VK_TRUE, UINT64_MAX);
+    // 上一帧 GPU 已完成,可安全销毁其顶点 buffer
+    if (stroke_vb) {
+      vkDestroyBuffer(ctx.device(), stroke_vb, nullptr);
+      vkFreeMemory(ctx.device(), stroke_vb_mem, nullptr);
+      stroke_vb = VK_NULL_HANDLE;
+      stroke_vb_mem = VK_NULL_HANDLE;
+    }
     vkResetFences(ctx.device(), 1, &sc.in_flight);
-    vkAcquireNextImageKHR(ctx.device(), sc.swapchain, UINT64_MAX, sc.image_ready,
-                          VK_NULL_HANDLE, &image_index);
 
     vkResetCommandBuffer(sc.cmd, 0);
     VkCommandBufferBeginInfo bi{};
@@ -327,9 +351,7 @@ int main(int argc, char** argv) {
     vkCmdBeginRenderPass(sc.cmd, &rpb, VK_SUBPASS_CONTENTS_INLINE);
 
     if (modeled.size() >= 2) {
-      // 顶点 buffer(生命周期覆盖提交)
-      VkBuffer vb = VK_NULL_HANDLE;
-      VkDeviceMemory vb_mem = VK_NULL_HANDLE;
+      // 顶点 buffer(本帧创建,下一帧 wait fence 后销毁,生命周期覆盖 GPU 使用)
       const VkDeviceSize bytes =
           static_cast<VkDeviceSize>(modeled.size()) * sizeof(stroke::Vec2);
       VkBufferCreateInfo bci{};
@@ -337,9 +359,9 @@ int main(int argc, char** argv) {
       bci.size = bytes;
       bci.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
       bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-      vkCreateBuffer(ctx.device(), &bci, nullptr, &vb);
+      vkCreateBuffer(ctx.device(), &bci, nullptr, &stroke_vb);
       VkMemoryRequirements mr;
-      vkGetBufferMemoryRequirements(ctx.device(), vb, &mr);
+      vkGetBufferMemoryRequirements(ctx.device(), stroke_vb, &mr);
       VkMemoryAllocateInfo ai{};
       ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
       ai.allocationSize = mr.size;
@@ -357,18 +379,15 @@ int main(int argc, char** argv) {
           break;
         }
       }
-      vkAllocateMemory(ctx.device(), &ai, nullptr, &vb_mem);
-      vkBindBufferMemory(ctx.device(), vb, vb_mem, 0);
+      vkAllocateMemory(ctx.device(), &ai, nullptr, &stroke_vb_mem);
+      vkBindBufferMemory(ctx.device(), stroke_vb, stroke_vb_mem, 0);
       void* data = nullptr;
-      vkMapMemory(ctx.device(), vb_mem, 0, bytes, 0, &data);
+      vkMapMemory(ctx.device(), stroke_vb_mem, 0, bytes, 0, &data);
       std::memcpy(data, modeled.data(), static_cast<size_t>(bytes));
-      vkUnmapMemory(ctx.device(), vb_mem);
+      vkUnmapMemory(ctx.device(), stroke_vb_mem);
 
-      pipeline.draw(sc.cmd, vb, static_cast<uint32_t>(modeled.size()),
+      pipeline.draw(sc.cmd, stroke_vb, static_cast<uint32_t>(modeled.size()),
                     sc.extent.width, sc.extent.height);
-
-      vkDestroyBuffer(ctx.device(), vb, nullptr);
-      vkFreeMemory(ctx.device(), vb_mem, nullptr);
     }
 
     ImGui_ImplVulkan_NewFrame();
@@ -406,6 +425,10 @@ int main(int argc, char** argv) {
   }
 
   vkDeviceWaitIdle(ctx.device());
+  if (stroke_vb) {
+    vkDestroyBuffer(ctx.device(), stroke_vb, nullptr);
+    vkFreeMemory(ctx.device(), stroke_vb_mem, nullptr);
+  }
   ImGui_ImplVulkan_Shutdown();
   ImGui_ImplGlfw_Shutdown();
   ImGui::DestroyContext();

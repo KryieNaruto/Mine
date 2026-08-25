@@ -88,6 +88,8 @@ pkg_check_modules(X11_REQ IMPORTED_TARGET x11 xrandr xinerama xcursor xi xext xr
 
 add_executable(easypainter
   src/app/main.cpp
+  src/app/fonts.cpp
+  src/app/fonts.h
   src/app/gui.h
   src/app/gui.cpp
   vendor/imgui/backends/imgui_impl_glfw.cpp
@@ -97,6 +99,8 @@ set_source_files_properties(vendor/imgui/backends/imgui_impl_glfw.cpp
   PROPERTIES COMPILE_DEFINITIONS GLFW_INCLUDE_NONE)
 target_link_libraries(easypainter PRIVATE
   easypainter_core imgui glfw PkgConfig::X11_REQ)
+target_compile_definitions(easypainter PRIVATE
+  CJK_FONT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/NotoSansCJK-Regular.ttc")
 
 # --- 测试 ---
 enable_testing()
@@ -121,3 +125,11 @@ target_link_libraries(golden_test PRIVATE easypainter_core GTest::gtest GTest::g
 target_compile_definitions(golden_test PRIVATE
   GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
 gtest_discover_tests(golden_test)
+
+# --- 字体回归用例:ImGui 中文字形覆盖(先红后绿) ---
+add_executable(font_test tests/font_test.cpp src/app/fonts.cpp)
+target_link_libraries(font_test PRIVATE easypainter_core imgui GTest::gtest GTest::gtest_main)
+target_include_directories(font_test PRIVATE src vendor/imgui vendor)
+target_compile_definitions(font_test PRIVATE
+  CJK_FONT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/NotoSansCJK-Regular.ttc")
+gtest_discover_tests(font_test)
