@@ -3,6 +3,12 @@
 # 无 sudo 场景:Vulkan/X11/lavapipe/Xvfb 由 tools/install-user-deps.sh 用户级部署到 .user-deps/。
 set -euo pipefail
 
+# 平台判定:MSYS*/MINGW* → Windows;否则 Linux
+case "$(uname -s)" in
+  MSYS*|MINGW*) OS_PLATFORM="windows" ;;
+  *)            OS_PLATFORM="linux" ;;
+esac
+
 info() { printf '%s\n' "$*"; }
 warn() { printf 'WARN: %s\n' "$*" >&2; }
 err()  { printf 'ERROR: %s\n' "$*" >&2; }
@@ -43,8 +49,17 @@ chk_user_deps() {
   fi
 }
 
+chk_user_deps_windows() {
+  if [ -f "$MINE_ROOT/.user-deps/env.sh" ]; then
+    printf '[OK]   user-deps: %s\n' "$MINE_ROOT/.user-deps/env.sh"
+  else
+    HARD_MISS=$((HARD_MISS+1)); MISS_DETAILS+=("user-deps(Vulkan SDK + SwiftShader + Qt6)")
+    printf '[MISS] user-deps: 未部署(先执行 tools/install-user-deps.sh)\n'
+  fi
+}
+
 probe() {
-  info "=== 系统工具链探测 ==="
+  info "=== 系统工具链探测(${OS_PLATFORM:-linux}) ==="
   HARD_MISS=0; MISS_DETAILS=()
   chk "cmake"      "3.22" "cmake --version"
   chk "ninja"      ""     "ninja --version"
@@ -52,10 +67,15 @@ probe() {
   chk "pkg-config" ""     "pkg-config --version"
   chk "git"        ""     "git --version"
   chk "python3"    "3.8"  "python3 --version"
-  chk_user_deps
+  if [ "$OS_PLATFORM" = "windows" ]; then
+    chk_user_deps_windows
+  else
+    chk_user_deps
+  fi
 }
 
 lavapipe_hint() {
+  [ "$OS_PLATFORM" = "windows" ] && return 0
   # 可选:无 GPU 时给出软件光栅建议,不阻塞
   if ! ls /dev/dri/* >/dev/null 2>&1; then
     warn "未检测到 GPU 设备(/dev/dri 为空);离屏渲染依赖 lavapipe(已由 install-user-deps.sh 部署)"
@@ -71,9 +91,11 @@ print_help() {
   -h,--help  打印本帮助。
   默认       探测;缺失时打印修复指引,非零退出(无 sudo 自动安装)。
 
-用户级系统依赖(Vulkan SDK / X11 头 / lavapipe / Xvfb)缺失时,先执行:
+用户级系统依赖缺失时,先执行:
     tools/install-user-deps.sh
   再于每个构建/运行 shell 中 source .user-deps/env.sh。
+  Linux:          Vulkan SDK / X11 头 / lavapipe / Xvfb。
+  Windows(MSYS2): Vulkan SDK / SwiftShader / Qt6(自动转交 tools/win-deps.sh)。
 EOF
 }
 
