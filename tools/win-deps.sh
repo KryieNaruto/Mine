@@ -5,6 +5,7 @@ set -euo pipefail
 info() { printf '[INFO] %s\n' "$*"; }
 err()  { printf '[ERROR] %s\n' "$*" >&2; }
 die()  { err "$*"; exit 1; }
+warn() { printf '[WARN] %s\n' "$*"; }
 has()  { command -v "$1" >/dev/null 2>&1; }
 
 MINE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -32,8 +33,13 @@ info "① glslc: $GLSLC;vulkan.h: $VULKAN_INC/vulkan.h"
 
 # --- ② SwiftShader(经池构建,见 Task 2;此处仅确保 ICD 路径) ---
 SWSS_ICD="$MINE_ROOT/third_party/_install/swiftshader-master/release/vk_swiftshader_icd.json"
-[ -f "$SWSS_ICD" ] || die "SwiftShader ICD 未找到: $SWSS_ICD(先执行 tools/fetch-deps.py --project EasyPainter && tools/build-deps.py --project EasyPainter)"
-SWSS_BIN="$(dirname "$SWSS_ICD")"
+if [ -f "$SWSS_ICD" ]; then
+  SWSS_BIN="$(dirname "$SWSS_ICD")"
+  info "② SwiftShader ICD: $SWSS_ICD"
+else
+  warn "② SwiftShader ICD 未找到: $SWSS_ICD(将由 tools/build-deps.py --all 构建产出;本步先继续生成 env.sh)"
+  SWSS_BIN=""
+fi
 
 # --- ③ Qt6(pacman) ---
 if ! pacman -Q mingw-w64-x86_64-qt6-base >/dev/null 2>&1; then
