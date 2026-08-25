@@ -10,10 +10,12 @@ add_library(stickynotes_core STATIC
   src/core/note_store.cpp
   src/core/persistence.cpp
   src/core/palette.cpp
+  src/core/geometry_util.cpp
   src/core/model.h
   src/core/note_store.h
   src/core/persistence.h
-  src/core/palette.h)
+  src/core/palette.h
+  src/core/geometry_util.h)
 target_include_directories(stickynotes_core PUBLIC src)
 # model.h 含 QColor(QtGui 头);core 虽以纯逻辑为主,仍需 Qt6::Gui 的 include 路径
 target_link_libraries(stickynotes_core PUBLIC Qt6::Core Qt6::Gui)
