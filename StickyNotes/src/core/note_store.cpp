@@ -23,6 +23,12 @@ void NoteStore::remove(QUuid id) {
   emit changed();
 }
 
+void NoteStore::rebuildIndex() {
+  index_.clear();
+  for (int i = 0; i < notes_.size(); ++i)
+    index_.insert(notes_[i].id, i);
+}
+
 Note* NoteStore::find(QUuid id) {
   auto it = index_.find(id);
   if (it == index_.end())

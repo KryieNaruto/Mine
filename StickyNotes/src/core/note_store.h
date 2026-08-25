@@ -19,6 +19,8 @@ public:
   void setPinned(QUuid id, bool v);
   void addTask(QUuid id, const QString& text);
   void setTaskDone(QUuid id, int index, bool done);
+  // 供 persistence 批量替换内容后重建索引（不触发 changed）
+  void rebuildIndex();
 signals:
   void changed();
 private:
