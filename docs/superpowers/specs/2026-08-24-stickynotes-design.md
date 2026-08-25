@@ -79,16 +79,17 @@ struct Note {
 ```
 
 - `NoteStore`：`QVector<Note>` + `QHash<QUuid,int>` 索引；增删改/pin/任务切换均发信号；`NoteStore` 变更 → app 防抖（~500ms QTimer）自动落盘 JSON。
+- **NoteStore API 约束（防引用悬垂）**：`add()` 返回 **`QUuid`**（新 note 的 id），不返回容器元素引用——`QVector` 扩容会使既有引用失效（UB）。所有调用方一律以 id 访问（`find(id)`），修改方法均接受 `QUuid`。
 - `persistence`：路径注入（测试用临时文件）；反序列化对损坏 JSON 返回错误而非崩溃。
 
 ### 5.3 需求 → 实现映射
 
 - **R1**：标题行 `QLineEdit` + 标题色（`palette_dialog` 选色）；正文 `QTextEdit`；正文背景 = `titleColor` 降低透明度（alpha 降到 ~0.35，铺在默认底色上）；**hover 时恢复不透明**（`enterEvent`/`leaveEvent` 重绘）。新增/删除按钮在标题栏。
 - **R2**：pin 按钮切换 `pinned` → `setWindowFlag(Qt::WindowStaysOnTopHint)`。仅置顶，收齐行为不受影响。
-- **R3**：`FramelessWindowHint`；`mousePress/Move` 在标题区实现窗口拖动（`windowHandle()->startSystemMove()` 优先，失败回退 `move()`）。
-- **R4**：`EdgeDockController`：定时器（~100ms）读 `QCursor::pos()` + 窗口几何；判定与目标几何由 `geometry_util` 纯函数给出；切换用 `QPropertyAnimation` 平滑。固定便签**仍收齐**。收齐成细条标签（仅标题色条，露出 ~8px），hover 展开。
+- **R3**：`FramelessWindowHint`；`mousePress/Move` 在标题区实现窗口拖动（`windowHandle()->startSystemMove()` 优先，失败回退 `move()`）。**验收：widget_test 断言窗口 flags 含 `FramelessWindowHint`。**
+- **R4**：`EdgeDockController`：定时器（~100ms）读 `QCursor::pos()` + 窗口几何；判定与目标几何由 `geometry_util` 纯函数给出；切换用 `QPropertyAnimation` 平滑。固定便签**仍收齐**。收齐成细条标签（仅标题色条，露出 ~8px），hover 展开。**阈值统一为 25px**（判定阈值 `threshold` 与标签露出 `reveal` 分离：`threshold=25` 判定靠近、`reveal=8` 收齐露出）。**验收：geometry_test 以距边 ≤25 的矩形断言四边收齐；widget_test 断言 pinned 窗口仍走收齐路径。**
 - **R5**：任务行 = `QCheckBox` + `QLabel`；勾选 → 模型 `done=true` → 文本 `QFont::StrikeOut` + 置灰；持久化。
-- **R6**：每便签独立顶层无边框窗；拖动标题栏，其边缘与另一便签边缘距离 < 阈值 → 吸附成 `NoteGroup`（组内随组整体移动，含 edge-dock 联动）；标题栏「拆合」按钮断开还原。
+- **R6**：每便签独立顶层无边框窗；拖动标题栏，其边缘与另一便签边缘距离 < 阈值 → 吸附成 `NoteGroup`（组内随组整体移动，含 edge-dock 联动）；标题栏「拆合」按钮断开还原。**验收：`NoteGroup` 成员增删/重复/组几何平移单测（测试门内）；吸附贴合几何由 `geometry_util::snappedRect` 纯函数单测；拖动→成组的窗口级集成由冒烟脚本（`tools/edge_dock_smoke.sh`，Xvfb+XTEST）人工验收，不进测试门。**
 
 ## 6. CLI + 离屏（硬约束实现）
 
@@ -104,8 +105,8 @@ struct Note {
 | store_test | 增删、pin 切换、任务勾选信号、索引一致性 | 断言通过 |
 | persistence_test | JSON 往返一致；损坏文件返回错误不崩溃；空 store 序列化 | 断言通过 |
 | palette_test | 淡化色 alpha 计算、hover 不透明色 | 数值断言 |
-| geometry_test | 四边收齐判定、收齐/展开目标几何（上/下/左/右） | 数值断言 |
-| widget_test | 任务勾选→StrikeOut 属性；pin→窗口 flag；淡化→hover 色变化 | 断言通过 |
+| geometry_test | 四边收齐判定、收齐/展开目标几何（上/下/左/右）；**阈值统一 threshold=25 / reveal=8，测试矩形距边 ≤25** | 数值断言 |
+| widget_test | 任务勾选→StrikeOut 属性；pin→窗口 flag；**FramelessWindowHint**；**pinned 仍收齐**；淡化→hover 色变化（经 `currentBodyColor()` 访问器） | 断言通过 |
 | image_golden_test | CLI 渲染 fixture → 与基准 PNG 逐像素比对（容差） | 像素一致 |
 
 **图像 golden 约定**：基准 PNG 由 `stickynotes-cli --render` 在确定环境（Qt 6.4.2、offscreen、Noto CJK 字体）生成，人工确认外观后提交；测试比对该 PNG，容差按实测设定（不预设）。测试红若因字体缺字形 → 按 EasyPainter 的 bundled Noto CJK 方案补齐字体资源（非回退路径，属环境补齐）。
@@ -121,6 +122,9 @@ struct Note {
 | golden 跨 Qt 版本漂移 | 锁定 6.4.2 + 容差；README 记录 golden 生成环境 |
 | 损坏 JSON | persistence 返回错误 + 默认空 store，不崩溃 |
 | offscreen 平台缺失 | 运行时已装，若仍缺按阻塞处理 |
+| **Qt6 cmake 解压后绝对路径失效** | `dpkg -x` 后 `Qt6Config.cmake`/宏文件内 `/usr` 路径未系统命中 → 对 `.user-deps` 下 `*.cmake`/`qt6/*` 做与 `.pc` 同款 sed 改写 + Task 1 探针显式 include Qt 头建窗，编译期暴露 |
+| **NoteStore 引用失效（内存安全）** | `add()` 返回 `QUuid`，不返回容器元素引用（`QVector` 扩容使引用悬垂 = UB）；所有访问经 `find(id)` |
+| **golden 测试 CLI 启动（PATH）** | `image_golden_test` 用编译期绝对路径 `STICKYNOTES_CLI="$<TARGET_FILE:stickynotes-cli>"`，不依赖 ctest 工作目录/PATH |
 
 ## 9. 成功标准
 
