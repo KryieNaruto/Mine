@@ -21,13 +21,25 @@ err()  { printf '[ERROR] %s\n' "$*" >&2; }
 die()  { err "$*"; exit 1; }
 has()  { command -v "$1" >/dev/null 2>&1; }
 
+case "$(uname -s)" in
+  MSYS*|MINGW*) OS_PLATFORM="windows" ;;
+  *)            OS_PLATFORM="linux" ;;
+esac
+
 # --- 前置工具检查 -----------------------------------------------------------
-for c in curl tar dpkg-deb dpkg sed; do
-  has "$c" || die "缺少命令: $c"
-done
-has apt-get || warn "未检测到 apt-get;.deb 将走远程 archive.ubuntu.com 下载(需能出网)"
-if ! has gcc && ! has cc && ! has g++; then
-  die "缺少 C/C++ 编译器(gcc/cc/g++),探针无法编译"
+if [ "$OS_PLATFORM" = "windows" ]; then
+  for c in curl tar unzip sed; do
+    has "$c" || die "缺少命令: $c(MSYS2 需安装)"
+  done
+  has pacman || die "缺少 pacman(MSYS2 需安装)"
+else
+  for c in curl tar dpkg-deb dpkg sed; do
+    has "$c" || die "缺少命令: $c"
+  done
+  has apt-get || warn "未检测到 apt-get;.deb 将走远程 archive.ubuntu.com 下载(需能出网)"
+  if ! has gcc && ! has cc && ! has g++; then
+    die "缺少 C/C++ 编译器(gcc/cc/g++),探针无法编译"
+  fi
 fi
 
 # apt 镜像基址(供 curl 兜底用)
@@ -304,6 +316,11 @@ export LD_LIBRARY_PATH="$SDK_X64/lib:$USBIN/usr/lib/$MULTIARCH\${LD_LIBRARY_PATH
 export VK_DRIVER_FILES="$VK_DRIVER_FILES"
 EOF
 info "⑥ 已生成 $USER_DEPS/env.sh"
+
+if [ "$OS_PLATFORM" = "windows" ]; then
+  info "Windows 平台: 依赖部署转交 tools/win-deps.sh"
+  exec "$MINE_ROOT/tools/win-deps.sh" "$@"
+fi
 
 # ===================== 真实探针(防假绿) ======================================
 PROBE_DIR="$DEB_CACHE/probe"
