@@ -1,10 +1,15 @@
 #include "app/gui.h"
 
+#include <vector>
+
+#include "core/bench/bench.h"
+#include "core/stroke/input_source.h"
 #include "imgui.h"
 
 namespace easypainter::app {
 
-void render_tuning_panel(stroke::PredictorConfig& cfg, bool& dirty, float latency_ms) {
+void render_tuning_panel(stroke::PredictorConfig& cfg, bool& dirty, float latency_ms,
+                         stroke::Predictor* predictor) {
   ImGui::Begin("EasyPainter 调参");
   ImGui::Text("最近预测延迟: %.2f ms", latency_ms);
   dirty |= ImGui::SliderFloat("spring_mass_constant", &cfg.spring_mass_constant,
@@ -30,6 +35,30 @@ void render_tuning_panel(stroke::PredictorConfig& cfg, bool& dirty, float latenc
                               5.0f, "%.2f");
   dirty |= ImGui::SliderFloat("wobble_speed_ceiling", &cfg.wobble_speed_ceiling,
                               0.0f, 10.0f, "%.2f");
+  ImGui::Separator();
+  if (predictor != nullptr) {
+    ImGui::Text("Benchmark(单次 update 延迟/吞吐)");
+    if (ImGui::Button("Run bench")) {
+      std::vector<stroke::Vec2> out;
+      predictor->update({stroke::InputType::kDown, {0.f, 0.f}, 0.0f}, out);
+      for (int i = 1; i <= 10; ++i) {
+        predictor->update(
+            {stroke::InputType::kMove, {i * 0.1f, i * 0.05f}, i * 0.05f}, out);
+      }
+      const auto stats = bench::measure_update_latency(
+          *predictor, {stroke::InputType::kMove, {1.5f, 0.8f}, 0.6f}, 200);
+      ImGui::Text("update p50=%.3fms p99=%.3fms mean=%.3fms", stats.p50_ms,
+                  stats.p99_ms, stats.mean_ms);
+      const std::vector<stroke::InputEvent> evs = {
+          {stroke::InputType::kDown, {0.f, 0.f}, 0.0f},
+          {stroke::InputType::kMove, {1.f, 1.f}, 0.05f},
+          {stroke::InputType::kMove, {2.f, 1.f}, 0.10f},
+          {stroke::InputType::kUp, {3.f, 1.f}, 0.15f},
+      };
+      const double t = bench::measure_throughput_pts_per_s(*predictor, evs);
+      ImGui::Text("throughput=%.0f pts/s", t);
+    }
+  }
   ImGui::Text("提示: 在窗口内按住鼠标左键拖动画笔画。");
   ImGui::End();
 }

@@ -61,6 +61,8 @@ add_library(easypainter_core STATIC
   src/core/render/pipeline.cpp
   src/core/render/offscreen.h
   src/core/render/offscreen.cpp
+  src/core/bench/bench.h
+  src/core/bench/bench.cpp
   ${CMAKE_CURRENT_BINARY_DIR}/stroke_shaders.h)
 target_include_directories(easypainter_core PUBLIC src)
 target_include_directories(easypainter_core PRIVATE vendor ${CMAKE_CURRENT_BINARY_DIR})
@@ -109,3 +111,7 @@ target_include_directories(image_golden_test PRIVATE vendor)
 target_compile_definitions(image_golden_test PRIVATE
   GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
 gtest_discover_tests(image_golden_test)
+
+add_executable(bench_test tests/bench_test.cpp)
+target_link_libraries(bench_test PRIVATE easypainter_core GTest::gtest GTest::gtest_main)
+gtest_discover_tests(bench_test)

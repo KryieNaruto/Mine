@@ -374,7 +374,7 @@ int main(int argc, char** argv) {
     ImGui_ImplVulkan_NewFrame();
     ImGui_ImplGlfw_NewFrame();
     ImGui::NewFrame();
-    app::render_tuning_panel(cfg, cfg_dirty, latency_ms);
+    app::render_tuning_panel(cfg, cfg_dirty, latency_ms, &predictor);
     ImGui::Render();
     ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), sc.cmd);
 
