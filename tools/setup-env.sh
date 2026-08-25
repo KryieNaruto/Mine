@@ -123,7 +123,8 @@ pool_built() {
   MINE_ROOT="$MINE_ROOT" "$py" - <<'PYEOF' || return 1
 import os, sys, yaml
 root = os.environ["MINE_ROOT"]
-m = yaml.safe_load(open(os.path.join(root, "third_party", "deps.yaml")))
+# deps.yaml 为 UTF-8;Windows 下 Python 默认 locale 编码是 gbk,必须显式指定,否则解码报错
+m = yaml.safe_load(open(os.path.join(root, "third_party", "deps.yaml"), encoding="utf-8"))
 variant = m.get("default_variant") or "release"
 for name, spec in (m.get("libs") or {}).items():
     if not os.path.exists(os.path.join(root, "third_party", "_install", f"{name}-{spec.get('tag','')}", variant, ".built")):
