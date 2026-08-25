@@ -109,13 +109,34 @@ dep_names() {
 # installed <pkg> : 系统是否已安装该包。
 installed() { dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'install ok installed'; }
 
+# provided_installed <virtual> : 是否有已安装包 Provides 该虚拟包。
+# 例: libqt6core6t64 已装且 Provides "qt6-base-abi (= 6.4.2)",则依赖 qt6-base-abi 已满足,
+# 不应尝试下载不存在的 .deb(虚拟包无实体包可下)。
+provided_installed() {
+  local dep="$1"
+  awk -v d="$dep" '
+    /^Status: install ok installed$/ { inst=1; next }
+    /^Status:/ { inst=0; next }
+    /^$/ { inst=0; next }
+    inst && /^Provides:/ {
+      line=$0; sub(/^Provides:[[:space:]]*/, "", line)
+      n=split(line, items, ",")
+      for (i=1; i<=n; i++) {
+        it=items[i]; gsub(/^[[:space:]]+|[[:space:]]+$/, "", it)
+        name=it; sub(/[[:space:]]*\(.*$/, "", name)
+        if (name==d) { print 1; exit }
+      }
+    }
+  ' /var/lib/dpkg/status 2>/dev/null | grep -q 1
+}
+
 # fetch_runtime_deps <pkg> <maxdepth> : 递归下载+解包运行期 Depends(未系统安装的)。
 fetch_runtime_deps() {
   local pkg="$1" depth="${2:-3}" f
   f="$(dl_deb "$pkg")"
   for dep in $(dep_names "$f"); do
     [ "$depth" -le 0 ] && break
-    if installed "$dep"; then continue; fi
+    if installed "$dep" || provided_installed "$dep"; then continue; fi
     info "  → 运行期依赖 $dep"
     x_deb "$dep"
     fetch_runtime_deps "$dep" $((depth-1))
@@ -233,16 +254,52 @@ else
 fi
 info "⑤ Xvfb: ${XVFB_BIN:-xvfb-run}"
 
-# --- ⑥ 生成 env.sh -----------------------------------------------------------
+# --- ⑥ Qt6 dev: 头文件 / moc·uic·rcc / Qt6 cmake 配置 / QtTest 运行期 ----------
+if [ -f "$USBIN/.qt6-deployed" ]; then
+  info "⑥ Qt6 已部署(标记文件),跳过"
+else
+  info "⑥ Qt6: 部署 qt6-base-dev + qt6-base-dev-tools + libqt6test6t64"
+  QT_DEVS="qt6-base-dev qt6-base-dev-tools libqt6test6t64"
+  for p in $QT_DEVS; do
+    if installed "$p"; then info "Qt 包 $p 已系统安装，跳过"; continue; fi
+    x_deb "$p" || die "Qt 包 $p 下载/解包失败"
+    fetch_runtime_deps "$p" 3
+  done
+  touch "$USBIN/.qt6-deployed"
+fi
+
+# dpkg -x 后改写 Qt cmake 配置内的 /usr 绝对路径 → 用户级前缀(与 .pc 改写同款)。
+# 系统未装 dev 头,若 Qt6Config.cmake 命中但内部 /usr 路径未改写 → 编译期 include 失败。
+find "$USBIN/usr/lib/$MULTIARCH/cmake" -type f \( -name '*.cmake' -o -name '*Config*.cmake' \) 2>/dev/null \
+  | xargs sed -i "s|/usr/include|$USBIN/usr/include|g; s|/usr/lib|$USBIN/usr/lib|g; s|/usr/share|$USBIN/usr/share|g" 2>/dev/null || true
+find "$USBIN/usr/lib/qt6" -type f \( -name '*.cmake' -o -name '*.pri' \) 2>/dev/null \
+  | xargs sed -i "s|/usr/include|$USBIN/usr/include|g; s|/usr/lib|$USBIN/usr/lib|g; s|/usr/share|$USBIN/usr/share|g" 2>/dev/null || true
+# 运行期 .so 由系统包提供(如 libqt6core6t64, fetch_runtime_deps 因已装而跳过);
+# dev 包只带 .so 符号链,改写后的 cmake targets 引用 $USBIN/.../libQt6Core.so.6.4.2 落空。
+# 补齐: 将系统 Qt6 运行期库软链进用户级 lib 目录(软链到系统真实文件,运行期 LD_LIBRARY_PATH 已含用户级)。
+for _qso in /usr/lib/$MULTIARCH/libQt6*.so.6; do
+  [ -e "$_qso" ] || continue
+  _base="$(basename "$_qso")"
+  [ -e "$USBIN/usr/lib/$MULTIARCH/$_base" ] || ln -sfn "$_qso" "$USBIN/usr/lib/$MULTIARCH/$_base"
+  _real="$(readlink -f "$_qso" 2>/dev/null || true)"
+  if [ -n "$_real" ] && [ -e "$_real" ]; then
+    _rbase="$(basename "$_real")"
+    [ -e "$USBIN/usr/lib/$MULTIARCH/$_rbase" ] || ln -sfn "$_real" "$USBIN/usr/lib/$MULTIARCH/$_rbase"
+  fi
+done
+info "⑥ Qt6 cmake 配置内 /usr 绝对路径已改写 -> $USBIN (运行期 .so 已软链系统库)"
+
+# --- ⑦ 生成 env.sh -----------------------------------------------------------
 cat > "$USER_DEPS/env.sh" <<EOF
-# EasyPainter 用户级系统依赖环境(由 tools/install-user-deps.sh 生成)。
+# EasyPainter/StickyNotes 用户级系统依赖环境(由 tools/install-user-deps.sh 生成)。
 # 用法: source $USER_DEPS/env.sh
 export MINE_ROOT="$MINE_ROOT"
 export USER_DEPS="$USER_DEPS"
-export PATH="$SDK_X64/bin:$USBIN/usr/bin:\$PATH"
+export QT_PREFIX="$USBIN/usr"
+export PATH="$USBIN/usr/lib/qt6/bin:$SDK_X64/bin:$USBIN/usr/bin:\$PATH"
 export PKG_CONFIG_PATH="$USBIN/usr/lib/$MULTIARCH/pkgconfig:$USBIN/usr/share/pkgconfig\${PKG_CONFIG_PATH:+:\$PKG_CONFIG_PATH}"
 export CMAKE_PREFIX_PATH="$USBIN/usr:$SDK_X64"
-export CMAKE_INCLUDE_PATH="$USBIN/usr/include:$SDK_X64/include"
+export CMAKE_INCLUDE_PATH="$USBIN/usr/include/$MULTIARCH/qt6:$USBIN/usr/include:$SDK_X64/include"
 export LD_LIBRARY_PATH="$SDK_X64/lib:$USBIN/usr/lib/$MULTIARCH\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
 export VK_DRIVER_FILES="$VK_DRIVER_FILES"
 EOF
