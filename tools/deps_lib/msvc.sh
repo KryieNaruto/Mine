@@ -9,24 +9,36 @@ if ! declare -F err  >/dev/null 2>&1; then err()  { printf '[ERROR] %s\n' "$*" >
 if ! declare -F die  >/dev/null 2>&1; then die()  { err "$*"; exit 1; }; fi
 if ! declare -F has  >/dev/null 2>&1; then has()  { command -v "$1" >/dev/null 2>&1; }; fi
 
-# vswhere 默认路径(32 位安装的 x86 程序,安装到 64 位系统)
-VSWHERE="/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
-[ -x "$VSWHERE" ] || VSWHERE="$(command -v vswhere.exe 2>/dev/null || true)"
-
 # msvc_vcvars_path <root> : 输出 vcvars64.bat 的 POSIX 路径。
 msvc_vcvars_path() {
   printf '%s/VC/Auxiliary/Build/vcvars64.bat' "$1"
 }
 
-# msvc_locate : 输出含 VC 工具链 + Windows SDK 的 VS/Build Tools 安装根;找不到返回 1。
+# msvc_resolve_vswhere : 输出 vswhere.exe 路径;找不到输出空。
+# vswhere.exe 随 VS Installer 一起装 —— 干净机器首次自动装 Build Tools 前并不存在,
+# 因此每次调用现找,绝不能在 source 时缓存(否则自动装完再定位仍拿空路径 → 定位失败)。
+msvc_resolve_vswhere() {
+  # 默认路径:32 位安装的 x86 程序,安装到 64 位系统
+  local p="/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
+  if [ -x "$p" ]; then printf '%s' "$p"; return 0; fi
+  command -v vswhere.exe 2>/dev/null || true
+}
+
+# msvc_locate : 输出含 VC 工具链的 VS/Build Tools 安装根;找不到返回 1。
+# 只过滤 VC 工具链组件,不强求 Windows SDK:SDK 组件 id 随系统而异
+# (Win10=Windows10SDK、Win11=Windows11SDK.<ver>),硬编码任一都会漏掉另一半;
+# 是否可用由 vcvars64.bat 存在性 + 构建期探测兜底。
 msvc_locate() {
   # ${VSINSTALLDIR:-} 而非 $VSINSTALLDIR:set -u 下未设置即展开会直接崩,须给默认空
   if [ -n "${VSINSTALLDIR:-}" ] && [ -x "$(msvc_vcvars_path "$VSINSTALLDIR")" ]; then
     printf '%s' "$VSINSTALLDIR"; return 0
   fi
-  if [ -n "$VSWHERE" ]; then
-    local root
-    root="$("$VSWHERE" -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -requires Microsoft.VisualStudio.Component.Windows10SDK -property installationPath 2>/dev/null | tr -d '\r' || true)"
+  local vswhere root
+  vswhere="$(msvc_resolve_vswhere)"
+  if [ -n "$vswhere" ]; then
+    root="$("$vswhere" -latest -products '*' \
+      -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 \
+      -property installationPath 2>/dev/null | tr -d '\r' || true)"
     if [ -n "$root" ] && [ -x "$(msvc_vcvars_path "$root")" ]; then
       # vswhere 输出 Windows 路径,转 POSIX
       if has cygpath; then root="$(cygpath -u "$root" 2>/dev/null || printf '%s' "$root")"; fi
