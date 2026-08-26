@@ -52,22 +52,46 @@ msvc_disk_roots() {
   done
 }
 
+# msvc_has_toolset <root> : root 是否含 C++ 工具集(存在 VC/Tools/MSVC 目录)。
+# 这是「装了使用 C++ 的桌面开发 / VCTools」的可靠判据,对齐 paint-pc find_vs。
+msvc_has_toolset() {
+  [ -d "$1/VC/Tools/MSVC" ]
+}
+
+# msvc_is_vs_root <root> : root 是否可用作 VS 根(有工具集目录 或 有 vcvars64.bat)。
+msvc_is_vs_root() {
+  msvc_has_toolset "$1" || [ -x "$(msvc_vcvars_path "$1")" ]
+}
+
+# msvc_find_vcvars <root> : 输出 vcvars64.bat 的 POSIX 路径;找不到输出空。
+# 先看 root 下常规位置,再全盘兜底(兼容 Insiders/自定义布局下 vcvars 路径差异)。
+# 对齐 paint-pc find_vcvars。
+msvc_find_vcvars() {
+  local root="${1:-}" base vc
+  if [ -n "$root" ] && [ -x "$root/VC/Auxiliary/Build/vcvars64.bat" ]; then
+    printf '%s' "$root/VC/Auxiliary/Build/vcvars64.bat"; return 0
+  fi
+  for base in "${MSVC_DISK_BASES[@]}"; do
+    [ -d "$base" ] || continue
+    vc="$(find "$base" -type f -name vcvars64.bat -path '*/VC/Auxiliary/Build/vcvars64.bat' 2>/dev/null | head -n1)"
+    [ -n "$vc" ] && { printf '%s' "$vc"; return 0; }
+  done
+  return 1
+}
+
 # msvc_locate : 输出含 VC 工具链的 VS/Build Tools 安装根(POSIX 路径);找不到返回 1。
-# 定位顺序(参照 paint-pc 已验证逻辑):VSINSTALLDIR → vswhere(-all,-requires 两连击) →
-# 磁盘扫描 VC/Tools/MSVC。只要求 VC 工具链组件,不强求 Windows SDK(SDK id 随系统而异)。
+# 定位顺序(对齐 paint-pc 已验证 find_vs):VSINSTALLDIR → vswhere(-all,-requires 两连击) →
+# 磁盘扫描 VC/Tools/MSVC。判据 = 工具集目录存在(msvc_is_vs_root),不强求 vcvars64.bat
+# 在猜测路径 —— vcvars 由 msvc_find_vcvars 单独定位(含全盘兜底)。
 msvc_locate() {
   # ${VSINSTALLDIR:-} 而非 $VSINSTALLDIR:set -u 下未设置即展开会直接崩,须给默认空。
   # 关键:捕获也要用 ${VSINSTALLDIR:-} —— VSINSTALLDIR 根本未设置时,local vs="$VSINSTALLDIR"
   # 照样展开崩,一样中招。
-  local vs="${VSINSTALLDIR:-}" root vcvars
+  local vs="${VSINSTALLDIR:-}" root vswhere diskroot
   if [ -n "$vs" ]; then
     vs="$(msvc_to_posix "$vs")"
-    vcvars="$(msvc_vcvars_path "$vs")"
-    if [ -x "$vcvars" ]; then
-      printf '%s' "$vs"; return 0
-    fi
+    if msvc_is_vs_root "$vs"; then printf '%s' "$vs"; return 0; fi
   fi
-  local vswhere
   vswhere="$(msvc_resolve_vswhere)"
   if [ -n "$vswhere" ]; then
     # 关键:-all 必须有 —— 否则 vswhere 默认隐藏 Insiders/预览版(用户 VS 装在
@@ -79,23 +103,16 @@ msvc_locate() {
     [ -z "$root" ] && root="$("$vswhere" -all -latest -products '*' \
       -property installationPath 2>/dev/null | tr -d '\r' | head -n1 || true)"
     if [ -n "$root" ]; then
-      # vswhere 输出反斜杠 Windows 路径 → 先转 POSIX,再查存在性。
+      # vswhere 输出反斜杠 Windows 路径 → 先转 POSIX,再判可用。
       # 顺序不能反:MSYS2 里 [ -x "C:\..." ] 会把反斜杠当普通字符,按相对路径判 → 恒失败。
       root="$(msvc_to_posix "$root")"
-      vcvars="$(msvc_vcvars_path "$root")"
-      if [ -x "$vcvars" ]; then
-        printf '%s' "$root"; return 0
-      fi
+      if msvc_is_vs_root "$root"; then printf '%s' "$root"; return 0; fi
     fi
   fi
-  # 兜底:vswhere 漏报时,直接扫磁盘 VC/Tools/MSVC(sort -r → 新版在前,如 2026 > 2022)
-  local diskroot
+  # 兜底:vswhere 漏报时,直接扫磁盘 VC/Tools/MSVC(64 位根在前;base 内 sort -r 新版优先)
   while IFS= read -r diskroot; do
     [ -n "$diskroot" ] || continue
-    vcvars="$(msvc_vcvars_path "$diskroot")"
-    if [ -x "$vcvars" ]; then
-      printf '%s' "$diskroot"; return 0
-    fi
+    if msvc_is_vs_root "$diskroot"; then printf '%s' "$diskroot"; return 0; fi
   done < <(msvc_disk_roots)
   return 1
 }
@@ -132,14 +149,20 @@ msvc_ensure() {
 }
 
 # msvc_write_vcvars_sh <root> : 写 .user-deps/vcvars.sh(记录 vcvars64.bat 路径)。
+# vcvars 经 msvc_find_vcvars 定位(含全盘兜底),不写死 root 下的猜测路径。
 msvc_write_vcvars_sh() {
-  local root="$1" out="${2:-}"
+  local root="$1" out="${2:-}" vcvars
   [ -n "$out" ] || out="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/.user-deps/vcvars.sh"
+  vcvars="$(msvc_find_vcvars "$root")"
+  if [ -z "$vcvars" ]; then
+    err "定位到 MSVC(root=$root)但找不到 vcvars64.bat"
+    return 1
+  fi
   mkdir -p "$(dirname "$out")"
   cat > "$out" <<EOF
 # MSVC 环境(由 deps_lib/msvc.sh 生成)。构建前 source 以拿到 vcvars64 环境。
 export VS_INSTALL_ROOT="$root"
-export VC_VARS_BAT="$(msvc_vcvars_path "$root")"
+export VC_VARS_BAT="$vcvars"
 # 用法:cmd /c "\"\$VC_VARS_BAT\" && set" 可导出完整环境;cmake 会自动找到 cl。
 EOF
   info "已生成 $out"

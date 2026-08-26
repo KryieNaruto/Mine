@@ -140,3 +140,24 @@ got="$( ( unset VSINSTALLDIR; PATH="$TMPD/emptybin:$PATH" msvc_locate ) )" \
   || { echo "FAIL: 磁盘扫描兜底未命中(用户已装 VS 但 vswhere 漏报)"; exit 1; }
 [ "$got" = "$DISKROOT/2026/Insiders" ] || { echo "FAIL: 磁盘扫描 root 错误(应选新版2026/Insiders): $got"; exit 1; }
 echo "PASS 磁盘扫描兜底命中已装 VS(2026/Insiders 优先)"
+
+# 7) msvc_find_vcvars:root 常规位置缺 vcvars 时,全盘兜底应找到其它位置的 vcvars64.bat。
+# paint-pc 的 find_vcvars 就是这么做的(定位 VS 根不依赖 vcvars 路径,vcvars 另找)。
+# 构造:2026/Insiders 无常规 vcvars,只有 2022 有 → 兜底应命中 2022 的。
+DISKROOT2="$TMPD/diskroots2"
+mkdir -p "$DISKROOT2/2026/Insiders/VC/Auxiliary/Build" \
+         "$DISKROOT2/2022/BuildTools/VC/Auxiliary/Build"
+touch "$DISKROOT2/2022/BuildTools/VC/Auxiliary/Build/vcvars64.bat"
+chmod +x "$DISKROOT2/2022/BuildTools/VC/Auxiliary/Build/vcvars64.bat"
+MSVC_DISK_BASES=("$DISKROOT2")   # 覆盖扫描根,让兜底只在这两个里找
+VCVARS_FALLBACK="$DISKROOT2/2022/BuildTools/VC/Auxiliary/Build/vcvars64.bat"
+gotvc="$(msvc_find_vcvars "$DISKROOT2/2026/Insiders")"
+[ "$gotvc" = "$VCVARS_FALLBACK" ] || { echo "FAIL: msvc_find_vcvars 全盘兜底错误: $gotvc"; exit 1; }
+echo "PASS msvc_find_vcvars 全盘兜底找到 vcvars64.bat"
+
+# 8) msvc_write_vcvars_sh:VC_VARS_BAT 应指向 msvc_find_vcvars 实际找到的路径(非猜测位)。
+MSVC_DISK_BASES=("$DISKROOT2")
+OUTSH="$TMPD/vcvars_out.sh"
+msvc_write_vcvars_sh "$DISKROOT2/2026/Insiders" "$OUTSH"
+grep -q "VC_VARS_BAT=\"$VCVARS_FALLBACK\"" "$OUTSH" || { echo "FAIL: vcvars.sh 未写全盘兜底路径"; exit 1; }
+echo "PASS msvc_write_vcvars_sh 写全盘兜底 vcvars 路径"
