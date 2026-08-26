@@ -152,7 +152,9 @@ class TestMsvcConfigureCommand(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
         root = tmp.name
         d = os.path.join(root, "third_party", "_install", "abseil-cpp-20260817.0", "release")
-        os.makedirs(d); open(os.path.join(d, ".built"), "w").write("")
+        os.makedirs(d)
+        with open(os.path.join(d, ".built"), "w") as f:
+            f.write("")
         return root
 
     def test_no_mingw64_and_msvc_runtime(self):
