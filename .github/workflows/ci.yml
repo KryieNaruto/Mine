@@ -35,12 +35,10 @@ jobs:
           install: >-
             base-devel
             git
-            mingw-w64-x86_64-gcc
             mingw-w64-x86_64-cmake
             mingw-w64-x86_64-ninja
             mingw-w64-x86_64-pkgconf
             mingw-w64-x86_64-python
-            mingw-w64-x86_64-qt6-base
             unzip
       - name: 环境部署
         run: |

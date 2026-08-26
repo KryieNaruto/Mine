@@ -41,6 +41,11 @@ def configure_command(root: str, lib: LibSpec, variant: str) -> list:
     # MSVC 工具链:统一动态 CRT,避免静态/动态 ABI 冲突。恒加、不受 on_windows 影响:
     # Linux 下 CMake 只把它当未消费缓存变量,无副作用;Windows/MSVC 下生效。
     cmd.append("-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL")
+    # Windows 强制用 MSVC cl,避免 PATH 里残留 g++(MinGW)时 CMake 选错编译器。
+    # MSVC 预编译/Qt6 均要求 cl;SwiftShader 等含 __nop() 等 MSVC-only 代码,GCC 编译必崩。
+    if pool.on_windows():
+        cmd.append("-DCMAKE_C_COMPILER=cl")
+        cmd.append("-DCMAKE_CXX_COMPILER=cl")
     return cmd
 
 

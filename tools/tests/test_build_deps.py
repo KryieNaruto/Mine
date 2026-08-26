@@ -2,6 +2,7 @@ import importlib.util
 import os
 import sys
 import unittest
+from unittest import mock
 
 _TOOLS = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _TOOLS)  # tools/ 便于 deps_lib 导入
@@ -10,6 +11,8 @@ _spec = importlib.util.spec_from_file_location(
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 topo_expand = _mod.topo_expand
+_ensure_msvc_env = _mod._ensure_msvc_env
+_vcvars_bat = _mod._vcvars_bat
 
 from deps_lib.manifest import LibSpec
 
@@ -44,6 +47,63 @@ class TestTopoExpand(unittest.TestCase):
         libs = [_lib("B", ("nope",))]
         with self.assertRaises(RuntimeError):
             topo_expand(libs, {})
+
+
+class _FakeRun:
+    """mock subprocess.run:返回 {stdout, returncode} 假对象。"""
+    def __init__(self, stdout="", rc=0):
+        self.stdout = stdout
+        self.returncode = rc
+        self.stderr = ""
+
+
+class TestEnsureMsvcEnv(unittest.TestCase):
+    def setUp(self):
+        self._old = dict(os.environ)
+        # 清掉可能存在的 MSVC 环境,保证走注入分支
+        for k in ("VCINSTALLDIR",):
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self._old)
+
+    def _force_win(self):
+        return mock.patch.object(_mod.pool, "on_windows", return_value=True)
+
+    def test_linux_noop(self):
+        with mock.patch.object(_mod.pool, "on_windows", return_value=False):
+            self.assertTrue(_ensure_msvc_env())
+
+    def test_injects_vcvars_env_into_os_environ(self):
+        # Windows + 找到 vcvars + cmd 导出含 cl → 环境被注入
+        fake = _FakeRun(stdout="PATH=C:\\vc\\bin;X\nINCLUDE=C:\\vc\\inc\n", rc=0)
+        with self._force_win(), \
+             mock.patch.object(_mod, "_vcvars_bat", return_value=r"C:\vc\vcvars64.bat"), \
+             mock.patch.object(_mod.subprocess, "run", return_value=fake), \
+             mock.patch.object(_mod.shutil, "which", return_value=r"C:\vc\bin\cl.exe"):
+            self.assertTrue(_ensure_msvc_env())
+        self.assertEqual(os.environ.get("INCLUDE"), r"C:\vc\inc")
+
+    def test_no_vcvars_returns_false(self):
+        with self._force_win(), \
+             mock.patch.object(_mod, "_vcvars_bat", return_value=""):
+            self.assertFalse(_ensure_msvc_env())
+
+    def test_vcvars_fails_returns_false(self):
+        fake = _FakeRun(stdout="", rc=1)
+        with self._force_win(), \
+             mock.patch.object(_mod, "_vcvars_bat", return_value=r"C:\vc\vcvars64.bat"), \
+             mock.patch.object(_mod.subprocess, "run", return_value=fake):
+            self.assertFalse(_ensure_msvc_env())
+
+    def test_no_cl_after_inject_returns_false(self):
+        fake = _FakeRun(stdout="PATH=C:\\vc\\bin;X\n", rc=0)
+        with self._force_win(), \
+             mock.patch.object(_mod, "_vcvars_bat", return_value=r"C:\vc\vcvars64.bat"), \
+             mock.patch.object(_mod.subprocess, "run", return_value=fake), \
+             mock.patch.object(_mod.shutil, "which", return_value=None):
+            self.assertFalse(_ensure_msvc_env())
 
 
 if __name__ == "__main__":

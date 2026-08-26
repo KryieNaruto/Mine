@@ -167,6 +167,25 @@ class TestMsvcConfigureCommand(unittest.TestCase):
         # 注入已 build 的 MSVC 池前缀(abseil)
         self.assertIn(os.path.join(root, "third_party", "_install", "abseil-cpp-20260817.0", "release"), joined)
 
+    def test_windows_forces_cl_compiler(self):
+        # Windows:configure 必须显式指定 cl,否则 PATH 里残留 g++ 时 CMake 选错(MingW 编 SwiftShader 必崩)
+        root = self._make_pool()
+        lib = LibSpec(name="fmt", repo="r", tag="10.2.1")
+        with mock.patch.object(cmake_driver.pool, "on_windows", return_value=True):
+            cmd = cmake_driver.configure_command(root, lib, "release")
+        joined = " ".join(cmd)
+        self.assertIn("-DCMAKE_C_COMPILER=cl", joined)
+        self.assertIn("-DCMAKE_CXX_COMPILER=cl", joined)
+
+    def test_linux_does_not_force_cl(self):
+        root = self._make_pool()
+        lib = LibSpec(name="fmt", repo="r", tag="10.2.1")
+        with mock.patch.object(cmake_driver.pool, "on_windows", return_value=False):
+            cmd = cmake_driver.configure_command(root, lib, "release")
+        joined = " ".join(cmd)
+        self.assertNotIn("-DCMAKE_C_COMPILER=cl", joined)
+        self.assertNotIn("-DCMAKE_CXX_COMPILER=cl", joined)
+
 
 if __name__ == "__main__":
     unittest.main()
