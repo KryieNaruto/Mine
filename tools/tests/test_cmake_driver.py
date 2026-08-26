@@ -147,5 +147,24 @@ class TestBuildLib(unittest.TestCase):
         self.assertFalse(os.path.exists(built))
 
 
+class TestMsvcConfigureCommand(unittest.TestCase):
+    def _make_pool(self):
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        root = tmp.name
+        d = os.path.join(root, "third_party", "_install", "abseil-cpp-20260817.0", "release")
+        os.makedirs(d); open(os.path.join(d, ".built"), "w").write("")
+        return root
+
+    def test_no_mingw64_and_msvc_runtime(self):
+        root = self._make_pool()
+        lib = LibSpec(name="fmt", repo="r", tag="10.2.1")
+        cmd = cmake_driver.configure_command(root, lib, "release")
+        joined = " ".join(cmd)
+        self.assertNotIn("/mingw64", joined)
+        self.assertIn("-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL", joined)
+        # 注入已 build 的 MSVC 池前缀(abseil)
+        self.assertIn(os.path.join(root, "third_party", "_install", "abseil-cpp-20260817.0", "release"), joined)
+
+
 if __name__ == "__main__":
     unittest.main()
