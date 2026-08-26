@@ -48,7 +48,54 @@ got="$(PATH="$TMPD/bin:$PATH" VSINSTALLDIR= msvc_locate)" \
 [ "$got" = "$FAKE_VS" ] || { echo "FAIL locate(现找)root: $got"; exit 1; }
 echo "PASS vswhere 每次调用现找(装后重新定位)"
 
-# 4) 回归:vswhere 过滤只要求 VC 工具链,不得硬编码 Windows10SDK。
+# 4) 回归:vswhere 输出的反斜杠 Windows 路径(C:\...)必须先转 POSIX(/c/...)再判存在。
+# 真实环境:MSYS2 的 cygpath 把 C:\... → /c/...;这里用假 cygpath 模拟,保证任何平台可测。
+# 若定位在转换前用 [ -x "C:\..." ] 判存在(反斜杠当普通字符→相对路径),必失败 → 本次必红。
+CYPATH="$TMPD/cygpath"
+mkdir -p "$(dirname "$CYPATH")"
+cat > "$CYPATH" <<EOF
+#!/usr/bin/env bash
+# 模拟 MSYS2 cygpath -u:Windows 盘符路径 C:\X\Y → $TMPD/X/Y(映射到临时目录,保证任何平台可建目录判存在);
+# 已有 POSIX 路径则原样返回。
+case "\$1" in
+  -u) ;;
+  *) exit 0 ;;
+esac
+in="\$2"
+if [[ "\$in" =~ ^([A-Za-z]):(.*)$ ]]; then
+  printf '%s%s\n' "$TMPD" "\$(printf '%s' "\${BASH_REMATCH[2]}" | sed 's|\\\\|/|g')"
+else
+  printf '%s\n' "\$in"
+fi
+EOF
+chmod +x "$CYPATH"
+
+# 让 msvc.sh 认为有 cygpath(在其源码里 has cygpath → command -v)
+CYG_BIN="$TMPD/cygbin"
+mkdir -p "$CYG_BIN"
+ln -sf "$CYPATH" "$CYG_BIN/cygpath"
+
+# 假 vswhere 输出反斜杠路径(真实 vswhere 行为)
+FAKE_VS_WIN="C:\\\\Program Files (x86)\\\\Microsoft Visual Studio\\\\2022\\\\BuildTools"
+# 假 cygpath 把 C:\... 映射到临时目录;此处即假 vswhere 实例根
+FAKE_VS_POSIX="$TMPD/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools"
+mkdir -p "$FAKE_VS_POSIX/VC/Auxiliary/Build"
+touch "$FAKE_VS_POSIX/VC/Auxiliary/Build/vcvars64.bat"
+chmod +x "$FAKE_VS_POSIX/VC/Auxiliary/Build/vcvars64.bat"
+cat > "$TMPD/bin/vswhere.exe" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$@" >> "$ARGS_LOG"
+for a in "\$@"; do [ "\$a" = "-property" ] && { printf '%s\n' "$FAKE_VS_WIN"; exit 0; }; done
+exit 0
+EOF
+chmod +x "$TMPD/bin/vswhere.exe"
+
+got="$(PATH="$TMPD/bin:$CYG_BIN:$PATH" VSINSTALLDIR= msvc_locate)" \
+  || { echo "FAIL: 反斜杠 Windows 路径定位失败(vswhere 输出未先转 POSIX?)"; exit 1; }
+[ "$got" = "$FAKE_VS_POSIX" ] || { echo "FAIL: 反斜杠路径转换后 root 错误: $got"; exit 1; }
+echo "PASS vswhere 反斜杠路径先转 POSIX 再判存在"
+
+# 5) 回归:vswhere 过滤只要求 VC 工具链,不得硬编码 Windows10SDK。
 # Windows SDK 组件 id 随系统而异(Win10=Windows10SDK、Win11=Windows11SDK.<ver>),
 # 硬编码 Windows10SDK 会漏掉 Win11 实例导致已装仍定位失败。vcvars64.bat 存在性已是可靠判定。
 : > "$ARGS_LOG"

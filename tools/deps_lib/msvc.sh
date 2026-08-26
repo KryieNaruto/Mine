@@ -24,25 +24,40 @@ msvc_resolve_vswhere() {
   command -v vswhere.exe 2>/dev/null || true
 }
 
-# msvc_locate : 输出含 VC 工具链的 VS/Build Tools 安装根;找不到返回 1。
+# msvc_to_posix <path> : Windows 路径(反斜杠,如 C:\...)转 POSIX(/c/...);已有 POSIX 则原样。
+msvc_to_posix() {
+  if has cygpath; then cygpath -u "$1" 2>/dev/null || printf '%s' "$1"
+  else printf '%s' "$1"; fi
+}
+
+# msvc_locate : 输出含 VC 工具链的 VS/Build Tools 安装根(POSIX 路径);找不到返回 1。
 # 只过滤 VC 工具链组件,不强求 Windows SDK:SDK 组件 id 随系统而异
 # (Win10=Windows10SDK、Win11=Windows11SDK.<ver>),硬编码任一都会漏掉另一半;
 # 是否可用由 vcvars64.bat 存在性 + 构建期探测兜底。
 msvc_locate() {
   # ${VSINSTALLDIR:-} 而非 $VSINSTALLDIR:set -u 下未设置即展开会直接崩,须给默认空
-  if [ -n "${VSINSTALLDIR:-}" ] && [ -x "$(msvc_vcvars_path "$VSINSTALLDIR")" ]; then
-    printf '%s' "$VSINSTALLDIR"; return 0
+  local vs="$VSINSTALLDIR" root vcvars
+  if [ -n "${vs:-}" ]; then
+    vs="$(msvc_to_posix "$vs")"
+    vcvars="$(msvc_vcvars_path "$vs")"
+    if [ -x "$vcvars" ]; then
+      printf '%s' "$vs"; return 0
+    fi
   fi
-  local vswhere root
+  local vswhere
   vswhere="$(msvc_resolve_vswhere)"
   if [ -n "$vswhere" ]; then
+    # vswhere 输出反斜杠 Windows 路径 → 先转 POSIX,再查 vcvars 存在性。
+    # 顺序不能反:MSYS2 里 [ -x "C:\..." ] 会把反斜杠当普通字符,按相对路径判 → 恒失败。
     root="$("$vswhere" -latest -products '*' \
       -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 \
       -property installationPath 2>/dev/null | tr -d '\r' || true)"
-    if [ -n "$root" ] && [ -x "$(msvc_vcvars_path "$root")" ]; then
-      # vswhere 输出 Windows 路径,转 POSIX
-      if has cygpath; then root="$(cygpath -u "$root" 2>/dev/null || printf '%s' "$root")"; fi
-      printf '%s' "$root"; return 0
+    if [ -n "$root" ]; then
+      root="$(msvc_to_posix "$root")"
+      vcvars="$(msvc_vcvars_path "$root")"
+      if [ -x "$vcvars" ]; then
+        printf '%s' "$root"; return 0
+      fi
     fi
   fi
   return 1
