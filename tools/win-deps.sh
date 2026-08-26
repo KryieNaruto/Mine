@@ -90,12 +90,14 @@ fi
 
 # --- ③ 三方库中声明了 windows_package 的:用 pacman 预编译包,不源码编译 ---
 # 解析 deps.yaml,凡 lib 带 windows_package 字段 → pacman 安装(如 abseil-cpp)。
+# 根经参数传入(不依赖未 export 的 MINE_ROOT),由 deps_lib/manifest 统一解析。
 PAC_LIBS="$(python3 -c "
-import os, yaml
-m = yaml.safe_load(open(os.path.join(os.environ['MINE_ROOT'], 'third_party', 'deps.yaml'), encoding='utf-8'))
-pkgs = [v['windows_package'] for v in (m.get('libs') or {}).values() if v.get('windows_package')]
+import sys
+sys.path.insert(0, sys.argv[1])
+from deps_lib import manifest
+pkgs = manifest.extract_windows_packages(manifest.load_global_manifest(sys.argv[2]))
 print(' '.join(pkgs))
-" 2>/dev/null)"
+" "$MINE_ROOT/tools" "$MINE_ROOT")"
 if [ -n "$PAC_LIBS" ]; then
   info "③ pacman 安装 windows_package 三方库: $PAC_LIBS"
   pacman -S --needed --noconfirm $PAC_LIBS

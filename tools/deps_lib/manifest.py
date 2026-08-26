@@ -74,3 +74,12 @@ def all_libs(global_manifest: dict) -> list:
 
 def variants(global_manifest: dict) -> list:
     return global_manifest.get("variants", ["release", "debug"]) or ["release", "debug"]
+
+
+def extract_windows_packages(global_manifest: dict) -> list:
+    """所有声明了 windows_package 的库 → pacman 预编译包名列表(Windows 用)。"""
+    return [
+        spec.windows_package
+        for spec in all_libs(global_manifest)
+        if spec.windows_package
+    ]

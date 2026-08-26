@@ -44,5 +44,26 @@ class TestResolve(unittest.TestCase):
         self.assertEqual([s.name for s in specs], ["fmt", "glm"])
 
 
+class TestWindowsPackages(unittest.TestCase):
+    def test_extract_returns_windows_package_names(self):
+        gm = {
+            "libs": {
+                "abseil-cpp": {"repo": "x", "tag": "1", "windows_package": "mingw-w64-x86_64-abseil-cpp"},
+                "fmt": {"repo": "x", "tag": "1"},
+                "glfw": {"repo": "x", "tag": "1", "windows_package": "mingw-w64-x86_64-glfw"},
+            }
+        }
+        self.assertEqual(
+            manifest.extract_windows_packages(gm),
+            ["mingw-w64-x86_64-abseil-cpp", "mingw-w64-x86_64-glfw"],
+        )
+
+    def test_extract_empty_when_none(self):
+        self.assertEqual(manifest.extract_windows_packages({"libs": {}}), [])
+
+    def test_extract_tolerates_missing_libs_key(self):
+        self.assertEqual(manifest.extract_windows_packages({}), [])
+
+
 if __name__ == "__main__":
     unittest.main()
