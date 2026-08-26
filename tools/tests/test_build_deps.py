@@ -51,11 +51,22 @@ class TestTopoExpand(unittest.TestCase):
 
 
 class _FakeRun:
-    """mock subprocess.run:返回 {stdout, returncode} 假对象。"""
+    """mock subprocess.run:把 stdout 写到子进程的 stdout 文件对象,返回 {returncode}。
+
+    现在 _ensure_msvc_env 用文件重定向(不再 capture_output),mock 须把内容写入
+    run 收到的 stdout 文件对象,代码才会从文件读回注入环境。
+    """
     def __init__(self, stdout="", rc=0):
-        self.stdout = stdout
+        self._stdout = stdout
         self.returncode = rc
-        self.stderr = ""
+
+    def __call__(self, cmd, **kwargs):
+        f = kwargs.get("stdout")
+        if f is not None:
+            f.write(self._stdout.encode("utf-8"))
+            f.flush()
+            f.close()
+        return self
 
 
 class TestEnsureMsvcEnv(unittest.TestCase):
@@ -81,7 +92,7 @@ class TestEnsureMsvcEnv(unittest.TestCase):
         fake = _FakeRun(stdout="PATH=C:\\vc\\bin;X\nINCLUDE=C:\\vc\\inc\n", rc=0)
         with self._force_win(), \
              mock.patch.object(_mod, "_vcvars_bat", return_value=r"C:\vc\vcvars64.bat"), \
-             mock.patch.object(_mod.subprocess, "run", return_value=fake), \
+             mock.patch.object(_mod.subprocess, "run", side_effect=fake), \
              mock.patch.object(_mod.shutil, "which", return_value=r"C:\vc\bin\cl.exe"):
             self.assertTrue(_ensure_msvc_env())
         self.assertEqual(os.environ.get("INCLUDE"), r"C:\vc\inc")
@@ -95,16 +106,35 @@ class TestEnsureMsvcEnv(unittest.TestCase):
         fake = _FakeRun(stdout="", rc=1)
         with self._force_win(), \
              mock.patch.object(_mod, "_vcvars_bat", return_value=r"C:\vc\vcvars64.bat"), \
-             mock.patch.object(_mod.subprocess, "run", return_value=fake):
+             mock.patch.object(_mod.subprocess, "run", side_effect=fake):
             self.assertFalse(_ensure_msvc_env())
 
     def test_no_cl_after_inject_returns_false(self):
         fake = _FakeRun(stdout="PATH=C:\\vc\\bin;X\n", rc=0)
         with self._force_win(), \
              mock.patch.object(_mod, "_vcvars_bat", return_value=r"C:\vc\vcvars64.bat"), \
-             mock.patch.object(_mod.subprocess, "run", return_value=fake), \
+             mock.patch.object(_mod.subprocess, "run", side_effect=fake), \
              mock.patch.object(_mod.shutil, "which", return_value=None):
             self.assertFalse(_ensure_msvc_env())
+
+    def test_uses_file_redirect_not_pipe_to_avoid_deadlock(self):
+        # 回归:`cmd //c vcvars && set` 的子进程链会持有 stdout 管道 → capture_output
+        # 等 EOF 永远等不到 → 屏幕只打印头部就卡死(本机已复现 capture_output 阻塞
+        # 3s+ 等后台子进程释放管道,timeout 不触发)。改为文件重定向(capture_output=False)
+        # 避免管道死锁;即便 cmd 链持有 stdout 也只是在文件上,无 EOF 可等。
+        fake = _FakeRun(stdout="PATH=C:\\vc\\bin;X\nINCLUDE=C:\\vc\\inc\n", rc=0)
+        with self._force_win(), \
+             mock.patch.object(_mod, "_vcvars_bat", return_value=r"C:\vc\vcvars64.bat"), \
+             mock.patch.object(_mod.subprocess, "run", side_effect=fake) as run, \
+             mock.patch.object(_mod.shutil, "which", return_value=r"C:\vc\bin\cl.exe"):
+            self.assertTrue(_ensure_msvc_env())
+        _, kwargs = run.call_args
+        self.assertFalse(kwargs.get("capture_output", False),
+                         "capture_output 用管道会与 vcvars 子进程链死锁,必须改文件重定向")
+        # stdout 必须是文件对象(重定向到文件),而非 capture_output 的管道
+        self.assertTrue(hasattr(kwargs.get("stdout"), "write"),
+                        "stdout 应为文件对象,避免管道 EOF 死锁")
+        self.assertNotIn("stderr", kwargs)
 
 
 class TestVcvarsBat(unittest.TestCase):

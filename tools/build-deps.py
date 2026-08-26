@@ -54,6 +54,16 @@ def _vcvars_bat() -> str:
     return plain[0] if plain else ""
 
 
+def _tail(path: str, n: int = 800) -> str:
+    """读文件尾部 n 字节(失败回退空串),用于 vcvars 导出失败的报错展示。"""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            data = f.read()
+        return data[-n:]
+    except OSError:
+        return ""
+
+
 def _ensure_msvc_env() -> bool:
     """Windows 上把 MSVC(vcvars64)环境注入 os.environ,确保池用 cl 编译。
 
@@ -71,19 +81,33 @@ def _ensure_msvc_env() -> bool:
         print("[ERROR] 未找到 vcvars64.bat。请先运行 tools/install-user-deps.sh(win-deps.sh 会定位/装 Build Tools 并写 .user-deps/vcvars.sh)。",
               file=sys.stderr)
         return False
+    # 用文件重定向而非管道(capture_output)读 vcvars 的 `set` 输出:
+    # cmd 的子进程链(vcvars 会拉起更多 bat)会持有 stdout 管道,capture_output 等 EOF
+    # 永远等不到 → 本脚本在打印头部后静默卡死(本机已复现 capture_output 等后台
+    # 子进程释放管道阻塞数秒)。文件上无 EOF 可等,不会死锁。用二进制写避免
+    # Windows 文本模式换行/编码坑。
+    import tempfile
+    env_txt = os.path.join(tempfile.gettempdir(), f"vcvars_{os.getpid()}.txt")
+    out = None
+    print(f"[INFO] 注入 MSVC 环境(vcvars64: {vcvars}) …", flush=True)
     try:
-        out = subprocess.run(
-            ["cmd", "//c", f'"{vcvars}" && set'],
-            capture_output=True, text=True, errors="replace", timeout=120,
-        )
+        with open(env_txt, "wb") as _f:
+            _f.write(b"")
+            _f.flush()
+            out = subprocess.run(
+                ["cmd", "//c", f'"{vcvars}" && set'],
+                stdout=_f, timeout=120,
+            )
     except (OSError, subprocess.TimeoutExpired) as e:
         print(f"[ERROR] 无法执行 vcvars64.bat: {e}", file=sys.stderr)
         return False
     if out.returncode != 0:
-        print(f"[ERROR] vcvars64.bat 执行失败(rc={out.returncode}):\n{out.stderr[-800:]}", file=sys.stderr)
+        print(f"[ERROR] vcvars64.bat 执行失败(rc={out.returncode}):\n{_tail(env_txt, 800)}", file=sys.stderr)
         return False
     applied = 0
-    for line in out.stdout.splitlines():
+    with open(env_txt, "r", encoding="utf-8", errors="replace") as _f:
+        out_text = _f.read()
+    for line in out_text.splitlines():
         # vcvars 的 set 输出形如 "PATH=C:\...;..."(首行可能是提示/空行,按 = 切首个)
         if "=" not in line:
             continue
