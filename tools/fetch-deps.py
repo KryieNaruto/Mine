@@ -26,8 +26,8 @@ def main(argv=None) -> int:
     summary = fetch.run(MINE_ROOT, libs, args.jobs)
     for k in ("fetched", "skipped", "failed"):
         for item in summary[k]:
-            print(f"[{k.upper()}] {item}")
-    print(f"汇总: 拉取 {len(summary['fetched'])} / 跳过 {len(summary['skipped'])} / 失败 {len(summary['failed'])}")
+            print(f"[{k.upper()}] {item}", flush=True)
+    print(f"汇总: 拉取 {len(summary['fetched'])} / 跳过 {len(summary['skipped'])} / 失败 {len(summary['failed'])}", flush=True)
     return 1 if summary["failed"] else 0
 
 

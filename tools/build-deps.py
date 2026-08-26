@@ -112,7 +112,7 @@ def main(argv=None) -> int:
             if pool.is_built(MINE_ROOT, lib.name, lib.tag, v):
                 summary["skipped"].append(key)
                 continue
-            print(f"编译 {manifest.ver_dir(lib.name, lib.tag)} [{v}] …")
+            print(f"编译 {manifest.ver_dir(lib.name, lib.tag)} [{v}] …", flush=True)
             ok, err = cmake_driver.build_lib(MINE_ROOT, lib, v, args.jobs)
             if ok:
                 summary["built"].append(key)
@@ -121,13 +121,13 @@ def main(argv=None) -> int:
                 lock[manifest.ver_dir(lib.name, lib.tag)]["built"][v] = True
             else:
                 summary["failed"].append(key)
-                print(f"  失败日志(尾部):\n{err[-2000:]}\n", file=sys.stderr)
+                print(f"  失败日志(尾部):\n{err[-2000:]}\n", file=sys.stderr, flush=True)
 
     pool.save_lock(MINE_ROOT, lock)
     for k in ("built", "skipped", "failed"):
         for item in summary[k]:
-            print(f"[{k.upper()}] {item}")
-    print(f"汇总: 已编 {len(summary['built'])} / 跳过 {len(summary['skipped'])} / 失败 {len(summary['failed'])}")
+            print(f"[{k.upper()}] {item}", flush=True)
+    print(f"汇总: 已编 {len(summary['built'])} / 跳过 {len(summary['skipped'])} / 失败 {len(summary['failed'])}", flush=True)
     return 1 if summary["failed"] else 0
 
 

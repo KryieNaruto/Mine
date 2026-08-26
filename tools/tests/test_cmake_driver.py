@@ -2,6 +2,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # tools/
 from deps_lib import cmake_driver
@@ -64,6 +65,86 @@ class TestPrefixPathInjection(unittest.TestCase):
         lib = LibSpec(name="fmt", repo="r", tag="10.2.1")
         cmd = cmake_driver.configure_command(root, lib, "release")
         self.assertNotIn("-DCMAKE_PREFIX_PATH=", " ".join(cmd))
+
+
+class _FakeProc:
+    def __init__(self, lines, rc):
+        self._lines = list(lines)
+        self._rc = rc
+        self.stdout = _FakeIter(self._lines)
+
+    def wait(self):
+        return self._rc
+
+
+class _FakeIter:
+    def __init__(self, lines):
+        self._lines = lines
+        self._i = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._i >= len(self._lines):
+            raise StopIteration
+        line = self._lines[self._i]
+        self._i += 1
+        return line
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class TestStream(unittest.TestCase):
+    def test_real_passthrough_and_tail_on_failure(self):
+        # 真子进程:非零退出,输出被透传且尾部留作失败日志
+        ok, tail = cmake_driver._stream(
+            [sys.executable, "-c", "print('line-a'); print('line-b'); raise SystemExit(2)"]
+        )
+        self.assertFalse(ok)
+        self.assertIn("line-a", tail)
+        self.assertIn("line-b", tail)
+
+    def test_real_success(self):
+        ok, tail = cmake_driver._stream([sys.executable, "-c", "print('hello')"])
+        self.assertTrue(ok)
+        self.assertIn("hello", tail)
+
+    def test_missing_command(self):
+        ok, tail = cmake_driver._stream(["/nonexistent/cmd-xyz"])
+        self.assertFalse(ok)
+        self.assertIn("命令不存在", tail)
+
+
+class TestBuildLib(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = self.tmp.name
+
+    def test_success_writes_built(self):
+        lib = LibSpec(name="fmt", repo="r", tag="10.2.1")
+        with mock.patch.object(cmake_driver, "_post_install_copy", return_value=(True, "")), \
+             mock.patch("deps_lib.cmake_driver.subprocess.Popen",
+                        return_value=_FakeProc([], 0)):
+            ok, err = cmake_driver.build_lib(self.root, lib, "release", jobs=2)
+        self.assertTrue(ok, err)
+        built = os.path.join(self.root, "third_party", "_install", "fmt-10.2.1", "release", ".built")
+        self.assertTrue(os.path.isfile(built))
+
+    def test_failure_no_built(self):
+        lib = LibSpec(name="fmt", repo="r", tag="10.2.1")
+        with mock.patch("deps_lib.cmake_driver.subprocess.Popen",
+                        return_value=_FakeProc(["configure boom"], 3)):
+            ok, err = cmake_driver.build_lib(self.root, lib, "release", jobs=2)
+        self.assertFalse(ok)
+        self.assertIn("configure boom", err)
+        built = os.path.join(self.root, "third_party", "_install", "fmt-10.2.1", "release", ".built")
+        self.assertFalse(os.path.exists(built))
 
 
 if __name__ == "__main__":

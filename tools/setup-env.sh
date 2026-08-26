@@ -149,9 +149,9 @@ auto_install() {
   # 3) 三方库池:未拉则拉,未编则编
   if ! pool_built; then
     info "=== 拉取三方库源码 ==="
-    python3 "$MINE_ROOT/tools/fetch-deps.py" --all
+    python3 -u "$MINE_ROOT/tools/fetch-deps.py" --all
     info "=== 预编译三方库进池 ==="
-    python3 "$MINE_ROOT/tools/build-deps.py" --all
+    python3 -u "$MINE_ROOT/tools/build-deps.py" --all
   else
     info "=== 三方库池已就绪,跳过 fetch/build ==="
   fi
