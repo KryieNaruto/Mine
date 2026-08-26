@@ -30,10 +30,28 @@ msvc_to_posix() {
   else printf '%s' "$1"; fi
 }
 
+# 磁盘扫描的 VS 安装根(可被测试覆盖)。直接找 vcvars64.bat 真实文件,不依赖 vswhere。
+# 背景:用户已装完整 VS(如 2026,带 C++ 桌面开发即含 MSVC),但 vswhere 可能
+# (版本旧 / 实例未被注册)枚举不到新实例 → 只靠 vswhere 会误判"未装"并错装 Build Tools。
+MSVC_DISK_BASES=("/c/Program Files/Microsoft Visual Studio" "/c/Program Files (x86)/Microsoft Visual Studio")
+
+# msvc_disk_roots : 输出磁盘上所有含 VC 工具链(存在 vcvars64.bat)的 VS 安装根,新在前。
+msvc_disk_roots() {
+  local base vcvars
+  for base in "${MSVC_DISK_BASES[@]}"; do
+    [ -d "$base" ] || continue
+    while IFS= read -r vcvars; do
+      [ -x "$vcvars" ] || continue
+      printf '%s\n' "${vcvars%/VC/Auxiliary/Build/vcvars64.bat}"
+    done < <(find "$base" -type f -name vcvars64.bat \
+        -path '*/VC/Auxiliary/Build/vcvars64.bat' 2>/dev/null | sort -r)
+  done
+}
+
 # msvc_locate : 输出含 VC 工具链的 VS/Build Tools 安装根(POSIX 路径);找不到返回 1。
-# 只过滤 VC 工具链组件,不强求 Windows SDK:SDK 组件 id 随系统而异
-# (Win10=Windows10SDK、Win11=Windows11SDK.<ver>),硬编码任一都会漏掉另一半;
-# 是否可用由 vcvars64.bat 存在性 + 构建期探测兜底。
+# 三层:VSINSTALLDIR → vswhere → 磁盘扫描兜底。只要求 VC 工具链组件,
+# 不强求 Windows SDK:SDK 组件 id 随系统而异(Win10=Windows10SDK、Win11=Windows11SDK.<ver>),
+# 硬编码任一都会漏掉另一半;是否可用由 vcvars64.bat 存在性 + 构建期探测兜底。
 msvc_locate() {
   # ${VSINSTALLDIR:-} 而非 $VSINSTALLDIR:set -u 下未设置即展开会直接崩,须给默认空。
   # 关键:捕获也要用 ${VSINSTALLDIR:-} —— VSINSTALLDIR 根本未设置时,local vs="$VSINSTALLDIR"
@@ -62,6 +80,14 @@ msvc_locate() {
       fi
     fi
   fi
+  # 兜底:vswhere 漏报新 VS 实例时,直接扫磁盘 vcvars64.bat(sort -r → 新版在前,如 2026 > 2022)
+  local diskroot
+  while IFS= read -r diskroot; do
+    [ -n "$diskroot" ] || continue
+    if [ -x "$(msvc_vcvars_path "$diskroot")" ]; then
+      printf '%s' "$diskroot"; return 0
+    fi
+  done < <(msvc_disk_roots)
   return 1
 }
 

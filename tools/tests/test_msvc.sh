@@ -120,3 +120,19 @@ fi
 printf '%s' "$args" | grep -q 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64' \
   || { echo "FAIL: vswhere 未要求 VC 工具链组件"; exit 1; }
 echo "PASS vswhere 过滤不含 Windows10SDK,保留 VC.Tools.x86.x64"
+
+# 6) 兜底:磁盘扫描 —— 用户已装 VS(如 2026)但 vswhere 漏报时应直接从磁盘找到。
+# 覆盖扫描根为测试目录,模拟真实 VS 布局 <root>/<year>/<edition>/VC/Auxiliary/Build/vcvars64.bat。
+DISKROOT="$TMPD/diskroots"
+mkdir -p "$DISKROOT/2022/BuildTools/VC/Auxiliary/Build" "$DISKROOT/2026/Community/VC/Auxiliary/Build" \
+         "$TMPD/emptybin"
+touch "$DISKROOT/2022/BuildTools/VC/Auxiliary/Build/vcvars64.bat" \
+      "$DISKROOT/2026/Community/VC/Auxiliary/Build/vcvars64.bat"
+chmod +x "$DISKROOT/2022/BuildTools/VC/Auxiliary/Build/vcvars64.bat" \
+         "$DISKROOT/2026/Community/VC/Auxiliary/Build/vcvars64.bat"
+MSVC_DISK_BASES=("$DISKROOT")
+# 无 vswhere 环境 + VSINSTALLDIR 未设置 → 应命中磁盘扫描,且新版(2026)在前
+got="$( ( unset VSINSTALLDIR; PATH="$TMPD/emptybin:$PATH" msvc_locate ) )" \
+  || { echo "FAIL: 磁盘扫描兜底未命中(用户已装 VS 但 vswhere 漏报)"; exit 1; }
+[ "$got" = "$DISKROOT/2026/Community" ] || { echo "FAIL: 磁盘扫描 root 错误(应选新版2026): $got"; exit 1; }
+echo "PASS 磁盘扫描兜底命中已装 VS(2026 优先)"
