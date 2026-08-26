@@ -121,18 +121,22 @@ printf '%s' "$args" | grep -q 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64
   || { echo "FAIL: vswhere 未要求 VC 工具链组件"; exit 1; }
 echo "PASS vswhere 过滤不含 Windows10SDK,保留 VC.Tools.x86.x64"
 
-# 6) 兜底:磁盘扫描 —— 用户已装 VS(如 2026)但 vswhere 漏报时应直接从磁盘找到。
-# 覆盖扫描根为测试目录,模拟真实 VS 布局 <root>/<year>/<edition>/VC/Auxiliary/Build/vcvars64.bat。
+# 6) 兜底:磁盘扫描 —— 用户已装 VS(如 2026,含「使用 C++ 的桌面开发」)但 vswhere 漏报时应直接从磁盘找到。
+# 判据 = VC/Tools/MSVC 目录(工具集真实所在,证明装了 C++ 工作负载),且 vcvars64.bat 也需存在。
+# 2026 用 Insiders 布局(18/Insiders,即 paint-pc 注释里 -all 才能查到的场景),2022 为普通 BuildTools。
 DISKROOT="$TMPD/diskroots"
-mkdir -p "$DISKROOT/2022/BuildTools/VC/Auxiliary/Build" "$DISKROOT/2026/Community/VC/Auxiliary/Build" \
-         "$TMPD/emptybin"
+mkdir -p "$TMPD/emptybin" \
+         "$DISKROOT/2022/BuildTools/VC/Tools/MSVC/14.40/bin/Hostx64/x64" \
+         "$DISKROOT/2022/BuildTools/VC/Auxiliary/Build" \
+         "$DISKROOT/2026/Insiders/VC/Tools/MSVC/14.50/bin/Hostx64/x64" \
+         "$DISKROOT/2026/Insiders/VC/Auxiliary/Build"
 touch "$DISKROOT/2022/BuildTools/VC/Auxiliary/Build/vcvars64.bat" \
-      "$DISKROOT/2026/Community/VC/Auxiliary/Build/vcvars64.bat"
+      "$DISKROOT/2026/Insiders/VC/Auxiliary/Build/vcvars64.bat"
 chmod +x "$DISKROOT/2022/BuildTools/VC/Auxiliary/Build/vcvars64.bat" \
-         "$DISKROOT/2026/Community/VC/Auxiliary/Build/vcvars64.bat"
+         "$DISKROOT/2026/Insiders/VC/Auxiliary/Build/vcvars64.bat"
 MSVC_DISK_BASES=("$DISKROOT")
-# 无 vswhere 环境 + VSINSTALLDIR 未设置 → 应命中磁盘扫描,且新版(2026)在前
+# 无 vswhere 环境 + VSINSTALLDIR 未设置 → 应命中磁盘扫描,且新版(2026/Insiders)在前
 got="$( ( unset VSINSTALLDIR; PATH="$TMPD/emptybin:$PATH" msvc_locate ) )" \
   || { echo "FAIL: 磁盘扫描兜底未命中(用户已装 VS 但 vswhere 漏报)"; exit 1; }
-[ "$got" = "$DISKROOT/2026/Community" ] || { echo "FAIL: 磁盘扫描 root 错误(应选新版2026): $got"; exit 1; }
-echo "PASS 磁盘扫描兜底命中已装 VS(2026 优先)"
+[ "$got" = "$DISKROOT/2026/Insiders" ] || { echo "FAIL: 磁盘扫描 root 错误(应选新版2026/Insiders): $got"; exit 1; }
+echo "PASS 磁盘扫描兜底命中已装 VS(2026/Insiders 优先)"
