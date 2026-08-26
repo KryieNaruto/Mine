@@ -3,10 +3,11 @@
 # 不单独执行。
 set -euo pipefail
 
-info() { printf '[INFO] %s\n' "$*"; }
-err()  { printf '[ERROR] %s\n' "$*" >&2; }
-die()  { err "$*"; exit 1; }
-has()  { command -v "$1" >/dev/null 2>&1; }
+# 辅助函数:若宿主脚本已定义则复用其版本(避免 source 后覆盖宿主格式,如 setup-env 用无前缀 info/err)。
+if ! declare -F info >/dev/null 2>&1; then info() { printf '[INFO] %s\n' "$*"; }; fi
+if ! declare -F err  >/dev/null 2>&1; then err()  { printf '[ERROR] %s\n' "$*" >&2; }; fi
+if ! declare -F die  >/dev/null 2>&1; then die()  { err "$*"; exit 1; }; fi
+if ! declare -F has  >/dev/null 2>&1; then has()  { command -v "$1" >/dev/null 2>&1; }; fi
 
 # vswhere 默认路径(32 位安装的 x86 程序,安装到 64 位系统)
 VSWHERE="/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"

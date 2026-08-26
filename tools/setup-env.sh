@@ -71,17 +71,27 @@ chk_user_deps_windows() {
 probe() {
   info "=== 系统工具链探测(${OS_PLATFORM:-linux}) ==="
   HARD_MISS=0; MISS_DETAILS=()
-  chk "cmake"      "3.22" "cmake --version"
-  chk "ninja"      ""     "ninja --version"
-  chk "g++"        "11"   "g++ --version"
-  chk "pkg-config" ""     "pkg-config --version"
-  chk "git"        ""     "git --version"
-  chk "python3"    "3.8"  "python3 --version"
   if [ "$OS_PLATFORM" = "windows" ]; then
+    # Windows:探测 MSVC(vcvars + cl)+ ninja + glslc/vulkan.h;不再硬要求 g++/pkg-config
+    chk "ninja"  "" "ninja --version"
+    # MSVC 定位(经 msvc.sh)
+    # shellcheck disable=SC1091
+    . "$MINE_ROOT/tools/deps_lib/msvc.sh"
+    if msvc_locate >/dev/null 2>&1; then
+      info "[OK]   MSVC: $(msvc_locate)"
+    else
+      HARD_MISS=$((HARD_MISS+1)); MISS_DETAILS+=("MSVC(需 VS Build Tools)")
+      printf '[MISS] MSVC: 未安装\n'
+    fi
     chk_user_deps_windows
   else
+    chk "cmake" "3.22" "cmake --version"
+    chk "g++"   "11"   "g++ --version"
+    chk "pkg-config" "" "pkg-config --version"
     chk_user_deps
   fi
+  chk "git" "" "git --version"
+  chk "python3" "3.8" "python3 --version"
 }
 
 lavapipe_hint() {
