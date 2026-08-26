@@ -1,6 +1,8 @@
+import io
 import os
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -118,6 +120,24 @@ class TestStream(unittest.TestCase):
         ok, tail = cmake_driver._stream(["/nonexistent/cmd-xyz"])
         self.assertFalse(ok)
         self.assertIn("命令不存在", tail)
+
+    def test_cr_progress_emitted_live(self):
+        # 回归:Ninja/CMake 的 \r 进度行若被 _stream 攒到 \n 才打印,SwiftShader
+        # 编译期屏幕零输出,形似卡死。此例用真实子进程写 \r 进度 + 停顿 + \n 收尾,
+        # 断言 \r 进度在进程结束前就透传到 stdout(即「实时」而非攒在管道里)。
+        code = ("import sys,time;"
+                "sys.stdout.write('\\r[1/2] building...');sys.stdout.flush();"
+                "time.sleep(0.5);"
+                "sys.stdout.write('\\r[2/2] building...');sys.stdout.flush();"
+                "sys.stdout.write('\\ndone\\n');sys.stdout.flush()")
+        out = io.StringIO()
+        with mock.patch.object(sys, "stdout", out):
+            ok, tail = cmake_driver._stream([sys.executable, "-u", "-c", code])
+        self.assertTrue(ok)
+        self.assertIn("done", tail)
+        self.assertIn("[2/2] building...", tail)
+        # 进度行必须在进程退出前就出现在 stdout(实时);攒到退出才打则说明回归
+        self.assertIn("[1/2] building...", out.getvalue())
 
 
 class TestBuildLib(unittest.TestCase):
