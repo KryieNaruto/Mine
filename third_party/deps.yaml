@@ -18,9 +18,6 @@ libs:
     tag: "20260817.0"
     build: cmake
     options: [ABSL_BUILD_TESTING=OFF, CMAKE_CXX_STANDARD=20]
-    # Windows 用 MSYS2 预编译包(20260526,含 absl::* cmake 目标),不源码编译;
-    # Linux 继续源码编译。abseil 源码在 mingw64 有上游平台缺口(O_NONBLOCK 等)。
-    windows_package: mingw-w64-x86_64-abseil-cpp
   ink-stroke-modeler:
     repo: https://github.com/google/ink-stroke-modeler.git
     tag: "main"
