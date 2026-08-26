@@ -78,9 +78,10 @@ pacman_sync() {
 }
 pacman_sync
 
-# --- ② 基础工具链(不再装 MinGW g++,只保证 ninja/git/python3/glslc) ---
+# --- ② 基础工具链(不再装 MinGW g++,只保证 ninja/cmake/git/python3/glslc) ---
 MISS_TOOLS=()
 has ninja    || MISS_TOOLS+=(mingw-w64-x86_64-ninja)
+has cmake    || MISS_TOOLS+=(mingw-w64-x86_64-cmake)
 has git      || MISS_TOOLS+=(git)
 has python3  || MISS_TOOLS+=(mingw-w64-x86_64-python)
 has python3 && ! python3 -c 'import yaml' >/dev/null 2>&1 && MISS_TOOLS+=(mingw-w64-x86_64-python-yaml)
@@ -132,7 +133,7 @@ install_qt_msvc() {
   mkdir -p "$qt_root"
   info "⑥ aqtinstall 下载 Qt6 MSVC 预编译(约 1GB)..."
   python3 -m aqt install-qt windows desktop 6.5.3 win64_msvc2019_64 \
-    --outputdir "$qt_root" --modules qtbase || die "Qt6 下载失败"
+    --outputdir "$qt_root" || die "Qt6 下载失败"
 }
 install_qt_msvc
 

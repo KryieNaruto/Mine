@@ -72,8 +72,9 @@ probe() {
   info "=== 系统工具链探测(${OS_PLATFORM:-linux}) ==="
   HARD_MISS=0; MISS_DETAILS=()
   if [ "$OS_PLATFORM" = "windows" ]; then
-    # Windows:探测 MSVC(vcvars + cl)+ ninja + glslc/vulkan.h;不再硬要求 g++/pkg-config
+    # Windows:探测 MSVC(vcvars + cl)+ ninja + cmake + glslc/vulkan.h;不再硬要求 g++/pkg-config
     chk "ninja"  "" "ninja --version"
+    chk "cmake" "3.22" "cmake --version"
     # MSVC 定位(经 msvc.sh)
     # shellcheck disable=SC1091
     . "$MINE_ROOT/tools/deps_lib/msvc.sh"
