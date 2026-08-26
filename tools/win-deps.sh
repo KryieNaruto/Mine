@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Windows(MSYS2)依赖部署:基础工具链 + Vulkan(pacman)+ SwiftShader(池构建) + Qt6(pacman)。
+# Windows(MSYS2+MSVC)依赖部署:基础工具链 + Vulkan(pacman)+ SwiftShader(池构建) + Qt6(aqtinstall/MSVC 预编译)。
 # 由 install-user-deps.sh 平台分支调用;也可单独执行。
 set -euo pipefail
 info() { printf '[INFO] %s\n' "$*"; }
@@ -12,6 +12,15 @@ MINE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 USER_DEPS="$MINE_ROOT/.user-deps"
 DEB_CACHE="$USER_DEPS/.deb-cache"
 mkdir -p "$USER_DEPS" "$DEB_CACHE"
+
+# MSVC 工具链发现/自动安装 + vcvars 导出(Task 1)
+# shellcheck disable=SC1091
+. "$MINE_ROOT/tools/deps_lib/msvc.sh"
+
+# MSVC 工具链(替代 MinGW g++):定位/自动安装 Build Tools,并写 vcvars.sh。
+msvc_ensure
+MSVC_ROOT="$(msvc_locate)" || die "MSVC 定位失败"
+msvc_write_vcvars_sh "$MSVC_ROOT"
 
 # --- ① MSYS2 国内镜像源(加速 pacman;首个 pacman 前必须完成) ---
 # 镜像列表(均经实测 200 可达)。测速挑最快,写入 mirrorlist.mingw64 与 mirrorlist.msys。
@@ -69,18 +78,12 @@ pacman_sync() {
 }
 pacman_sync
 
-# --- ② 基础工具链(MSYS2 pacman;覆盖 setup-env.sh 探测的 cmake/ninja/gcc/git/python3) ---
+# --- ② 基础工具链(不再装 MinGW g++,只保证 ninja/git/python3/glslc) ---
 MISS_TOOLS=()
-has cmake  || MISS_TOOLS+=(mingw-w64-x86_64-cmake)
-has ninja  || MISS_TOOLS+=(mingw-w64-x86_64-ninja)
-has g++    || MISS_TOOLS+=(mingw-w64-x86_64-gcc)
-has git    || MISS_TOOLS+=(git)
-has python3 || MISS_TOOLS+=(mingw-w64-x86_64-python)
-has pkg-config || MISS_TOOLS+=(mingw-w64-x86_64-pkgconf)
-# python3 装了但缺 PyYAML(fetch-deps/build-deps 解析 deps.yaml 需要)
-if has python3 && ! python3 -c 'import yaml' >/dev/null 2>&1; then
-  MISS_TOOLS+=(mingw-w64-x86_64-python-yaml)
-fi
+has ninja    || MISS_TOOLS+=(mingw-w64-x86_64-ninja)
+has git      || MISS_TOOLS+=(git)
+has python3  || MISS_TOOLS+=(mingw-w64-x86_64-python)
+has python3 && ! python3 -c 'import yaml' >/dev/null 2>&1 && MISS_TOOLS+=(mingw-w64-x86_64-python-yaml)
 if [ "${#MISS_TOOLS[@]}" -gt 0 ]; then
   info "② pacman 安装基础工具链: ${MISS_TOOLS[*]}"
   pacman -S --needed --noconfirm "${MISS_TOOLS[@]}"
@@ -88,22 +91,7 @@ else
   info "② 基础工具链齐全"
 fi
 
-# --- ③ 三方库中声明了 windows_package 的:用 pacman 预编译包,不源码编译 ---
-# 解析 deps.yaml,凡 lib 带 windows_package 字段 → pacman 安装(如 abseil-cpp)。
-# 根经参数传入(不依赖未 export 的 MINE_ROOT),由 deps_lib/manifest 统一解析。
-PAC_LIBS="$(python3 -c "
-import sys
-sys.path.insert(0, sys.argv[1])
-from deps_lib import manifest
-pkgs = manifest.extract_windows_packages(manifest.load_global_manifest(sys.argv[2]))
-print(' '.join(pkgs))
-" "$MINE_ROOT/tools" "$MINE_ROOT")"
-if [ -n "$PAC_LIBS" ]; then
-  info "③ pacman 安装 windows_package 三方库: $PAC_LIBS"
-  pacman -S --needed --noconfirm $PAC_LIBS
-else
-  info "③ 无 windows_package 三方库"
-fi
+# --- ③ windows_package:MSVC 下不再用 pacman 预编译三方库(pool.is_pacman_provided 恒 False)→ 删除 ---
 
 # --- ④ Vulkan SDK(头 + glslc + loader,均用 MSYS2 原生 pacman 包) ---
 # 注:不用 Lunarg SDK zip —— 其 windows/vulkan-sdk-latest.zip 实际重定向为 .exe 安装包,
@@ -131,24 +119,30 @@ else
   SWSS_BIN=""
 fi
 
-# --- ⑥ Qt6(pacman) ---
-if ! pacman -Q mingw-w64-x86_64-qt6-base >/dev/null 2>&1; then
-  info "⑥ pacman 安装 Qt6 base"
-  pacman -S --needed --noconfirm mingw-w64-x86_64-qt6-base
-else
-  info "⑥ Qt6 已安装"
-fi
+# --- ⑥ Qt6:改走 aqtinstall(MSVC 预编译) ---
+# aqtinstall --outputdir 落盘在 <outputdir>/<qt_version>/<target_arch>/(installer.py:1652)
+QT_PREFIX="$USER_DEPS/qt/6.5.3/msvc2019_64"
+install_qt_msvc() {
+  local qt_root="$USER_DEPS/qt"
+  if [ -f "$QT_PREFIX/bin/qmake.exe" ]; then
+    info "⑥ Qt6 MSVC 已存在,跳过"; return 0
+  fi
+  has python3 || die "python3 缺失"
+  python3 -m pip install --quiet aqtinstall || die "aqtinstall 安装失败"
+  mkdir -p "$qt_root"
+  info "⑥ aqtinstall 下载 Qt6 MSVC 预编译(约 1GB)..."
+  python3 -m aqt install-qt windows desktop 6.5.3 win64_msvc2019_64 \
+    --outputdir "$qt_root" --modules qtbase || die "Qt6 下载失败"
+}
+install_qt_msvc
 
-# --- ⑦ 生成 env.sh ---
-# glslc/vulkan.h/loader 均在 MSYS2 /mingw64(已在 PATH),无需记路径。
-# CMAKE_PREFIX_PATH 含 /mingw64:使 find_package 命中 pacman 预编译包(如 abseil 的 abslConfig.cmake)。
+# --- ⑦ 生成 env.sh(MSVC 前缀 + Qt6 前缀 + SwiftShader ICD;不含 /mingw64) ---
 cat > "$USER_DEPS/env.sh" <<EOF
-# Mine Windows(MSYS2)用户级依赖环境(由 win-deps.sh 生成)。
 export MINE_ROOT="$MINE_ROOT"
 export USER_DEPS="$USER_DEPS"
 export VK_ICD_FILENAMES="$SWSS_ICD"
 export VK_DRIVER_FILES="$SWSS_ICD"
-export CMAKE_PREFIX_PATH="/mingw64:$MINE_ROOT/third_party/_install/glfw-3.4/release"
+export CMAKE_PREFIX_PATH="$QT_PREFIX:$MINE_ROOT/third_party/_install/glfw-3.4/release"
 EOF
 info "⑦ 已生成 $USER_DEPS/env.sh"
 
