@@ -26,12 +26,17 @@ def _vcvars_bat() -> str:
     vs = os.path.join(MINE_ROOT, ".user-deps", "vcvars.sh")
     if os.path.isfile(vs):
         try:
-            for line in open(vs, encoding="utf-8", errors="replace"):
-                m = re.match(r'^\s*export\s+VC_VARS_BAT="?(.+?)"?\s*$', line)
-                if m:
-                    p = m.group(1).strip()
-                    if p:
-                        return p
+            with open(vs, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    m = re.match(r'^\s*export\s+VC_VARS_BAT="?(.+?)"?\s*$', line)
+                    if m:
+                        p = m.group(1).strip()
+                        if p:
+                            # vcvars.sh 存的是 MSYS 风格(/c/...),cmd 只认盘符反斜杠路径;
+                            # 不转换就原样给 cmd,cmd 会剥引号按空格切,执行 '/Program' → rc=1。
+                            if re.match(r"^/[a-zA-Z]/", p):
+                                p = p[1].upper() + ":\\" + p[3:].replace("/", "\\")  # /c/... → C:\...
+                            return p
         except OSError:
             pass
     # 2) 磁盘扫描标准 VS 根(仅当 vcvars.sh 缺失)。

@@ -1,6 +1,7 @@
 import importlib.util
 import os
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -104,6 +105,42 @@ class TestEnsureMsvcEnv(unittest.TestCase):
              mock.patch.object(_mod.subprocess, "run", return_value=fake), \
              mock.patch.object(_mod.shutil, "which", return_value=None):
             self.assertFalse(_ensure_msvc_env())
+
+
+class TestVcvarsBat(unittest.TestCase):
+    """_vcvars_bat:vcvars.sh 里是 MSYS 风格路径,必须转 Windows 风格供 cmd 调用。"""
+
+    def _write_vcvars_sh(self, root, value):
+        d = os.path.join(root, ".user-deps")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "vcvars.sh"), "w", encoding="utf-8") as f:
+            f.write(f'export VC_VARS_BAT="{value}"\n')
+        return os.path.join(d, "vcvars.sh")
+
+    def test_msys_path_converted_to_windows(self):
+        # 回归:msvc.sh 写 /c/Program Files/... 的 MSYS 路径,若原样交给 cmd
+        # 会被 cmd 剥引号并按空格切,执行 '/Program' → rc=1。必须转 C:\...。
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(_mod, "MINE_ROOT", td):
+            self._write_vcvars_sh(
+                td,
+                "/c/Program Files/Microsoft Visual Studio/2022/BuildTools/VC/Auxiliary/Build/vcvars64.bat")
+            self.assertEqual(
+                _vcvars_bat(),
+                r"C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat",
+            )
+
+    def test_windows_path_passthrough(self):
+        # 已是 Windows 风格(如磁盘扫描回退)则原样返回。
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(_mod, "MINE_ROOT", td):
+            self._write_vcvars_sh(
+                td,
+                r"C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat")
+            self.assertEqual(
+                _vcvars_bat(),
+                r"C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat",
+            )
 
 
 if __name__ == "__main__":
