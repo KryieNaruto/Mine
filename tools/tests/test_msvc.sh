@@ -21,6 +21,18 @@ got="$(VSINSTALLDIR="$TMPD/vs" msvc_locate)"
 [ "$got" = "$TMPD/vs" ] || { echo "FAIL VSINSTALLDIR: $got"; exit 1; }
 echo "PASS msvc_locate VSINSTALLDIR 优先"
 
+# 2b) 回归:VSINSTALLDIR 完全未设置(set -u 下最易崩的形态)。paint-pc 实际报
+# 'VSINSTALLDIR: unbound variable' —— 捕获赋值不得用 local vs="$VSINSTALLDIR"。
+# 这里在全新子 shell 里 unset 后再调,必须不崩且返回 1(无 vswhere 环境)。
+(
+  unset VSINSTALLDIR
+  if msvc_locate >/dev/null 2>&1; then
+    echo "FAIL: 未设置 VSINSTALLDIR 且无 vswhere 时不应定位成功"
+    exit 1
+  fi
+) || { echo "FAIL: VSINSTALLDIR 未设置时 msvc_locate 崩溃(unbound variable)"; exit 1; }
+echo "PASS msvc_locate 未设置 VSINSTALLDIR 不崩(unbound 回归)"
+
 # 3) 回归:vswhere 每次调用现找,不得用 source 时的缓存。
 # 干净机器上 vswhere.exe 随 VS Installer 一起装 —— 首次自动装 Build Tools 前并不存在。
 # 源入时(PATH 无 vswhere)缓存为空,装完后再现找必须命中,否则自动装完依然定位失败。

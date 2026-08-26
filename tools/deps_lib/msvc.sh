@@ -35,9 +35,11 @@ msvc_to_posix() {
 # (Win10=Windows10SDK、Win11=Windows11SDK.<ver>),硬编码任一都会漏掉另一半;
 # 是否可用由 vcvars64.bat 存在性 + 构建期探测兜底。
 msvc_locate() {
-  # ${VSINSTALLDIR:-} 而非 $VSINSTALLDIR:set -u 下未设置即展开会直接崩,须给默认空
-  local vs="$VSINSTALLDIR" root vcvars
-  if [ -n "${vs:-}" ]; then
+  # ${VSINSTALLDIR:-} 而非 $VSINSTALLDIR:set -u 下未设置即展开会直接崩,须给默认空。
+  # 关键:捕获也要用 ${VSINSTALLDIR:-} —— VSINSTALLDIR 根本未设置时,local vs="$VSINSTALLDIR"
+  # 照样展开崩,一样中招。
+  local vs="${VSINSTALLDIR:-}" root vcvars
+  if [ -n "$vs" ]; then
     vs="$(msvc_to_posix "$vs")"
     vcvars="$(msvc_vcvars_path "$vs")"
     if [ -x "$vcvars" ]; then
