@@ -120,30 +120,77 @@ else
   SWSS_BIN=""
 fi
 
-# --- ⑥ Qt6:改走 aqtinstall(MSVC 预编译) ---
-# aqtinstall --outputdir 落盘在 <outputdir>/<qt_version>/<target_arch>/(installer.py:1652)
-QT_PREFIX="$USER_DEPS/qt/6.5.3/msvc2019_64"
+# --- ⑥ Qt6:直接下载官方 MSVC 预编译(弃 aqtinstall/pip —— MSYS2 python 无 pip) ---
+# Qt 官方在线仓库的 qtbase-...-X86_64.7z 即完整 MSVC 预编译(含 bin/qmake.exe、lib/cmake/Qt6、
+# Qt6Core/Gui/Widgets/Test DLL 与 import lib),解压即用,CMake find_package(Qt6) 直接消费。
+QT_VER="6.5.3"
+QT_MODULE="qt6_653"
+QT_MODULE_DIR="qt.qt6.653.win64_msvc2019_64"
+QT_PREFIX="$USER_DEPS/qt/$QT_VER/msvc2019_64"
+QT_REPO_BASE="online/qtsdkrepository/windows_x86/desktop/$QT_MODULE/$QT_MODULE_DIR"
+# Qt 在线仓库镜像根(与 ① MSYS2 镜像同思路,官方兜底放最后)
+QT_MIRRORS=(
+  "https://mirrors.tuna.tsinghua.edu.cn/qt"
+  "https://mirrors.ustc.edu.cn/qtproject"
+  "https://mirror.nju.edu.cn/qt"
+  "https://mirrors.cloud.tencent.com/qt"
+  "https://mirrors.aliyun.com/qt"
+  "https://download.qt.io"
+)
 install_qt_msvc() {
-  local qt_root="$USER_DEPS/qt"
-  if [ -f "$QT_PREFIX/bin/qmake.exe" ]; then
+  local qt_root="$USER_DEPS/qt" base href arch qm
+  if [ -f "$QT_PREFIX/bin/qmake.exe" ] && [ -d "$QT_PREFIX/lib/cmake/Qt6" ]; then
     info "⑥ Qt6 MSVC 已存在,跳过"; return 0
   fi
-  has python3 || die "python3 缺失"
-  python3 -m pip install --quiet aqtinstall || die "aqtinstall 安装失败"
-  mkdir -p "$qt_root"
-  info "⑥ aqtinstall 下载 Qt6 MSVC 预编译(约 1GB)..."
-  python3 -m aqt install-qt windows desktop 6.5.3 win64_msvc2019_64 \
-    --outputdir "$qt_root" || die "Qt6 下载失败"
+  has 7z || { info "⑥ 安装 p7zip(解压 Qt 预编译)"; pacman -S --needed --noconfirm p7zip; }
+  # 挑可达镜像:列出模块目录,提取 qtbase-...-X86_64.7z 文件名(不硬编码带时间戳的文件名)
+  base=""; href=""
+  for m in "${QT_MIRRORS[@]}"; do
+    if curl -sf --max-time 10 -o "$DEB_CACHE/qt.list" "$m/$QT_REPO_BASE/" 2>/dev/null; then
+      # 提取 basename:<版本>-<build>qtbase-...-X86_64.7z。文件名不含 /;
+      # href 形如 "6.5.3-0-202309260341qtbase-...-X86_64.7z"(版本 1-2 段、build 为长数字)。
+      # 用 [^"/] 排除路径分隔符,保证取的是 basename;排除 debug。
+      href="$(grep -oE '[^"/]*qtbase-[^"]*X86_64\.7z' "$DEB_CACHE/qt.list" | grep -vi 'debug' | head -n1 || true)"
+      if [ -n "$href" ]; then base="$m"; break; fi
+    fi
+  done
+  [ -n "$base" ] && [ -n "$href" ] || die "Qt 在线仓库不可达(镜像全挂或找不到 qtbase MSVC 预编译)"
+  arch="$DEB_CACHE/$href"
+  info "⑥ 下载 Qt6 MSVC 预编译($QT_VER, qtbase, 约 50MB)← $base ..."
+  curl -fL --retry 3 -o "$arch" "$base/$QT_REPO_BASE/$href" || die "Qt6 预编译下载失败"
+  info "⑥ 解压到 $qt_root ..."
+  # 官方 7z 内部自带 <ver>/<arch> 两层(验证:6.5.3/msvc2019_64/),直接解到 qt_root,
+  # 使 $QT_PREFIX(=$qt_root/$QT_VER/msvc2019_64)天然指向解压根,不产生嵌套。
+  rm -rf "$qt_root"; mkdir -p "$qt_root"
+  7z x -y "$arch" -o"$qt_root" >/dev/null 2>&1 || { rm -f "$arch"; die "Qt6 预编译解压失败"; }
+  rm -f "$arch"
+  # 防御:7z 内部布局若与预期不符(无 <ver>/<arch> 层),find 反推 prefix(<prefix>/bin/qmake.exe)
+  if [ ! -f "$QT_PREFIX/bin/qmake.exe" ]; then
+    qm="$(find "$qt_root" -type f -name qmake.exe 2>/dev/null | head -n1 || true)"
+    [ -n "$qm" ] || die "Qt 解压后未找到 qmake.exe"
+    QT_PREFIX="$(dirname "$(dirname "$qm")")"
+  fi
+  [ -d "$QT_PREFIX/lib/cmake/Qt6" ] || die "Qt 预编译缺 lib/cmake/Qt6(CMake 无法 find_package(Qt6))"
+  # 写 bin/qt.conf 使其可重定位(对齐 aqtinstall 的 make_qtconf):
+  # qmake 等工具凭此找到 prefix;CMake 的 Qt6Config.cmake 自身可重定位不需要,但便宜且防坑。
+  cat > "$QT_PREFIX/bin/qt.conf" <<EOF
+[Paths]
+Prefix=..
+EOF
+  info "⑥ Qt6 MSVC 就绪: $QT_PREFIX"
 }
 install_qt_msvc
 
 # --- ⑦ 生成 env.sh(MSVC 前缀 + Qt6 前缀 + SwiftShader ICD;不含 /mingw64) ---
+# PATH 前置 $QT_PREFIX/bin:Qt6 运行期 DLL(Qt6Core/Gui/Widgets/Test)需在此可被找到。
+# \$PATH 转义成字面量,source 时才展开,避免写成生成时刻的 PATH。
 cat > "$USER_DEPS/env.sh" <<EOF
 export MINE_ROOT="$MINE_ROOT"
 export USER_DEPS="$USER_DEPS"
 export VK_ICD_FILENAMES="$SWSS_ICD"
 export VK_DRIVER_FILES="$SWSS_ICD"
 export CMAKE_PREFIX_PATH="$QT_PREFIX:$MINE_ROOT/third_party/_install/glfw-3.4/release"
+export PATH="$QT_PREFIX/bin:\$PATH"
 EOF
 info "⑦ 已生成 $USER_DEPS/env.sh"
 
