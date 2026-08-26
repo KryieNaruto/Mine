@@ -161,3 +161,35 @@ OUTSH="$TMPD/vcvars_out.sh"
 msvc_write_vcvars_sh "$DISKROOT2/2026/Insiders" "$OUTSH"
 grep -q "VC_VARS_BAT=\"$VCVARS_FALLBACK\"" "$OUTSH" || { echo "FAIL: vcvars.sh 未写全盘兜底路径"; exit 1; }
 echo "PASS msvc_write_vcvars_sh 写全盘兜底 vcvars 路径"
+
+# 9) 关键回归:磁盘有 VS2026/Insiders 且 vswhere 只报 2022 BuildTools → 必须选 2026/Insiders。
+# paint-pc 实测就是这个场景(vswhere 看不见 18/Insiders);若 vswhere 优先会错选 2022。
+# 构造:磁盘上有 2026/Insiders(工具集+vcvars),vswhere 报 2022 BuildTools。
+PRIO="$TMPD/prio"
+mkdir -p "$PRIO/2026/Insiders/VC/Tools/MSVC/14.50/bin/Hostx64/x64" \
+         "$PRIO/2026/Insiders/VC/Auxiliary/Build" \
+         "$PRIO/bin" "$PRIO/cygbin" "$PRIO/emptybin"
+touch "$PRIO/2026/Insiders/VC/Auxiliary/Build/vcvars64.bat"
+chmod +x "$PRIO/2026/Insiders/VC/Auxiliary/Build/vcvars64.bat"
+PRIO_CYP="$PRIO/cygpath"; cat > "$PRIO_CYP" <<'EOF'
+#!/usr/bin/env bash
+[ "$1" = "-u" ] || exit 0
+in="$2"
+case "$in" in
+  C:*) printf '%s\n' '/tmp/PRIO_BT';;   # vswhere 报的 2022 映射到不存在路径 → 判不可用
+  *) printf '%s\n' "$in";;
+esac
+EOF
+chmod +x "$PRIO_CYP"; ln -sf "$PRIO_CYP" "$PRIO/cygbin/cygpath"
+cat > "$PRIO/bin/vswhere.exe" <<'EOF'
+#!/usr/bin/env bash
+for a in "$@"; do [ "$a" = "-property" ] && { printf '%s\n' 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools'; exit 0; }; done
+exit 0
+EOF
+chmod +x "$PRIO/bin/vswhere.exe"
+MSVC_DISK_BASES=("$PRIO/2026")
+# 磁盘优先 → 应选 2026/Insiders,而非 vswhere 报的 2022 BuildTools
+got="$( ( unset VSINSTALLDIR; MSVC_DISK_BASES="$PRIO/2026" PATH="$PRIO/bin:$PRIO/cygbin:$PATH" msvc_locate ) )"
+[ "$got" = "$PRIO/2026/Insiders" ] || { echo "FAIL: 磁盘未优先于 vswhere(错选 vswhere 报的 2022): $got"; exit 1; }
+echo "PASS 磁盘扫描优先于 vswhere(错选 2022 修复)"
+MSVC_DISK_BASES=("$DISKROOT")

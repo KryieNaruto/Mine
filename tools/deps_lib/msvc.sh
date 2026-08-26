@@ -80,9 +80,10 @@ msvc_find_vcvars() {
 }
 
 # msvc_locate : 输出含 VC 工具链的 VS/Build Tools 安装根(POSIX 路径);找不到返回 1。
-# 定位顺序(对齐 paint-pc 已验证 find_vs):VSINSTALLDIR → vswhere(-all,-requires 两连击) →
-# 磁盘扫描 VC/Tools/MSVC。判据 = 工具集目录存在(msvc_is_vs_root),不强求 vcvars64.bat
-# 在猜测路径 —— vcvars 由 msvc_find_vcvars 单独定位(含全盘兜底)。
+# 定位顺序:VSINSTALLDIR → 磁盘扫描 VC/Tools/MSVC(新版优先)→ vswhere(-all 两连击)。
+# 为什么磁盘扫描优先于 vswhere:paint-pc 上 vswhere 只报被误装的 2022 BuildTools,
+# 看不见用户的 VS2026(18/Insiders);若先走 vswhere 会抢在真实 VS 前返回 2022。
+# 磁盘扫描按 sort -r 新版优先,能选到 18/Insiders(> 2022)。vswhere 仅作补漏。
 msvc_locate() {
   # ${VSINSTALLDIR:-} 而非 $VSINSTALLDIR:set -u 下未设置即展开会直接崩,须给默认空。
   # 关键:捕获也要用 ${VSINSTALLDIR:-} —— VSINSTALLDIR 根本未设置时,local vs="$VSINSTALLDIR"
@@ -92,6 +93,11 @@ msvc_locate() {
     vs="$(msvc_to_posix "$vs")"
     if msvc_is_vs_root "$vs"; then printf '%s' "$vs"; return 0; fi
   fi
+  # 磁盘扫描:VC/Tools/MSVC 存在即命中;base 内 sort -r 新版优先(18 > 2022),64 位根在前。
+  while IFS= read -r diskroot; do
+    [ -n "$diskroot" ] || continue
+    if msvc_is_vs_root "$diskroot"; then printf '%s' "$diskroot"; return 0; fi
+  done < <(msvc_disk_roots)
   vswhere="$(msvc_resolve_vswhere)"
   if [ -n "$vswhere" ]; then
     # 关键:-all 必须有 —— 否则 vswhere 默认隐藏 Insiders/预览版(用户 VS 装在
@@ -109,11 +115,6 @@ msvc_locate() {
       if msvc_is_vs_root "$root"; then printf '%s' "$root"; return 0; fi
     fi
   fi
-  # 兜底:vswhere 漏报时,直接扫磁盘 VC/Tools/MSVC(64 位根在前;base 内 sort -r 新版优先)
-  while IFS= read -r diskroot; do
-    [ -n "$diskroot" ] || continue
-    if msvc_is_vs_root "$diskroot"; then printf '%s' "$diskroot"; return 0; fi
-  done < <(msvc_disk_roots)
   return 1
 }
 
