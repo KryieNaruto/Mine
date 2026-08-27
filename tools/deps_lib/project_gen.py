@@ -78,3 +78,22 @@ def _gen_vs(root: str, project: str, variant: str, generator: str | None) -> tup
     if not ok:
         return False, f"configure 失败:\n{tail}"
     return True, os.path.join(build_dir, f"{project}.sln")
+
+
+def _gen_as(root: str, project: str, variant: str, generator: str | None) -> tuple:
+    """as(Android Studio)生成器占位:已登记类型,真实 Android 工程出现前不实现。"""
+    return False, "未实现: as(Android Studio)生成器待有真实 Android 工程后实现"
+
+
+GENERATORS = {
+    "vs": _gen_vs,
+    "as": _gen_as,
+}
+
+
+def generate(root: str, project: str, type_name: str, variant: str, generator: str | None) -> tuple:
+    """按 type_name 分派到对应生成器;未知类型直接失败。"""
+    fn = GENERATORS.get(type_name)
+    if fn is None:
+        return False, f"未知项目类型: {type_name}"
+    return fn(root, project, variant, generator)

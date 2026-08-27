@@ -185,5 +185,31 @@ class TestGenVs(unittest.TestCase):
             self.assertIn("find_package(absl)", msg)
 
 
+class TestGenAsPlaceholder(unittest.TestCase):
+    def test_returns_not_implemented(self):
+        ok, msg = project_gen._gen_as("/root", "SomeAndroidApp", "release", None)
+        self.assertFalse(ok)
+        self.assertTrue(msg.startswith("未实现"))
+
+
+class TestGenerateDispatch(unittest.TestCase):
+    def test_unknown_type_fails(self):
+        ok, msg = project_gen.generate("/root", "X", "bogus", "release", None)
+        self.assertFalse(ok)
+        self.assertIn("bogus", msg)
+
+    def test_dispatches_to_registered_generator(self):
+        with mock.patch.dict(project_gen.GENERATORS, {"vs": mock.Mock(return_value=(True, "ok"))}):
+            ok, msg = project_gen.generate("/root", "EasyPainter", "vs", "release", None)
+            self.assertTrue(ok)
+            self.assertEqual(msg, "ok")
+            project_gen.GENERATORS["vs"].assert_called_once_with("/root", "EasyPainter", "release", None)
+
+    def test_as_is_registered_but_not_implemented(self):
+        ok, msg = project_gen.generate("/root", "SomeAndroidApp", "as", "release", None)
+        self.assertFalse(ok)
+        self.assertTrue(msg.startswith("未实现"))
+
+
 if __name__ == "__main__":
     unittest.main()
