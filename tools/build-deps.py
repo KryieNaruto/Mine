@@ -266,6 +266,14 @@ def main(argv=None) -> int:
                 summary["failed"].append(f"{manifest.ver_dir(lib.name, lib.tag)} [fetch] {msg}")
                 print(f"  拉取失败: {msg}", file=sys.stderr)
                 continue
+        # SwiftShader 需 glslang 子模块(Vulkan 必需);CMake configure 里拉全量易 502,
+        # 这里提前浅克隆+重试,就位后其 InitSubmodule 检测到 .git 直接跳过。
+        if lib.name == "swiftshader":
+            ok, err = fetch.ensure_swiftshader_submodules(MINE_ROOT)
+            if not ok:
+                summary["failed"].append(f"{manifest.ver_dir(lib.name, lib.tag)} [submodule] {err}")
+                print(f"  SwiftShader 子模块失败: {err}", file=sys.stderr)
+                continue
         for v in variants:
             key = f"{manifest.ver_dir(lib.name, lib.tag)} [{v}]"
             if pool.is_built(MINE_ROOT, lib.name, lib.tag, v):
