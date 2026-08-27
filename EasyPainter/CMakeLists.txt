@@ -4,6 +4,13 @@ project(EasyPainter CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+if(MSVC)
+  # 源码含中文注释;MSVC 默认按系统代码页(如中文 Windows 的 936/GBK)解读源文件,
+  # 非 ASCII 字节把字符串字面量拆散,报 C2001/C2143(且伴随 C4819 编码警告)。
+  # /utf-8 强制源码与运行期字符集按 UTF-8 解析,跟 GCC/Clang 的默认行为对齐。
+  add_compile_options(/utf-8)
+endif()
+
 # 池根:优先取缓存变量,否则推导 MINE_ROOT
 set(MINE_ROOT "$ENV{MINE_ROOT}" CACHE PATH "Mine workspace root")
 if(NOT MINE_ROOT)
@@ -18,23 +25,33 @@ endif()
 file(GLOB _pool_dirs LIST_DIRECTORIES true "${MINE_ROOT}/third_party/_install/*/${_variant}")
 list(APPEND CMAKE_PREFIX_PATH ${_pool_dirs})
 
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
 find_package(absl CONFIG REQUIRED)
 find_package(glm CONFIG REQUIRED)
 find_package(GTest CONFIG REQUIRED)
 find_package(InkStrokeModeler CONFIG REQUIRED)
 find_package(Vulkan REQUIRED)
+# glslc:优先用 find_package(Vulkan) 自带探测到的 Vulkan_GLSLC_EXECUTABLE(CMake >= 3.24,
+# 随 Vulkan SDK 一起找到);更早版本兜底 find_program 现场找。
+if(NOT Vulkan_GLSLC_EXECUTABLE)
+  find_program(Vulkan_GLSLC_EXECUTABLE glslc REQUIRED)
+endif()
 # glfw:仅 windowed 目标(easypainter)需要,在 Task 6 目标作用域 find_package;headless/CLI 构建不依赖
 
 # --- shader:glslc 编译 GLSL → SPIR-V,再嵌入 C++ 头(运行期无文件路径依赖) ---
+# 用 configure 期解析出的绝对路径(${Vulkan_GLSLC_EXECUTABLE}/${Python3_EXECUTABLE}),
+# 不用裸命令 glslc/python3 —— VS 打开 .sln 直接生成时继承系统 PATH,不是 configure 那次
+# (gen-projects.py 从已 source env.sh 的 shell 里跑)的 PATH,裸命令会在构建期报
+# "不是内部或外部命令"(MSB8066/退出码 9009)。
 add_custom_command(
   OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/stroke.vert.spv ${CMAKE_CURRENT_BINARY_DIR}/stroke.frag.spv
-  COMMAND glslc -fshader-stage=vert -o ${CMAKE_CURRENT_BINARY_DIR}/stroke.vert.spv ${CMAKE_CURRENT_SOURCE_DIR}/shaders/stroke.vert
-  COMMAND glslc -fshader-stage=frag -o ${CMAKE_CURRENT_BINARY_DIR}/stroke.frag.spv ${CMAKE_CURRENT_SOURCE_DIR}/shaders/stroke.frag
+  COMMAND ${Vulkan_GLSLC_EXECUTABLE} -fshader-stage=vert -o ${CMAKE_CURRENT_BINARY_DIR}/stroke.vert.spv ${CMAKE_CURRENT_SOURCE_DIR}/shaders/stroke.vert
+  COMMAND ${Vulkan_GLSLC_EXECUTABLE} -fshader-stage=frag -o ${CMAKE_CURRENT_BINARY_DIR}/stroke.frag.spv ${CMAKE_CURRENT_SOURCE_DIR}/shaders/stroke.frag
   DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/shaders/stroke.vert ${CMAKE_CURRENT_SOURCE_DIR}/shaders/stroke.frag
   VERBATIM)
 add_custom_command(
   OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/stroke_shaders.h
-  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/shaders/embed_shaders.py
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/shaders/embed_shaders.py
           ${CMAKE_CURRENT_BINARY_DIR}/stroke.vert.spv
           ${CMAKE_CURRENT_BINARY_DIR}/stroke.frag.spv
           ${CMAKE_CURRENT_BINARY_DIR}/stroke_shaders.h
