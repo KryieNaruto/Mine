@@ -151,6 +151,12 @@ class TestEnsureMsvcEnv(unittest.TestCase):
         args, _ = run.call_args
         self.assertEqual(args[0][1], "/c",
                          "原生 python 下 cmd 开关必须 /c;`//c` 会让 cmd 开交互 shell 卡死")
+        # 回归:命令必须是裸 .cmd 包装文件名(无空格无引号),而非带引号的 vcvars 命令串;
+        # list2cmdline 会把内嵌引号转义成 `\"`,cmd /c 剥引号后执行 `\"...\"` 报 not recognized。
+        self.assertTrue(args[0][2].endswith(".cmd"),
+                        "应传临时 .cmd 包装文件名,cmd 只跑它避开引号转义")
+        self.assertNotIn("vcvars64.bat", args[0][2],
+                         "cmd 参数不应含 vcvars 路径(那会经 list2cmdline 转义成 \\\" 卡死)")
 
     def test_uses_double_slash_for_msys_linked_python(self):
         # MSYS 链接的 python:其运行时会把 `/c` 当路径转成 C:\,必须 `//c` 防转换。

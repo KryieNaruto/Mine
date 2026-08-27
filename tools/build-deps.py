@@ -67,7 +67,7 @@ def _tail(path: str, n: int = 800) -> str:
 def _msys_linked() -> bool:
     """当前 Python 进程是否加载了 MSYS2 运行时(msys-2.0.dll)。
 
-    MSYS 链接的 python 里 subprocess 参数会被其运行时做路径转换(`/c` → `C:\`),
+    MSYS 链接的 python 里 subprocess 参数会被其运行时做路径转换(`/c` → `C:\\`),
     所以 cmd 开关要写 `//c` 防转换;原生 Windows python(本仓库工具链装的
     mingw-w64-x86_64-python)参数原样传递,必须写 `/c`——`//c` 会让 cmd 打开交互
     shell 等 stdin,卡死到 timeout(本机已复现交互 banner)。GetModuleHandleW 查
@@ -108,25 +108,40 @@ def _ensure_msvc_env() -> bool:
     # cmd 的子进程链(vcvars 会拉起更多 bat)会持有 stdout 管道,capture_output 等 EOF
     # 永远等不到 → 静默卡死。文件上无 EOF 可等,不会死锁。用二进制写避免
     # Windows 文本模式换行/编码坑。
-    # 卡死根因:`//c` 在原生 Windows python 下原样进 cmd,cmd 不认该开关,打开交互
+    # 卡死根因一:`//c` 在原生 Windows python 下原样进 cmd,cmd 不认该开关,打开交互
     # shell 等 stdin → 卡到 timeout,vcvars 根本没跑。开关按运行时是否 MSYS 链接
     # 选 `/c` 或 `//c`(见 _msys_linked)。
+    # 卡死根因二(开关改对后暴露):list2cmdline 会把命令内引号转义成 `\"`,cmd /c 剥
+    # 首尾引号后留下 `\"...\"` → 执行 `\"C:\...vcvars64.bat\"` → 'not recognized'。
+    # 因此不把带引号的命令塞给 cmd /c,改写临时 .cmd 包装 `call vcvars && set`,cmd
+    # 只跑无空格无引号的裸文件名,不触发任何转义;batch 语法里 call + 引号是合法的。
     import tempfile
-    env_txt = os.path.join(tempfile.gettempdir(), f"vcvars_{os.getpid()}.txt")
+    tmp = tempfile.gettempdir()
+    env_txt = os.path.join(tmp, f"vcvars_{os.getpid()}.txt")
+    bat_name = f"vcvars_{os.getpid()}.cmd"
     out = None
     print(f"[INFO] 注入 MSVC 环境(vcvars64: {vcvars}) …", flush=True)
     cmd_switch = "//c" if _msys_linked() else "/c"
     try:
+        with open(os.path.join(tmp, bat_name), "w", encoding="utf-8") as _b:
+            _b.write("@echo off\r\n")
+            _b.write(f'call "{vcvars}"\r\n')
+            _b.write("set\r\n")
         with open(env_txt, "wb") as _f:
             _f.write(b"")
             _f.flush()
             out = subprocess.run(
-                ["cmd", cmd_switch, f'"{vcvars}" && set'],
-                stdout=_f, timeout=120,
+                ["cmd", cmd_switch, bat_name],
+                cwd=tmp, stdout=_f, timeout=120,
             )
     except (OSError, subprocess.TimeoutExpired) as e:
         print(f"[ERROR] 无法执行 vcvars64.bat: {e}", file=sys.stderr)
         return False
+    finally:
+        try:
+            os.remove(os.path.join(tmp, bat_name))
+        except OSError:
+            pass
     if out.returncode != 0:
         print(f"[ERROR] vcvars64.bat 执行失败(rc={out.returncode}):\n{_tail(env_txt, 800)}", file=sys.stderr)
         return False
