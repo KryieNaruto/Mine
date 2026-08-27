@@ -20,7 +20,7 @@ def _vcvars_bat() -> str:
     优先读 .user-deps/vcvars.sh(win-deps.sh 生成,记录 VC_VARS_BAT,MSYS 风格路径;
     win-deps 经 msvc_locate 已选到正确 VS 根,如 18/Insiders);
     缺则回退扫描标准 VS 安装根,优先含 VC/Tools/MSVC(真实 C++ 工具集)的实例。
-    返回 Windows 风格路径(带盘符反斜杠),供 cmd //c 调用。
+    返回 Windows 风格路径(带盘符反斜杠),供 cmd 调用(开关按运行时选 /c 或 //c)。
     """
     # 1) win-deps.sh 已写的 vcvars.sh —— 最可靠,含 msvc_locate 选中的根
     vs = os.path.join(MINE_ROOT, ".user-deps", "vcvars.sh")
@@ -64,12 +64,35 @@ def _tail(path: str, n: int = 800) -> str:
         return ""
 
 
+def _msys_linked() -> bool:
+    """当前 Python 进程是否加载了 MSYS2 运行时(msys-2.0.dll)。
+
+    MSYS 链接的 python 里 subprocess 参数会被其运行时做路径转换(`/c` → `C:\`),
+    所以 cmd 开关要写 `//c` 防转换;原生 Windows python(本仓库工具链装的
+    mingw-w64-x86_64-python)参数原样传递,必须写 `/c`——`//c` 会让 cmd 打开交互
+    shell 等 stdin,卡死到 timeout(本机已复现交互 banner)。GetModuleHandleW 查
+    DLL 是否已加载来判定;Linux 上恒 False(无 MSVC 需求)。
+    """
+    if not pool.on_windows():
+        return False
+    try:
+        import ctypes
+        # 句柄是 64 位指针,默认 restype=c_int 会截断致误判;显式定 c_void_p + argtypes。
+        _gmw = ctypes.windll.kernel32.GetModuleHandleW
+        _gmw.restype = ctypes.c_void_p
+        _gmw.argtypes = [ctypes.c_wchar_p]
+        return bool(_gmw("msys-2.0.dll"))
+    except Exception:
+        return False
+
+
 def _ensure_msvc_env() -> bool:
     """Windows 上把 MSVC(vcvars64)环境注入 os.environ,确保池用 cl 编译。
 
     根因:cmake_driver 跑 cmake 时 PATH 里没有 cl(MSYS2 只有 g++),CMake 自动选 MinGW,
     SwiftShader 的 __nop()(MSVC-only)直接崩。vcvars64.bat 只在 cmd 进程内改环境,
-    因此用 `cmd //c "<vcvars> && set"` 捕获全部 KEY=VALUE 再 apply 到父进程。
+    因此用 `cmd /c "<vcvars> && set"`(开关按运行时是否 MSYS 链接选 /c 或 //c,
+    见 _msys_linked)捕获全部 KEY=VALUE 再 apply 到父进程。
     找不到 vcvars/导出失败 → 打印清晰报错返回 False(调用方停止,别静默走 MinGW)。
     """
     if not pool.on_windows():
@@ -83,19 +106,22 @@ def _ensure_msvc_env() -> bool:
         return False
     # 用文件重定向而非管道(capture_output)读 vcvars 的 `set` 输出:
     # cmd 的子进程链(vcvars 会拉起更多 bat)会持有 stdout 管道,capture_output 等 EOF
-    # 永远等不到 → 本脚本在打印头部后静默卡死(本机已复现 capture_output 等后台
-    # 子进程释放管道阻塞数秒)。文件上无 EOF 可等,不会死锁。用二进制写避免
+    # 永远等不到 → 静默卡死。文件上无 EOF 可等,不会死锁。用二进制写避免
     # Windows 文本模式换行/编码坑。
+    # 卡死根因:`//c` 在原生 Windows python 下原样进 cmd,cmd 不认该开关,打开交互
+    # shell 等 stdin → 卡到 timeout,vcvars 根本没跑。开关按运行时是否 MSYS 链接
+    # 选 `/c` 或 `//c`(见 _msys_linked)。
     import tempfile
     env_txt = os.path.join(tempfile.gettempdir(), f"vcvars_{os.getpid()}.txt")
     out = None
     print(f"[INFO] 注入 MSVC 环境(vcvars64: {vcvars}) …", flush=True)
+    cmd_switch = "//c" if _msys_linked() else "/c"
     try:
         with open(env_txt, "wb") as _f:
             _f.write(b"")
             _f.flush()
             out = subprocess.run(
-                ["cmd", "//c", f'"{vcvars}" && set'],
+                ["cmd", cmd_switch, f'"{vcvars}" && set'],
                 stdout=_f, timeout=120,
             )
     except (OSError, subprocess.TimeoutExpired) as e:

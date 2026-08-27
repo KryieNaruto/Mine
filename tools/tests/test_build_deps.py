@@ -14,6 +14,7 @@ _spec.loader.exec_module(_mod)
 topo_expand = _mod.topo_expand
 _ensure_msvc_env = _mod._ensure_msvc_env
 _vcvars_bat = _mod._vcvars_bat
+_msys_linked = _mod._msys_linked
 
 from deps_lib.manifest import LibSpec
 
@@ -135,6 +136,37 @@ class TestEnsureMsvcEnv(unittest.TestCase):
         self.assertTrue(hasattr(kwargs.get("stdout"), "write"),
                         "stdout 应为文件对象,避免管道 EOF 死锁")
         self.assertNotIn("stderr", kwargs)
+
+    def test_uses_c_switch_for_native_python(self):
+        # 回归(卡死根因):原生 Windows python 的 subprocess 参数不经 MSYS 转换,
+        # `//c` 原样进 cmd → cmd 不认该开关,打开交互 shell 等 stdin → 卡到 timeout,
+        # vcvars 根本没跑(本机已复现 `//c "echo OK"` 出交互 banner)。必须 `/c`。
+        fake = _FakeRun(stdout="PATH=C:\\vc\\bin;X\nINCLUDE=C:\\vc\\inc\n", rc=0)
+        with self._force_win(), \
+             mock.patch.object(_mod, "_vcvars_bat", return_value=r"C:\vc\vcvars64.bat"), \
+             mock.patch.object(_mod, "_msys_linked", return_value=False), \
+             mock.patch.object(_mod.subprocess, "run", side_effect=fake) as run, \
+             mock.patch.object(_mod.shutil, "which", return_value=r"C:\vc\bin\cl.exe"):
+            self.assertTrue(_ensure_msvc_env())
+        args, _ = run.call_args
+        self.assertEqual(args[0][1], "/c",
+                         "原生 python 下 cmd 开关必须 /c;`//c` 会让 cmd 开交互 shell 卡死")
+
+    def test_uses_double_slash_for_msys_linked_python(self):
+        # MSYS 链接的 python:其运行时会把 `/c` 当路径转成 C:\,必须 `//c` 防转换。
+        fake = _FakeRun(stdout="PATH=C:\\vc\\bin;X\n", rc=0)
+        with self._force_win(), \
+             mock.patch.object(_mod, "_vcvars_bat", return_value=r"C:\vc\vcvars64.bat"), \
+             mock.patch.object(_mod, "_msys_linked", return_value=True), \
+             mock.patch.object(_mod.subprocess, "run", side_effect=fake) as run, \
+             mock.patch.object(_mod.shutil, "which", return_value=r"C:\vc\bin\cl.exe"):
+            self.assertTrue(_ensure_msvc_env())
+        args, _ = run.call_args
+        self.assertEqual(args[0][1], "//c")
+
+    def test_msys_linked_false_on_linux(self):
+        with mock.patch.object(_mod.pool, "on_windows", return_value=False):
+            self.assertFalse(_msys_linked())
 
 
 class TestVcvarsBat(unittest.TestCase):

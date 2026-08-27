@@ -164,7 +164,8 @@ msvc_write_vcvars_sh() {
 # MSVC 环境(由 deps_lib/msvc.sh 生成)。构建前 source 以拿到 vcvars64 环境。
 export VS_INSTALL_ROOT="$root"
 export VC_VARS_BAT="$vcvars"
-# 用法:cmd /c "\"\$VC_VARS_BAT\" && set" 可导出完整环境;cmake 会自动找到 cl。
+# 用法:cmd //c "\"\$VC_VARS_BAT\" && set" 可导出完整环境;cmake 会自动找到 cl。
+# (MSYS bash 里 /c 会被其运行时转成 C:\ 路径,须写 //c 防转换;python 侧见 build-deps.py _msys_linked)
 EOF
   info "已生成 $out"
 }
