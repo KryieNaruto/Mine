@@ -5,7 +5,7 @@ import os
 import re
 import subprocess
 
-from . import manifest
+from . import cmake_driver, manifest, msvc_env, pool
 
 # 根目录下不是"项目"的目录:工具/池/文档/CI/用户级依赖/超能力笔记/VCS
 _EXCLUDE_DIRS = {"tools", "third_party", "docs", ".claude", ".github", ".user-deps", ".superpowers", ".git"}
@@ -48,3 +48,33 @@ def discover_vs_generator() -> str:
                 best_year = year
                 best_name = m.group(1)
     return best_name
+
+
+def _gen_vs(root: str, project: str, variant: str, generator: str | None) -> tuple:
+    """Windows 上用 CMake VS generator 为 project 生成 .sln;只 configure 不编译。"""
+    if not pool.on_windows():
+        return True, "跳过: vs 类型仅 Windows"
+    project_dir = os.path.join(root, project)
+    if not os.path.isfile(os.path.join(project_dir, "CMakeLists.txt")):
+        return True, "跳过: 无 CMakeLists.txt"
+    gen_name = generator or discover_vs_generator()
+    if not gen_name:
+        return False, "未探测到可用的 Visual Studio 生成器(cmake --help 无输出);请安装 VS Build Tools"
+    if not msvc_env.ensure_msvc_env(root):
+        return False, "MSVC 环境注入失败(vcvars),无法 configure"
+    build_dir = os.path.join(project_dir, "build", "vs")
+    # EasyPainter 等靠 $ENV{MINE_ROOT} 定位池,必须在 configure 进程环境里注入
+    os.environ["MINE_ROOT"] = root
+    prefixes = cmake_driver._built_prefixes(root, variant)
+    cmd = [
+        "cmake", "-S", project_dir, "-B", build_dir,
+        "-G", gen_name, "-A", "x64",
+        "-DCMAKE_CONFIGURATION_TYPES=Release",
+    ]
+    if prefixes:
+        cmd.append("-DCMAKE_PREFIX_PATH=" + ";".join(prefixes))
+    print(f"---- configure {project} (vs): {' '.join(cmd)}", flush=True)
+    ok, tail = cmake_driver._stream(cmd)
+    if not ok:
+        return False, f"configure 失败:\n{tail}"
+    return True, os.path.join(build_dir, f"{project}.sln")
