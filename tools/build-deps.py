@@ -225,6 +225,10 @@ def _target_variants(gm: dict, arg: str) -> list:
 
 
 def main(argv=None) -> int:
+    # Windows 控制台是 GBK,子进程输出(经 errors="replace" 解码)可能含 U+FFFD,
+    # 直接 print 回 GBK 会 UnicodeEncodeError 崩掉,长编译中断。全局把编码错误处理
+    # 降为 replace:宁可打 `?` 也不崩(详见 cmake_driver._make_output_safe)。
+    cmake_driver._make_output_safe()
     p = argparse.ArgumentParser(description="预编译三方库进共享池")
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--project", metavar="DIR")

@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from collections import deque
 
 from . import pool
@@ -56,6 +57,20 @@ def configure_command(root: str, lib: LibSpec, variant: str) -> list:
     return cmd
 
 
+def _make_output_safe() -> None:
+    """让 stdout/stderr 编码错误处理降级为 replace,print 永不因编码抛异常。
+
+    Windows 控制台是 GBK(cp936)。子进程输出经 text=True + errors="replace" 解码后,
+    非法字节变成 U+FFFD;print 回 GBK 时 U+FFFD 无法编码 → UnicodeEncodeError,
+    长编译直接中断(本机已崩在 _stream 的 print)。Linux/UTF-8 下无副作用。
+    """
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            _s.reconfigure(errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
 def _stream(cmd: list, tail_lines: int = 60) -> tuple:
     """运行子进程并逐行实时透传输出(flush),仅保留尾部 tail_lines 行作失败日志。
 
@@ -63,8 +78,9 @@ def _stream(cmd: list, tail_lines: int = 60) -> tuple:
     cmake/ninja 输出整段吞掉 —— SwiftShader 这类大库编译几十分钟屏幕零输出,
     形似卡死。此处把 stdout/stderr 合并逐行打印,慢则可见进度,真卡则能定位
     卡在哪个命令的最后一行。Windows 下子进程输出可能非 UTF-8,errors='replace'
-    防止解码崩。
+    防止解码崩;打印侧再经 _make_output_safe 兜底,不因控制台编码中断编译。
     """
+    _make_output_safe()
     tail = deque(maxlen=tail_lines)
     try:
         proc = subprocess.Popen(

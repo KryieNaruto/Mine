@@ -101,7 +101,46 @@ class _FakeIter:
         return False
 
 
+class _GbkConsole:
+    """模拟 Windows GBK 控制台(stdout.encoding='gbk',mintty 下原生 Windows Python 常如此)。
+
+    修复前:编码错误处理默认 strict,子进程输出含 U+FFFD(text=True errors="replace"
+    解码产物)时 print 回 GBK 抛 UnicodeEncodeError → _stream 崩、编译中断。
+    修复后:_make_output_safe 把错误处理降为 replace,U+FFFD 替换成 `?`,不崩。
+    """
+
+    encoding = "gbk"
+
+    def __init__(self):
+        self.lines = []
+        self._replace = False
+
+    def reconfigure(self, *, errors=None, **kw):
+        self._replace = errors == "replace"
+
+    def write(self, s):
+        if self._replace:
+            self.lines.append(s.encode("gbk", "replace").decode("gbk"))
+        else:
+            s.encode("gbk")  # 未修复时 U+FFFD 在此抛 UnicodeEncodeError
+        return len(s)
+
+    def flush(self):
+        pass
+
+
 class TestStream(unittest.TestCase):
+    def test_gbk_console_does_not_crash_on_unencodable(self):
+        # 回归:Windows GBK 控制台下,子进程输出含 U+FFFD(errors="replace" 解码产物),
+        # 修复前 print 回 GBK 抛 UnicodeEncodeError 崩掉长编译;修复后替换为 `?` 不崩,
+        # 且失败日志仍保留原始内容便于排查。
+        out = _GbkConsole()
+        with mock.patch.object(sys, "stdout", out):
+            ok, tail = cmake_driver._stream([sys.executable, "-u", "-c", "print('\\ufffd')"])
+        self.assertTrue(ok)
+        self.assertEqual("".join(out.lines), "?\n")  # 控制台侧 U+FFFD → `?`,不崩
+        self.assertIn("�", tail)               # 日志侧保留原始内容
+
     def test_real_passthrough_and_tail_on_failure(self):
         # 真子进程:非零退出,输出被透传且尾部留作失败日志
         ok, tail = cmake_driver._stream(
