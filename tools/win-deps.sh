@@ -94,53 +94,71 @@ fi
 
 # --- ③ windows_package:MSVC 下不再用 pacman 预编译三方库(pool.is_pacman_provided 恒 False)→ 删除 ---
 
-# --- ④ Vulkan(glslc 用 MSYS2 pacman 包;find_package(Vulkan) 用 MSVC 兼容的 LunarG SDK) ---
-# 注:不用 Lunarg SDK zip 装 glslc/vulkan.h —— 其 windows/vulkan-sdk-latest.zip 实际重定向为
-# .exe 安装包,unzip 会报 "plain executable, not an archive"。MSYS2 的
-# mingw-w64-x86_64-vulkan-headers/shaderc/vulkan-loader 恰好提供 vulkan.h + glslc.exe +
-# libvulkan,且已在 PATH,足够 shader 编译用。
-PAC_VK="mingw-w64-x86_64-vulkan-headers mingw-w64-x86_64-shaderc mingw-w64-x86_64-vulkan-loader"
-info "④ pacman 安装 Vulkan 依赖: $PAC_VK"
-pacman -S --needed --noconfirm $PAC_VK
+# --- ④ Vulkan(单一来源:一份 MSVC 兼容 Vulkan SDK,glslc.exe 与 find_package(Vulkan) 都用它) ---
+# 曾经拆两路:MSYS2 pacman 装 glslc/vulkan.h(MinGW ABI,给 shader 编译)+ 另装一份
+# LunarG SDK 给 find_package(Vulkan)。冗余,且用户机器上往往已经装了真正的 Vulkan
+# SDK(如 C:\VulkanSDK\<ver>,VULKAN_SDK 环境变量已设)——这种情况下 pacman 那份完全
+# 多余,还会让人误以为项目依赖 MinGW 版 Vulkan。统一成一路:先探测机器上是否已有
+# 可用 Vulkan SDK(VULKAN_SDK 环境变量,或磁盘扫描 C:\VulkanSDK\*,对齐 msvc_locate
+# 的"先找现成、找不到才装"套路),有就直接复用(glslc.exe 与 vulkan.h/vulkan-1.lib
+# SDK 自带);没有才静默装 LunarG 官方 SDK 到 .user-deps 下。
 
-# 定位 glslc.exe 与 vulkan.h(均在 /mingw64,已在 PATH,此处仅校验存在性)
-GLSLC="$(command -v glslc.exe || true)"
-[ -n "$GLSLC" ] || die "未找到 glslc.exe(确认已装 mingw-w64-x86_64-shaderc)"
-GLSLC="$(cygpath -u "$GLSLC" 2>/dev/null || printf '%s' "$GLSLC")"
-VULKAN_INC="$(dirname "$(dirname "$GLSLC")")/include/vulkan"
-[ -f "$VULKAN_INC/vulkan.h" ] || die "未找到 vulkan.h(确认已装 mingw-w64-x86_64-vulkan-headers)"
-info "④ glslc: $GLSLC;vulkan.h: $VULKAN_INC/vulkan.h"
+# vulkan_sdk_valid <root> : root 是否是可用的 Vulkan SDK(含 MSVC 需要的头/库/glslc)。
+vulkan_sdk_valid() {
+  local d
+  d="$(cygpath -u "$1" 2>/dev/null || printf '%s' "$1")"
+  [ -f "$d/Include/vulkan/vulkan.h" ] && [ -f "$d/Lib/vulkan-1.lib" ] && [ -f "$d/Bin/glslc.exe" ]
+}
 
-# CMake 的 find_package(Vulkan)(EasyPainter/CMakeLists.txt 需要)在 MSVC 下无法用上面的
-# MSYS2 包 —— libvulkan 是 MinGW 格式 .dll.a,link.exe 认不了;/mingw64 也不在
-# CMAKE_PREFIX_PATH 里(MSVC 迁移时特意去掉,见 docs/superpowers/specs/2026-08-25-msvc-design.md)。
-# 需要一份真正的 MSVC 兼容 Vulkan SDK(vulkan-1.lib + vulkan/vulkan.h)。装到 .user-deps 下
-# 自包含(不碰系统 C:\VulkanSDK),VULKAN_SDK 写进 env.sh —— CMake FindVulkan.cmake 自动认
-# ENV{VULKAN_SDK},零 CMakeLists 改动。
-VULKAN_SDK_DIR="$USER_DEPS/vulkan-sdk"
-if [ -f "$VULKAN_SDK_DIR/Include/vulkan/vulkan.h" ] && [ -f "$VULKAN_SDK_DIR/Lib/vulkan-1.lib" ]; then
-  info "④ Vulkan SDK(MSVC 兼容)已存在: $VULKAN_SDK_DIR"
+VULKAN_SDK_DIR=""
+if [ -n "${VULKAN_SDK:-}" ] && vulkan_sdk_valid "$VULKAN_SDK"; then
+  VULKAN_SDK_DIR="$(cygpath -u "$VULKAN_SDK" 2>/dev/null || printf '%s' "$VULKAN_SDK")"
+  info "④ 复用已安装的 Vulkan SDK(\$VULKAN_SDK): $VULKAN_SDK_DIR"
 else
-  info "④ 下载 Vulkan SDK(MSVC 兼容,LunarG,约几百 MB)..."
-  VK_SDK_EXE="$DEB_CACHE/vulkan_sdk.exe"
-  curl -fL --retry 3 -o "$VK_SDK_EXE" \
-    "https://sdk.lunarg.com/sdk/download/latest/windows/vulkan_sdk.exe" \
-    || die "Vulkan SDK 下载失败(需能出网)"
-  info "④ 静默安装 Vulkan SDK 到 $VULKAN_SDK_DIR ..."
-  # --root 指到 .user-deps 下的自定义目录(免管理员,不碰系统 C:\VulkanSDK);
-  # --accept-licenses --default-answer --confirm-command install 是 LunarG 文档给出的
-  # 全非交互静默安装组合(Qt Installer Framework 底层)。
-  "$VK_SDK_EXE" --root "$(cygpath -m "$VULKAN_SDK_DIR")" \
-    --accept-licenses --default-answer --confirm-command install \
-    || { rm -f "$VK_SDK_EXE"; die "Vulkan SDK 安装失败(可手动重跑安装器)"; }
-  rm -f "$VK_SDK_EXE"
-  [ -f "$VULKAN_SDK_DIR/Include/vulkan/vulkan.h" ] && [ -f "$VULKAN_SDK_DIR/Lib/vulkan-1.lib" ] \
-    || die "Vulkan SDK 安装完成但未找到 Include/vulkan/vulkan.h 或 Lib/vulkan-1.lib(安装可能不完整)"
+  # VULKAN_SDK 环境变量在当前 shell 可能不可见(装完未重启终端);磁盘扫描
+  # C:\VulkanSDK\* 兜底,目录名形如 1.4.357.0,sort -rV 取版本号最大的一个在前。
+  for cand in /c/VulkanSDK/*/; do
+    [ -d "$cand" ] || continue
+    cand="${cand%/}"
+    if vulkan_sdk_valid "$cand"; then
+      VULKAN_SDK_DIR="$cand"
+      info "④ 磁盘扫描到已安装 Vulkan SDK: $VULKAN_SDK_DIR"
+      break
+    fi
+  done
 fi
-# 装完的 VULKAN_SDK 是系统环境变量,当前已在跑的 shell(含本脚本进程)看不到,
-# 且 setup-env.sh 用 `bash install-user-deps.sh` 子进程调用本脚本(非 source),
-# 这里 export 出去也过不了进程边界 —— 唯一可靠路径是写进 env.sh,由 setup-env.sh
-# 稍后 `. .user-deps/env.sh` 源进自己进程,再传给 gen-projects.py 子进程。
+
+if [ -z "$VULKAN_SDK_DIR" ]; then
+  VULKAN_SDK_DIR="$USER_DEPS/vulkan-sdk"
+  if vulkan_sdk_valid "$VULKAN_SDK_DIR"; then
+    info "④ Vulkan SDK(此前已装到 .user-deps)已存在: $VULKAN_SDK_DIR"
+  else
+    info "④ 未检测到已安装的 Vulkan SDK,下载 LunarG 官方 SDK(约几百 MB)..."
+    VK_SDK_EXE="$DEB_CACHE/vulkan_sdk.exe"
+    curl -fL --retry 3 -o "$VK_SDK_EXE" \
+      "https://sdk.lunarg.com/sdk/download/latest/windows/vulkan_sdk.exe" \
+      || die "Vulkan SDK 下载失败(需能出网)"
+    info "④ 静默安装 Vulkan SDK 到 $VULKAN_SDK_DIR ..."
+    # --root 指到 .user-deps 下的自定义目录(免管理员,不碰系统 C:\VulkanSDK);
+    # --accept-licenses --default-answer --confirm-command install 是 LunarG 文档给出的
+    # 全非交互静默安装组合(Qt Installer Framework 底层)。
+    "$VK_SDK_EXE" --root "$(cygpath -m "$VULKAN_SDK_DIR")" \
+      --accept-licenses --default-answer --confirm-command install \
+      || { rm -f "$VK_SDK_EXE"; die "Vulkan SDK 静默安装失败。可从 https://vulkan.lunarg.com/sdk/home 手动装一份(装完重跑本脚本会自动探测复用,无需再改本脚本)。"; }
+    rm -f "$VK_SDK_EXE"
+    vulkan_sdk_valid "$VULKAN_SDK_DIR" \
+      || die "Vulkan SDK 安装完成但未找到 Include/vulkan/vulkan.h、Lib/vulkan-1.lib 或 Bin/glslc.exe(安装可能不完整)"
+  fi
+fi
+
+GLSLC="$VULKAN_SDK_DIR/Bin/glslc.exe"
+[ -f "$GLSLC" ] || die "Vulkan SDK 缺 Bin/glslc.exe: $VULKAN_SDK_DIR"
+info "④ glslc: $GLSLC;vulkan.h: $VULKAN_SDK_DIR/Include/vulkan/vulkan.h"
+# 无论是复用到的还是刚装的,VULKAN_SDK 都要写进 env.sh 才能跨进程边界传下去:
+# setup-env.sh 用 `bash install-user-deps.sh` 子进程调用本脚本(非 source),这里
+# export 出去过不了进程边界;唯一可靠路径是写文件,由 setup-env.sh 稍后
+# `. .user-deps/env.sh` 源进自己进程,再传给 gen-projects.py 子进程(CMake 的
+# FindVulkan.cmake 自动认 ENV{VULKAN_SDK},零 CMakeLists 改动)。
 VULKAN_SDK="$(cygpath -m "$VULKAN_SDK_DIR")"
 
 # --- ⑤ SwiftShader(经池构建,见 Task 2;此处仅确保 ICD 路径) ---
@@ -215,7 +233,8 @@ EOF
 install_qt_msvc
 
 # --- ⑦ 生成 env.sh(MSVC 前缀 + Qt6 前缀 + SwiftShader ICD + Vulkan SDK;不含 /mingw64) ---
-# PATH 前置 $QT_PREFIX/bin:Qt6 运行期 DLL(Qt6Core/Gui/Widgets/Test)需在此可被找到。
+# PATH 前置 $QT_PREFIX/bin(Qt6 运行期 DLL 需要)与 $VULKAN_SDK/Bin(glslc.exe——
+# EasyPainter/CMakeLists.txt 的 shader 自定义命令用裸命令 `glslc`,构建期靠 PATH 找到)。
 # \$PATH 转义成字面量,source 时才展开,避免写成生成时刻的 PATH。
 # VULKAN_SDK:CMake FindVulkan.cmake 自动认 ENV{VULKAN_SDK},find_package(Vulkan) 靠它。
 cat > "$USER_DEPS/env.sh" <<EOF
@@ -225,7 +244,7 @@ export VK_ICD_FILENAMES="$SWSS_ICD"
 export VK_DRIVER_FILES="$SWSS_ICD"
 export VULKAN_SDK="$VULKAN_SDK"
 export CMAKE_PREFIX_PATH="$QT_PREFIX:$MINE_ROOT/third_party/_install/glfw-3.4/release"
-export PATH="$QT_PREFIX/bin:\$PATH"
+export PATH="$QT_PREFIX/bin:$VULKAN_SDK/Bin:\$PATH"
 EOF
 info "⑦ 已生成 $USER_DEPS/env.sh"
 
