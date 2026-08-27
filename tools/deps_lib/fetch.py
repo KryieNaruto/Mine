@@ -38,29 +38,72 @@ def clone_lib(root: str, lib: LibSpec):
     return True, commit
 
 
+def _submodule_ready(src: str) -> bool:
+    """glslang 子模块是否已就位可用。
+
+    现代 git 把子模块仓库放进父仓 .git/modules/,子模块工作树里只有指向它的 .git
+    「文件」——「存在 .git 目录」不是可靠判据(本机复现:浅拉成功后 .git 是 47 字节
+    文件,os.path.isdir 误判失败,已拉取仍报错中断 setup)。以 git 自身状态为准:
+    `git submodule status` 首字符为空格(已初始化且与索引一致)或 +(检出不同 commit,
+    仍可用)即视为就位;`-`(未初始化)或命令失败则未就位。
+    """
+    sub = os.path.join(src, "third_party", "glslang")
+    if not os.path.isdir(sub):
+        return False
+    r = subprocess.run(
+        ["git", "-C", src, "submodule", "status", "third_party/glslang"],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        return False
+    # 首字符即状态前缀:「 」(已初始化且与索引一致)、「+」(检出不同 commit)。
+    # 注意绝不能 strip() —— 会把就位的空格前缀剥掉,误判未就位(本机已复现)。
+    line = r.stdout or r.stderr
+    return line[:1] in (" ", "+")
+
+
+def _reset_submodule(src: str, sub: str) -> None:
+    """清除 glslang 子模块半成品(反注册 + 删残留 gitdir/工作树)。
+
+    网络中断(如 502)会让 update 留下指向不完整 .git/modules 的 .git 文件;
+    不清理直接重试,git 会沿用坏状态反复失败。deinit 反注册并删工作树,再手动删
+    .git/modules 下的模块仓库,让下一次 update 从零重克隆。
+    """
+    subprocess.run(
+        ["git", "-C", src, "submodule", "deinit", "-f", "third_party/glslang"],
+        capture_output=True, text=True,
+    )
+    shutil.rmtree(os.path.join(src, ".git", "modules", "third_party", "glslang"),
+                  ignore_errors=True)
+    shutil.rmtree(sub, ignore_errors=True)
+
+
 def ensure_swiftshader_submodules(root: str) -> tuple:
     """确保 swiftshader 的 glslang 子模块就位(其 Vulkan 构建必需)。
 
     SwiftShader 的 InitSubmodule 在 CMake configure 时跑 `git submodule update --init`
-    (全量,glslang 数百 MB,国内网络下 HTTP 502 常现,本机已复现两次失败)。这里提前
-    用 --depth 1 浅克隆 + 重试,并利用其 CMake `if(NOT EXISTS <dir>/.git)` 逻辑:
-    glslang 就位(带 .git)后 configure 直接跳过 submodule update,不再走网络。
+    (全量,glslang 数百 MB,国内/弱网下 GitHub HTTP 502 常现,本机已复现两次失败)。
+    这里提前用 --depth 1 浅克隆 + 重试预取,并利用其 CMake `if(NOT EXISTS <dir>/.git)`
+    逻辑:glslang 就位(带 .git 文件/目录)后 configure 直接跳过 submodule update,
+    不再走网络。就位判定以 `git submodule status` 为准(现代 git 子模块 .git 是文件
+    而非目录,os.path.isdir 会误判);重试前清理半成品,避免中断残留让重试沿用坏状态。
     返回 (ok, err)。
     """
     src = pool.src_dir(root, "swiftshader", "master")
     sub = os.path.join(src, "third_party", "glslang")
-    if os.path.isdir(os.path.join(sub, ".git")):
+    if _submodule_ready(src):
         return True, ""  # 已就位
     if not os.path.isdir(src) or not os.path.isfile(os.path.join(src, ".gitmodules")):
         return True, ""  # swiftshader 未拉取或无需子模块,交给后续流程
     last = ""
     for _ in (1, 2, 3):
+        _reset_submodule(src, sub)  # 清半成品,否则中断残留会让重试沿用坏状态
         r = subprocess.run(
             ["git", "-C", src, "submodule", "update", "--init", "--depth", "1",
              "third_party/glslang"],
             capture_output=True, text=True,
         )
-        if r.returncode == 0 and os.path.isdir(os.path.join(sub, ".git")):
+        if r.returncode == 0 and _submodule_ready(src):
             return True, ""
         last = (r.stderr or r.stdout)[-800:]
     return False, f"glslang 子模块拉取失败(3 次尝试): {last}"
