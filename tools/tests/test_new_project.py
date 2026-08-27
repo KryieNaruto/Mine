@@ -1,8 +1,10 @@
 import importlib.util
 import os
+import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 _TOOLS = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # tools/
 sys.path.insert(0, _TOOLS)
@@ -29,6 +31,40 @@ class TestRenderTemplate(unittest.TestCase):
         np_mod.render_template(src, dst, {"NAME": "world"})
         with open(os.path.join(dst, "main.txt")) as f:
             self.assertEqual(f.read(), "hello world")
+
+
+class TestTypeFlag(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = self.tmp.name
+        os.makedirs(os.path.join(self.root, "third_party"), exist_ok=True)
+        with open(os.path.join(self.root, "third_party", "deps.yaml"), "w", encoding="utf-8") as f:
+            f.write("libs: {}\n")
+        # 复用真实模板渲染,不重复维护模板内容
+        shutil.copytree(
+            os.path.join(_TOOLS, "templates"),
+            os.path.join(self.root, "tools", "templates"),
+        )
+
+    def test_explicit_type_written_into_deps_yaml(self):
+        with mock.patch.object(np_mod, "MINE_ROOT", self.root):
+            rc = np_mod.main(["cpp", "demo", "--type", "as"])
+        self.assertEqual(rc, 0)
+        with open(os.path.join(self.root, "demo", "deps.yaml"), encoding="utf-8") as f:
+            self.assertIn("type: as", f.read())
+
+    def test_default_type_is_vs(self):
+        with mock.patch.object(np_mod, "MINE_ROOT", self.root):
+            rc = np_mod.main(["cpp", "demo2"])
+        self.assertEqual(rc, 0)
+        with open(os.path.join(self.root, "demo2", "deps.yaml"), encoding="utf-8") as f:
+            self.assertIn("type: vs", f.read())
+
+    def test_invalid_type_exits_nonzero(self):
+        with self.assertRaises(SystemExit) as cm:
+            np_mod.main(["cpp", "demo3", "--type", "bogus"])
+        self.assertNotEqual(cm.exception.code, 0)
 
 
 if __name__ == "__main__":

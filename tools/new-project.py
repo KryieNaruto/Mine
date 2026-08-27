@@ -63,6 +63,8 @@ def main(argv=None) -> int:
     p.add_argument("lang", choices=sorted(LANGS), help="项目类型")
     p.add_argument("name", help="项目名(目录名)")
     p.add_argument("--libs", default="", help="逗号分隔库名,写入 deps.yaml use(默认空)")
+    p.add_argument("--type", default="vs", choices=("vs", "as"),
+                   help="IDE 工程类型,仅 cpp 生效(默认 vs)")
     args = p.parse_args(argv)
 
     if not _NAME_RE.match(args.name):
@@ -89,6 +91,7 @@ def main(argv=None) -> int:
         "DEPS": ", ".join(use),
         "DEPS_FIND": find_frag,
         "DEPS_LINK": f"target_link_libraries({args.name} PRIVATE {link_frag})" if use else "",
+        "TYPE": args.type,
     }
 
     src_tpl = os.path.join(MINE_ROOT, "tools", "templates", args.lang)
