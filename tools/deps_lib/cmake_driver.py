@@ -46,6 +46,13 @@ def configure_command(root: str, lib: LibSpec, variant: str) -> list:
     if pool.on_windows():
         cmd.append("-DCMAKE_C_COMPILER=cl")
         cmd.append("-DCMAKE_CXX_COMPILER=cl")
+        # 统一 C++20 + REQUIRED:abseil 的 AbseilDll.cmake 要求 CMAKE_CXX_STANDARD 与
+        # CMAKE_CXX_STANDARD_REQUIRED 同时设才走快速路径;只设 STANDARD 会落到
+        # check_cxx_source_compiles,而 MSVC 下 try_compile 不传 /std:c++20 →
+        # _MSVC_LANG=201402(默认 C++14)探测失败报 "compiler defaults to C++ < 17"
+        # (本机已复现)。全池同标准也保证 abseil 消费者(ink-stroke-modeler)ABI 一致。
+        cmd.append("-DCMAKE_CXX_STANDARD=20")
+        cmd.append("-DCMAKE_CXX_STANDARD_REQUIRED=ON")
     return cmd
 
 

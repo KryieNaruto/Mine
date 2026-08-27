@@ -196,6 +196,10 @@ class TestMsvcConfigureCommand(unittest.TestCase):
         joined = " ".join(cmd)
         self.assertIn("-DCMAKE_C_COMPILER=cl", joined)
         self.assertIn("-DCMAKE_CXX_COMPILER=cl", joined)
+        # 回归:abseil 要求 CXX_STANDARD + CXX_STANDARD_REQUIRED 同时设,否则 MSVC 下
+        # 走 check_cxx_source_compiles 探测失败报 "compiler defaults to C++ < 17"。
+        self.assertIn("-DCMAKE_CXX_STANDARD=20", joined)
+        self.assertIn("-DCMAKE_CXX_STANDARD_REQUIRED=ON", joined)
 
     def test_linux_does_not_force_cl(self):
         root = self._make_pool()
@@ -205,6 +209,8 @@ class TestMsvcConfigureCommand(unittest.TestCase):
         joined = " ".join(cmd)
         self.assertNotIn("-DCMAKE_C_COMPILER=cl", joined)
         self.assertNotIn("-DCMAKE_CXX_COMPILER=cl", joined)
+        # Linux 不强制 C++20:靠 abseil 自己的编译探测按真实编译器能力走(旧 g++ 可 C++17)
+        self.assertNotIn("-DCMAKE_CXX_STANDARD_REQUIRED=ON", joined)
 
 
 if __name__ == "__main__":
