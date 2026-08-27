@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import os
+import re
+import subprocess
 
 from . import manifest
 
@@ -28,3 +30,21 @@ def project_type(deps_yaml_path: str) -> str:
     """读 deps.yaml 的 type: 字段,缺省 'vs'。"""
     data = manifest._load_yaml(deps_yaml_path)
     return data.get("type") or "vs"
+
+
+def discover_vs_generator() -> str:
+    """返回 cmake --help 里可用的最新 Visual Studio 生成器名;无则空串。"""
+    try:
+        out = subprocess.run(["cmake", "--help"], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    best_year = -1
+    best_name = ""
+    for line in (out or "").splitlines():
+        m = re.search(r"(Visual Studio \d+ (\d{4}))", line)
+        if m:
+            year = int(m.group(2))
+            if year > best_year:
+                best_year = year
+                best_name = m.group(1)
+    return best_name

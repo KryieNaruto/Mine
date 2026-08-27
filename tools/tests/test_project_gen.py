@@ -2,6 +2,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # tools/
 from deps_lib import project_gen
@@ -51,6 +52,37 @@ class TestProjectType(unittest.TestCase):
             path = os.path.join(root, "deps.yaml")
             _write(path, "use: [abseil-cpp]\n")
             self.assertEqual(project_gen.project_type(path), "vs")
+
+
+class TestDiscoverVsGenerator(unittest.TestCase):
+    _HELP_OUTPUT = """
+Generators
+
+The following generators are available on this platform (* marks default):
+* Ninja                        = Generates build.ninja files.
+  Visual Studio 16 2019        = Generates Visual Studio 2019 project files.
+                                  Use -A option to specify architecture.
+  Visual Studio 17 2022        = Generates Visual Studio 2022 project files.
+                                  Use -A option to specify architecture.
+"""
+
+    def test_picks_newest_year(self):
+        with mock.patch.object(
+            project_gen.subprocess, "run",
+            return_value=mock.Mock(stdout=self._HELP_OUTPUT),
+        ):
+            self.assertEqual(project_gen.discover_vs_generator(), "Visual Studio 17 2022")
+
+    def test_no_vs_generator_returns_empty(self):
+        with mock.patch.object(
+            project_gen.subprocess, "run",
+            return_value=mock.Mock(stdout="* Ninja = Generates build.ninja files.\n"),
+        ):
+            self.assertEqual(project_gen.discover_vs_generator(), "")
+
+    def test_cmake_missing_returns_empty(self):
+        with mock.patch.object(project_gen.subprocess, "run", side_effect=OSError("no cmake")):
+            self.assertEqual(project_gen.discover_vs_generator(), "")
 
 
 if __name__ == "__main__":
