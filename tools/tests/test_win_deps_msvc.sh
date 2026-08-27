@@ -40,4 +40,23 @@ fi
 # runtime:env.sh 应前置 $QT_PREFIX/bin 到 PATH(Qt6 DLL 运行期可寻)
 printf '%s\n' "$env_block" | grep -qE 'export PATH="\$QT_PREFIX/bin:\\\$PATH"' \
   || { echo "FAIL: env.sh 未把 Qt bin 前置到 PATH"; exit 1; }
-echo "PASS env.sh no /mingw64 + QT_PREFIX 含 6.5.3/msvc2019_64 + 直下预编译"
+
+# Vulkan SDK(MSVC 兼容,find_package(Vulkan) 需要):win-deps.sh 静默装 LunarG SDK 到
+# .user-deps 下(自包含,不碰系统 C:\VulkanSDK),并把 VULKAN_SDK 写进 env.sh 供
+# setup-env.sh source 后传给 gen-projects.py 子进程(CMake FindVulkan 自动认 ENV{VULKAN_SDK})。
+if ! grep -qE 'sdk\.lunarg\.com/sdk/download/latest/windows/vulkan_sdk\.exe' "$WIN_DEPS"; then
+  echo "FAIL: win-deps 缺 LunarG Vulkan SDK(MSVC 兼容)下载 URL"; exit 1
+fi
+if ! grep -qE -- '--accept-licenses' "$WIN_DEPS" || ! grep -qE -- '--confirm-command' "$WIN_DEPS"; then
+  echo "FAIL: win-deps 缺 Vulkan SDK 静默安装参数(--accept-licenses/--confirm-command)"; exit 1
+fi
+vk_dir_def="$(grep -nE '^VULKAN_SDK_DIR=' "$WIN_DEPS" || true)"
+[ -n "$vk_dir_def" ] || { echo "FAIL: win-deps 缺 VULKAN_SDK_DIR 定义"; exit 1; }
+if ! printf '%s\n' "$vk_dir_def" | grep -qE '\$USER_DEPS/'; then
+  echo "FAIL: VULKAN_SDK_DIR 未落在 .user-deps 下(应自包含,不碰系统 C:\\VulkanSDK)"; exit 1
+fi
+if ! printf '%s\n' "$env_block" | grep -qE '^export VULKAN_SDK='; then
+  echo "FAIL: env.sh 缺 VULKAN_SDK(CMake FindVulkan 需要 ENV{VULKAN_SDK} 才能在 MSVC 下定位)"; exit 1
+fi
+
+echo "PASS env.sh no /mingw64 + QT_PREFIX 含 6.5.3/msvc2019_64 + 直下预编译 + Vulkan SDK MSVC 兼容"
