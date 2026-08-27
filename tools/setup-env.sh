@@ -167,6 +167,9 @@ auto_install() {
     info "=== 三方库池已就绪,跳过 fetch/build ==="
   fi
 
+  info "=== 生成 IDE 工程(vs → .sln)==="
+  python3 -u "$MINE_ROOT/tools/gen-projects.py" --all
+
   # 4) 最终校验
   info "=== 最终校验 ==="
   probe
