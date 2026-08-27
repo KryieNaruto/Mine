@@ -1,3 +1,4 @@
+type: vs
 use: []
 # StickyNotes 无第三方 C++ 依赖：Qt 6.4.2 经 tools/install-user-deps.sh 部署到 .user-deps，
 # Noto CJK 字体来自 EasyPainter/assets/fonts。

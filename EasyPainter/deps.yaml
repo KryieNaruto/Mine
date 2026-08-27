@@ -1,1 +1,2 @@
+type: vs
 use: [abseil-cpp, ink-stroke-modeler, glfw, glm, googletest, swiftshader]

@@ -12,6 +12,9 @@ endif()
 
 # 变体解析:CMAKE_BUILD_TYPE(Release/Debug)→ 池产物子目录(release/debug)
 string(TOLOWER "${CMAKE_BUILD_TYPE}" _variant)
+if(NOT _variant)
+  set(_variant "release")          # 多配置生成器(VS)下 CMAKE_BUILD_TYPE 恒空
+endif()
 file(GLOB _pool_dirs LIST_DIRECTORIES true "${MINE_ROOT}/third_party/_install/*/${_variant}")
 list(APPEND CMAKE_PREFIX_PATH ${_pool_dirs})
 

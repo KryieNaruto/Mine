@@ -4,7 +4,8 @@ import tempfile
 import unittest
 from unittest import mock
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # tools/
+_TOOLS = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _TOOLS)  # tools/
 from deps_lib import project_gen
 
 
@@ -209,6 +210,17 @@ class TestGenerateDispatch(unittest.TestCase):
         ok, msg = project_gen.generate("/root", "SomeAndroidApp", "as", "release", None)
         self.assertFalse(ok)
         self.assertTrue(msg.startswith("未实现"))
+
+
+class TestRealProjectsDeclareVsType(unittest.TestCase):
+    def test_easypainter_and_stickynotes_declare_vs(self):
+        mine_root = os.path.dirname(_TOOLS)
+        for name in ("EasyPainter", "StickyNotes"):
+            deps_path = os.path.join(mine_root, name, "deps.yaml")
+            self.assertTrue(os.path.isfile(deps_path), f"{deps_path} 不存在")
+            with open(deps_path, encoding="utf-8") as f:
+                content = f.read()
+            self.assertIn("type: vs", content, f"{deps_path} 缺少显式 type: vs 声明")
 
 
 if __name__ == "__main__":
