@@ -62,14 +62,18 @@ def _gen_vs(root: str, project: str, variant: str, generator: str | None) -> tup
         return False, "未探测到可用的 Visual Studio 生成器(cmake --help 无输出);请安装 VS Build Tools"
     if not msvc_env.ensure_msvc_env(root):
         return False, "MSVC 环境注入失败(vcvars),无法 configure"
-    build_dir = os.path.join(project_dir, "build", "vs")
+    # release/debug 各自独立目录:一次 CMake configure 只能绑定池的一个变体前缀
+    # (find_package 一次性解析,多配置生成器下 CMAKE_BUILD_TYPE 恒空,没法像单配置
+    # 生成器那样靠它切前缀)。同名复用会导致两个变体互相覆盖 build 目录。
+    build_dir = os.path.join(project_dir, "build", "vs" if variant != "debug" else "vs-debug")
+    config_type = "Debug" if variant == "debug" else "Release"
     # EasyPainter 等靠 $ENV{MINE_ROOT} 定位池,必须在 configure 进程环境里注入
     os.environ["MINE_ROOT"] = root
     prefixes = cmake_driver._built_prefixes(root, variant)
     cmd = [
         "cmake", "-S", project_dir, "-B", build_dir,
         "-G", gen_name, "-A", "x64",
-        "-DCMAKE_CONFIGURATION_TYPES=Release",
+        "-DCMAKE_CONFIGURATION_TYPES=" + config_type,
     ]
     if prefixes:
         cmd.append("-DCMAKE_PREFIX_PATH=" + ";".join(prefixes))

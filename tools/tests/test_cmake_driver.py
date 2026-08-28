@@ -240,6 +240,16 @@ class TestMsvcConfigureCommand(unittest.TestCase):
         self.assertIn("-DCMAKE_CXX_STANDARD=20", joined)
         self.assertIn("-DCMAKE_CXX_STANDARD_REQUIRED=ON", joined)
 
+    def test_debug_variant_uses_debug_runtime(self):
+        # 回归:此前不论 variant 一律 MultiThreadedDLL(/MD,Release CRT)。debug 变体
+        # 的静态库若仍以 /MD 编,链进用 CMP0091=NEW 默认 /MDd 的 EasyPainter Debug
+        # 配置时,CRT 不一致(MSVC 链接期 LNK2038 或更隐蔽的堆/ABI 错乱)。
+        root = self._make_pool()
+        lib = LibSpec(name="fmt", repo="r", tag="10.2.1")
+        cmd = cmake_driver.configure_command(root, lib, "debug")
+        joined = " ".join(cmd)
+        self.assertIn("-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDebugDLL", joined)
+
     def test_linux_does_not_force_cl(self):
         root = self._make_pool()
         lib = LibSpec(name="fmt", repo="r", tag="10.2.1")

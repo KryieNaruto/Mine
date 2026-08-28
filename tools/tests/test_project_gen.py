@@ -159,6 +159,48 @@ class TestGenVs(unittest.TestCase):
             self.assertIn("abseil-cpp-1", joined)
             self.assertEqual(os.environ.get("MINE_ROOT"), root)
 
+    def test_debug_variant_uses_debug_configuration_and_separate_build_dir(self):
+        # 回归:gen-projects.py 的 --variant 早就存在(CLI 默认 release),但 _gen_vs
+        # 之前不论 variant 恒 -DCMAKE_CONFIGURATION_TYPES=Release 且写死 build/vs ——
+        # 传 --variant debug 会静默生成一个自称 Debug 却仍指向 release 池前缀语义
+        # 混乱的目录,还会覆盖 release 的 build/vs。debug 变体必须落在独立目录,且
+        # 请求 Debug 配置类型,使两者可共存、各自可在 VS 里直接打开。
+        with tempfile.TemporaryDirectory() as root, \
+             mock.patch.object(project_gen.pool, "on_windows", return_value=True), \
+             mock.patch.object(project_gen, "discover_vs_generator", return_value="Visual Studio 17 2022"), \
+             mock.patch.object(project_gen.msvc_env, "ensure_msvc_env", return_value=True), \
+             mock.patch.object(project_gen.cmake_driver, "_built_prefixes",
+                                return_value=[os.path.join(root, "third_party/_install/abseil-cpp-1/debug")]), \
+             mock.patch.object(project_gen.cmake_driver, "_stream", return_value=(True, "")) as stream:
+            self._make_project(root)
+            ok, msg = project_gen._gen_vs(root, "EasyPainter", "debug", None)
+            self.assertTrue(ok)
+            cmd = stream.call_args[0][0]
+            self.assertIn("-DCMAKE_CONFIGURATION_TYPES=Debug", cmd)
+            self.assertNotIn("-DCMAKE_CONFIGURATION_TYPES=Release", cmd)
+            b_idx = cmd.index("-B")
+            build_dir = cmd[b_idx + 1]
+            self.assertNotEqual(
+                build_dir, os.path.join(root, "EasyPainter", "build", "vs"),
+                "debug 变体不能复用 release 的 build/vs 目录(会互相覆盖)",
+            )
+            self.assertTrue(msg.startswith(build_dir))
+
+    def test_release_variant_still_uses_build_vs_dir(self):
+        # release 是既有默认行为,目录名不应因本次改动而变化(向后兼容)。
+        with tempfile.TemporaryDirectory() as root, \
+             mock.patch.object(project_gen.pool, "on_windows", return_value=True), \
+             mock.patch.object(project_gen, "discover_vs_generator", return_value="Visual Studio 17 2022"), \
+             mock.patch.object(project_gen.msvc_env, "ensure_msvc_env", return_value=True), \
+             mock.patch.object(project_gen.cmake_driver, "_built_prefixes", return_value=[]), \
+             mock.patch.object(project_gen.cmake_driver, "_stream", return_value=(True, "")) as stream:
+            self._make_project(root)
+            ok, msg = project_gen._gen_vs(root, "EasyPainter", "release", None)
+            self.assertTrue(ok)
+            cmd = stream.call_args[0][0]
+            b_idx = cmd.index("-B")
+            self.assertEqual(cmd[b_idx + 1], os.path.join(root, "EasyPainter", "build", "vs"))
+
     def test_generator_override_skips_discovery(self):
         with tempfile.TemporaryDirectory() as root, \
              mock.patch.object(project_gen.pool, "on_windows", return_value=True), \

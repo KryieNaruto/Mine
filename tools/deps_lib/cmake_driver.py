@@ -40,8 +40,12 @@ def configure_command(root: str, lib: LibSpec, variant: str) -> list:
     if prefixes:
         cmd.append("-DCMAKE_PREFIX_PATH=" + ";".join(prefixes))
     # MSVC 工具链:统一动态 CRT,避免静态/动态 ABI 冲突。恒加、不受 on_windows 影响:
-    # Linux 下 CMake 只把它当未消费缓存变量,无副作用;Windows/MSVC 下生效。
-    cmd.append("-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL")
+    # Linux 下 CMake 只把它当未消费缓存变量,无副作用;Windows/MSVC 下生效。按 variant
+    # 选 /MD 还是 /MDd —— 消费方(如 EasyPainter)在 CMP0091=NEW 下 Debug 配置默认走
+    # /MDd,池的 debug 变体若仍编 /MD 会导致 CRT 不一致(MSVC 链接期 LNK2038 或更隐蔽
+    # 的堆/ABI 错乱)。
+    _runtime = "MultiThreadedDebugDLL" if variant == "debug" else "MultiThreadedDLL"
+    cmd.append("-DCMAKE_MSVC_RUNTIME_LIBRARY=" + _runtime)
     # Windows 强制用 MSVC cl,避免 PATH 里残留 g++(MinGW)时 CMake 选错编译器。
     # MSVC 预编译/Qt6 均要求 cl;SwiftShader 等含 __nop() 等 MSVC-only 代码,GCC 编译必崩。
     if pool.on_windows():
