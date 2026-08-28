@@ -101,14 +101,6 @@ class TestGenVs(unittest.TestCase):
             _write(os.path.join(d, "CMakeLists.txt"), "project(demo)\n")
         return d
 
-    def test_skips_on_non_windows(self):
-        with tempfile.TemporaryDirectory() as root, \
-             mock.patch.object(project_gen.pool, "on_windows", return_value=False):
-            self._make_project(root)
-            ok, msg = project_gen._gen_vs(root, "EasyPainter", "release", None)
-            self.assertTrue(ok)
-            self.assertTrue(msg.startswith("跳过"))
-
     def test_skips_when_no_cmakelists(self):
         with tempfile.TemporaryDirectory() as root, \
              mock.patch.object(project_gen.pool, "on_windows", return_value=True):
@@ -262,11 +254,109 @@ class TestGenVs(unittest.TestCase):
             self.assertIn("find_package(absl)", msg)
 
 
-class TestGenAsPlaceholder(unittest.TestCase):
-    def test_returns_not_implemented(self):
-        ok, msg = project_gen._gen_as("/root", "SomeAndroidApp", "release", None)
-        self.assertFalse(ok)
-        self.assertTrue(msg.startswith("未实现"))
+class TestGenVsLinuxBuild(unittest.TestCase):
+    def setUp(self):
+        self._old = dict(os.environ)
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self._old)
+
+    def test_linux_uses_preset_and_builds(self):
+        with tempfile.TemporaryDirectory() as root, \
+             mock.patch.object(project_gen.pool, "on_windows", return_value=False), \
+             mock.patch.object(project_gen.cmake_driver, "_stream",
+                                return_value=(True, "")) as stream:
+            d = os.path.join(root, "EasyPainter")
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "CMakeLists.txt"), "w") as f:
+                f.write("project(demo)\n")
+            with open(os.path.join(d, "CMakePresets.json"), "w") as f:
+                f.write("{}")
+            ok, msg = project_gen._gen_vs(root, "EasyPainter", "release", None)
+        self.assertTrue(ok)
+        cmds = [c.args[0] for c in stream.call_args_list]
+        self.assertIn(["cmake", "--preset", "release", "-S", d], cmds)
+        self.assertTrue(any("--build" in c for c in cmds))
+        self.assertTrue(msg.startswith("构建完成"))
+        self.assertEqual(os.environ.get("MINE_ROOT"), root)
+
+    def test_linux_debug_variant_uses_explicit_build_type(self):
+        with tempfile.TemporaryDirectory() as root, \
+             mock.patch.object(project_gen.pool, "on_windows", return_value=False), \
+             mock.patch.object(project_gen.cmake_driver, "_stream",
+                                return_value=(True, "")) as stream:
+            d = os.path.join(root, "EasyPainter")
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "CMakeLists.txt"), "w") as f:
+                f.write("project(demo)\n")
+            ok, _ = project_gen._gen_vs(root, "EasyPainter", "debug", None)
+        self.assertTrue(ok)
+        cfg = stream.call_args_list[0].args[0]
+        self.assertIn("-DCMAKE_BUILD_TYPE=Debug", cfg)
+
+
+class TestGenAs(unittest.TestCase):
+    def setUp(self):
+        self._old = dict(os.environ)
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self._old)
+
+    def _make_android_project(self, root, with_gradlew=True):
+        d = os.path.join(root, "HelloAndroid")
+        os.makedirs(os.path.join(d, "app"), exist_ok=True)
+        if with_gradlew:
+            with open(os.path.join(d, "gradlew"), "w") as f:
+                f.write("#!/usr/bin/env bash\n")
+        return d
+
+    def test_windows_with_sdk_writes_local_properties(self):
+        with tempfile.TemporaryDirectory() as root, \
+             mock.patch.object(project_gen.pool, "on_windows", return_value=True), \
+             mock.patch.object(project_gen.android, "find_android_sdk",
+                               return_value=r"D:\Android\Sdk"), \
+             mock.patch.object(project_gen.android, "write_local_properties",
+                               return_value="") as wlp:
+            self._make_android_project(root)
+            ok, msg = project_gen._gen_as(root, "HelloAndroid", "release", None)
+        self.assertTrue(ok)
+        wlp.assert_called_once()
+        self.assertIn("local.properties", msg)
+
+    def test_windows_no_sdk_skips(self):
+        with tempfile.TemporaryDirectory() as root, \
+             mock.patch.object(project_gen.pool, "on_windows", return_value=True), \
+             mock.patch.object(project_gen.android, "find_android_sdk", return_value=None):
+            self._make_android_project(root)
+            ok, msg = project_gen._gen_as(root, "HelloAndroid", "release", None)
+        self.assertTrue(ok)
+        self.assertTrue(msg.startswith("跳过"))
+
+    def test_linux_with_sdk_builds_apk(self):
+        with tempfile.TemporaryDirectory() as root, \
+             mock.patch.object(project_gen.pool, "on_windows", return_value=False), \
+             mock.patch.object(project_gen.android, "find_android_sdk",
+                               return_value="/opt/android-sdk"), \
+             mock.patch.object(project_gen.cmake_driver, "_stream",
+                                return_value=(True, "")) as stream:
+            d = self._make_android_project(root)
+            ok, msg = project_gen._gen_as(root, "HelloAndroid", "release", None)
+        self.assertTrue(ok)
+        cmd, kw = stream.call_args
+        self.assertEqual(cmd[0], ["./gradlew", "assembleDebug"])
+        self.assertEqual(kw.get("cwd"), d)
+        self.assertIn("app-debug.apk", msg)
+
+    def test_linux_no_sdk_skips(self):
+        with tempfile.TemporaryDirectory() as root, \
+             mock.patch.object(project_gen.pool, "on_windows", return_value=False), \
+             mock.patch.object(project_gen.android, "find_android_sdk", return_value=None):
+            self._make_android_project(root)
+            ok, msg = project_gen._gen_as(root, "HelloAndroid", "release", None)
+        self.assertTrue(ok)
+        self.assertTrue(msg.startswith("跳过"))
 
 
 class TestGenerateDispatch(unittest.TestCase):
@@ -281,11 +371,6 @@ class TestGenerateDispatch(unittest.TestCase):
             self.assertTrue(ok)
             self.assertEqual(msg, "ok")
             project_gen.GENERATORS["vs"].assert_called_once_with("/root", "EasyPainter", "release", None)
-
-    def test_as_is_registered_but_not_implemented(self):
-        ok, msg = project_gen.generate("/root", "SomeAndroidApp", "as", "release", None)
-        self.assertFalse(ok)
-        self.assertTrue(msg.startswith("未实现"))
 
 
 class TestRealProjectsDeclareVsType(unittest.TestCase):

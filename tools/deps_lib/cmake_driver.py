@@ -75,7 +75,7 @@ def _make_output_safe() -> None:
             pass
 
 
-def _stream(cmd: list, tail_lines: int = 60) -> tuple:
+def _stream(cmd: list, tail_lines: int = 60, cwd: str | None = None) -> tuple:
     """运行子进程并逐行实时透传输出(flush),仅保留尾部 tail_lines 行作失败日志。
 
     背景:build-deps 在管道下 stdout 是块缓冲,capture_output 会把
@@ -89,6 +89,7 @@ def _stream(cmd: list, tail_lines: int = 60) -> tuple:
     try:
         proc = subprocess.Popen(
             cmd,
+            cwd=cwd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,

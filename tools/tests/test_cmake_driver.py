@@ -179,6 +179,15 @@ class TestStream(unittest.TestCase):
         self.assertIn("[1/2] building...", out.getvalue())
 
 
+class TestStreamCwd(unittest.TestCase):
+    def test_cwd_passed_to_subprocess(self):
+        with mock.patch.object(cmake_driver.subprocess, "Popen") as popen:
+            popen.return_value = _FakeProc(["ok"], 0)
+            ok, tail = cmake_driver._stream(["true"], cwd="/tmp/proj")
+        self.assertTrue(ok)
+        self.assertEqual(popen.call_args[1].get("cwd"), "/tmp/proj")
+
+
 class TestBuildLib(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
