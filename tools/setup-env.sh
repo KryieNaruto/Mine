@@ -153,6 +153,9 @@ auto_install() {
   fi
   bash "$MINE_ROOT/tools/install-user-deps.sh"
 
+  # Android 工具链(JDK + SDK;探测复用优先,缺失才下载;Windows/Linux 共用)
+  bash "$MINE_ROOT/tools/android-deps.sh"
+
   # 2) 载入用户级环境
   # shellcheck disable=SC1090
   [ -f "$USER_DEPS_ENV" ] && . "$USER_DEPS_ENV"

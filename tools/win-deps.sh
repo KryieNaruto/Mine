@@ -13,6 +13,33 @@ USER_DEPS="$MINE_ROOT/.user-deps"
 DEB_CACHE="$USER_DEPS/.deb-cache"
 mkdir -p "$USER_DEPS" "$DEB_CACHE"
 
+# --- 0.5 非 MSYS2 环境(如 Git Bash)引导:下载 msys2 base 到 .user-deps/msys64 ---
+# 根因:Git Bash 的 uname 也报 MINGW*,但无 pacman;必须回到真 MSYS2 才能跑 pacman。
+# 仅当 win-deps.sh 被单独直接执行时走到这里(setup-env.sh/install-user-deps.sh 已先行 ensure_msys2)。
+if ! command -v pacman >/dev/null 2>&1; then
+  info "0.5 未检测到 pacman(非 MSYS2 环境,如 Git Bash)。引导 MSYS2 到 \$USER_DEPS/msys64 …"
+  MSYS2_DIR="$USER_DEPS/msys64"
+  [ -x "$MSYS2_DIR/usr/bin/pacman.exe" ] || {
+    mkdir -p "$USER_DEPS"
+    # 镜像优先:清华/中科大 msys2 仓库的 msys2-base-x86_64-*.tar.xz(取最新一个)
+    MSYS2_BASE=""
+    for base in "https://mirrors.tuna.tsinghua.edu.cn/msys2/distrib/x86_64/" \
+                "https://mirrors.ustc.edu.cn/msys2/distrib/x86_64/"; do
+      idx="$(curl -fsSL --max-time 20 "$base" 2>/dev/null || true)"
+      fn="$(printf '%s' "$idx" | grep -oE 'msys2-base-x86_64-[0-9]{8}\.tar\.xz' | sort -r | head -1 || true)"
+      [ -n "$fn" ] && { MSYS2_BASE="$base$fn"; break; }
+    done
+    [ -n "$MSYS2_BASE" ] || die "MSYS2 base 下载源不可达(镜像全挂)"
+    curl -fL --retry 3 -o "$USER_DEPS/msys2-base.tar.xz" "$MSYS2_BASE" \
+      || die "MSYS2 base 下载失败"
+    tar -xJf "$USER_DEPS/msys2-base.tar.xz" -C "$USER_DEPS"   # 解出 msys64/
+    rm -f "$USER_DEPS/msys2-base.tar.xz"
+  }
+  # 用新 MSYS2 的 bash 重入本脚本(路径转换:MSYS2 内用 /d/qsw/Mine)
+  MSYS_ROOT="$(cygpath -u "$MINE_ROOT" 2>/dev/null || printf '%s' "$MINE_ROOT")"
+  exec "$MSYS2_DIR/usr/bin/bash.exe" -lc "cd '$MSYS_ROOT' && export USER_DEPS='$USER_DEPS' && bash tools/win-deps.sh"
+fi
+
 # MSVC 工具链发现/自动安装 + vcvars 导出(Task 1)
 # shellcheck disable=SC1091
 . "$MINE_ROOT/tools/deps_lib/msvc.sh"

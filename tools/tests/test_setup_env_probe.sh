@@ -26,3 +26,11 @@ grep -q "msvc" "$ROOT/setup-env.sh" && echo "PASS probe references msvc" || {
   echo "FAIL: probe 未引用 msvc"
   exit 1
 }
+
+# setup.bat 双击入口(仓库根,非 tools/ 下):存在且引用 setup-env.sh。
+SETUP_BAT="$ROOT/../setup.bat"
+[ -f "$SETUP_BAT" ] || { echo "FAIL: setup.bat 不存在"; exit 1; }
+grep -q "setup-env.sh" "$SETUP_BAT" && echo "PASS setup.bat 存在且引用 setup-env.sh" || {
+  echo "FAIL: setup.bat 未引用 setup-env.sh"
+  exit 1
+}
