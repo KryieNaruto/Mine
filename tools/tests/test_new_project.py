@@ -60,6 +60,8 @@ class TestNewProjectAndroid(unittest.TestCase):
                     "gradle/wrapper/gradle-wrapper.properties",
                     "gradlew"):
             self.assertTrue(os.path.isfile(os.path.join(dst, rel)), rel)
+        self.assertTrue(os.access(os.path.join(dst, "gradlew"), os.X_OK),
+                        "gradlew 可执行位")
         with open(os.path.join(dst, "deps.yaml"), encoding="utf-8") as f:
             self.assertIn("type: as", f.read())
 

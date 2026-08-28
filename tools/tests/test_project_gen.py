@@ -294,6 +294,9 @@ class TestGenVsLinuxBuild(unittest.TestCase):
         self.assertTrue(ok)
         cfg = stream.call_args_list[0].args[0]
         self.assertIn("-DCMAKE_BUILD_TYPE=Debug", cfg)
+        b_idx = cfg.index("-B")
+        self.assertEqual(cfg[b_idx + 1], os.path.join(d, "build", "debug"),
+                         "debug 变体必须落在 build/debug,不能复用 release 的 build/release")
 
 
 class TestGenAs(unittest.TestCase):

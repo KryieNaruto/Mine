@@ -58,7 +58,9 @@ def _gen_vs(root: str, project: str, variant: str, generator: str | None) -> tup
         return True, "跳过: 无 CMakeLists.txt"
     if not pool.on_windows():
         # Linux(或 macOS):直接编译出结果,满足"linux->能编译成功即可"。
-        build_dir = os.path.join(project_dir, "build", "release")
+        # debug/release 分目录,对齐 CMakePresets 的 binaryDir(build/debug、build/release),
+        # 避免两变体互相覆盖。
+        build_dir = os.path.join(project_dir, "build", "debug" if variant == "debug" else "release")
         os.environ["MINE_ROOT"] = root  # 池根,CMakeLists 里靠 $ENV{MINE_ROOT} 定位池
         bt = "Debug" if variant == "debug" else "Release"
         if variant == "release" and os.path.isfile(os.path.join(project_dir, "CMakePresets.json")):

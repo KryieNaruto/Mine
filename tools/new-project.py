@@ -103,6 +103,10 @@ def main(argv=None) -> int:
     }
     if args.lang == "as":
         ctx["TYPE"] = "as"   # as 模板强制 Android Studio 类型,忽略 --type
+        if use:
+            # as 的依赖来自 Maven(模板 settings.gradle 已配镜像),--libs 不写入 deps.yaml
+            print(f"警告: as 项目忽略 --libs({', '.join(use)}),Android 依赖来自 Maven",
+                  file=sys.stderr)
 
     src_tpl = os.path.join(MINE_ROOT, "tools", "templates", args.lang)
     render_template(src_tpl, dst, ctx)

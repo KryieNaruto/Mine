@@ -954,6 +954,8 @@ git commit -m "feat(tools): new-project.py 支持 as 类型 + Android 模板 + H
 - Consumes: 无(独立脚本)。env.sh 里 `ANDROID_HOME`/`JAVA_HOME` 供 Task 2 的 `find_android_sdk` 与 gradle 使用。
 - Produces: `.user-deps/env.sh` 追加 `export ANDROID_HOME=...`、`export JAVA_HOME=...`、`export PATH=...:$PATH`; `setup.bat` 可双击运行。
 
+> **评审修正(2026-08-28,cmdline-tools spec→plan 偏差)**:spec §5 要求 cmdline-tools 国内镜像兜底,原实现只有官方 `commandlinetools-${PLAT}-latest.zip`(无 `-latest` 别名,官方与镜像均 404)。实测腾讯云 `https://mirrors.cloud.tencent.com/AndroidSDK/commandlinetools-{linux,win}-16111833_latest.zip` 返回 200,故改为镜像优先(腾讯云)+ 官方 `dl.google.com` 版本号 URL 兜底,平台 token 用 `win`(非 `windows`)。
+
 - [ ] **Step 1: 写静态断言测试 `tools/tests/test_android_deps.sh`**
 
 ```bash

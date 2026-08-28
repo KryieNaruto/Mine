@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import os
 
+from . import MINE_ROOT
+
 
 def find_android_sdk() -> str | None:
     """返回已安装的 Android SDK 根目录;找不到返回 None。"""
@@ -17,7 +19,9 @@ def find_android_sdk() -> str | None:
             return v
     home = os.path.expanduser("~")
     local = os.environ.get("LOCALAPPDATA", "")
-    user_deps = os.environ.get("USER_DEPS", os.path.join(home, ".user-deps"))
+    # 默认落到 MINE_ROOT/.user-deps(即 tools/android-deps.sh 的落地目录),保证
+    # 无 env.sh source 的独立 `gen-projects.py --all` 也能命中;USER_DEPS 可覆盖。
+    user_deps = os.environ.get("USER_DEPS", os.path.join(MINE_ROOT, ".user-deps"))
     candidates = []
     if local:
         candidates.append(os.path.join(local, "Android", "Sdk"))

@@ -12,8 +12,12 @@ fi
 if ! grep -qE 'api\.adoptium\.net|mirrors\.huaweicloud\.com/openjdk' "$ANDROID_DEPS"; then
   echo "FAIL: android-deps.sh 缺 JDK 下载源"; exit 1
 fi
-if ! grep -qE 'commandlinetools-(linux|windows|\$\{PLAT\})-latest\.zip' "$ANDROID_DEPS"; then
-  echo "FAIL: android-deps.sh 缺 cmdline-tools 下载 URL"; exit 1
+if ! grep -qE 'commandlinetools-\$\{CT_PLAT\}-\$\{CT_VER\}_latest\.zip' "$ANDROID_DEPS"; then
+  echo "FAIL: android-deps.sh 缺 cmdline-tools 下载 URL(应带版本号,官方/镜像均无 -latest 别名)"; exit 1
+fi
+# cmdline-tools 国内镜像优先(腾讯云 AndroidSDK 仓库,实测 200),官方 dl.google.com 兜底
+if ! grep -qE 'mirrors\.cloud\.tencent\.com/AndroidSDK' "$ANDROID_DEPS"; then
+  echo "FAIL: android-deps.sh 缺 cmdline-tools 国内镜像"; exit 1
 fi
 # 许可证自动接受
 if ! grep -qE 'sdkmanager.*--licenses' "$ANDROID_DEPS"; then
@@ -22,6 +26,10 @@ fi
 # env.sh 导出
 if ! grep -qE 'export ANDROID_HOME=' "$ANDROID_DEPS"; then
   echo "FAIL: android-deps.sh 未写 ANDROID_HOME 到 env.sh"; exit 1
+fi
+# Windows 分支写 env.sh 前须用 cygpath -m 把 /c/... 转 C:\...(原生 Windows Python/Android Studio 才认)
+if ! grep -qE 'cygpath -m' "$ANDROID_DEPS"; then
+  echo "FAIL: android-deps.sh Windows 分支未用 cygpath -m 转换 env.sh 路径"; exit 1
 fi
 # 复用优先:先探测现成 SDK,找不到才下载
 if ! grep -qE 'ANDROID_HOME|ANDROID_SDK_ROOT' "$ANDROID_DEPS"; then

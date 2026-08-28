@@ -46,10 +46,26 @@ class TestFindAndroidSdk(unittest.TestCase):
             os.environ["USER_DEPS"] = deps
             self.assertEqual(android.find_android_sdk(), sdk)
 
+    def test_mine_root_user_deps_fallback_when_user_deps_unset(self):
+        # USER_DEPS 未设时,默认落到 MINE_ROOT/.user-deps/android-sdk(android-deps.sh 落地目录)。
+        # mock MINE_ROOT + expanduser 指向临时目录,隔离真实机器的 ~/Android/Sdk 与仓库 .user-deps。
+        sdk = os.path.join(self.tmp.name, "mine", ".user-deps", "android-sdk")
+        os.makedirs(sdk)
+        with mock.patch.object(android, "MINE_ROOT", os.path.join(self.tmp.name, "mine")), \
+             mock.patch("os.path.expanduser", return_value=os.path.join(self.tmp.name, "no-home")):
+            os.environ.pop("ANDROID_HOME", None)
+            os.environ.pop("ANDROID_SDK_ROOT", None)
+            os.environ.pop("USER_DEPS", None)
+            os.environ.pop("LOCALAPPDATA", None)
+            self.assertEqual(android.find_android_sdk(), sdk)
+
     def test_none_when_missing(self):
         os.environ.pop("ANDROID_HOME", None)
         os.environ.pop("ANDROID_SDK_ROOT", None)
-        with mock.patch("os.path.expanduser", return_value="/nonexistent-home"):
+        os.environ.pop("USER_DEPS", None)
+        os.environ.pop("LOCALAPPDATA", None)
+        with mock.patch("os.path.expanduser", return_value="/nonexistent-home"), \
+             mock.patch.object(android, "MINE_ROOT", "/nonexistent-mine-root"):
             self.assertIsNone(android.find_android_sdk())
 
 

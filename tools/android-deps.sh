@@ -73,6 +73,8 @@ if [ -z "$JAVA_HOME" ]; then
 fi
 
 # --- ② Android SDK cmdline-tools:探测现成,缺失下载 ---
+# 注:cmdline-tools 只是最小 SDK 管理器本体,不含 platforms/android-34 与 build-tools;
+# 这些由 AGP 首次构建时按 compileSdk 自动经 sdkmanager 下载(需联网 + 已接受许可证)。
 ANDROID_HOME=""
 for cand in "${ANDROID_HOME:-}" "${ANDROID_SDK_ROOT:-}" "$USER_DEPS/android-sdk" \
             "${LOCALAPPDATA:-}/Android/Sdk" "$HOME/Android/Sdk" "/opt/android-sdk"; do
@@ -84,10 +86,17 @@ else
   info "② 未探测到 Android SDK,下载 cmdline-tools 到 .user-deps/android-sdk …"
   ANDROID_HOME="$USER_DEPS/android-sdk"
   mkdir -p "$ANDROID_HOME/cmdline-tools"
-  CT_URL="https://dl.google.com/android/repository/commandlinetools-${PLAT}-latest.zip"
+  # cmdline-tools 命名里平台 token 是 linux/win(非 windows),单独映射;版本必须显式
+  # 带出(官方与镜像都没有 -latest 别名,`-latest.zip` 实测 404)。版本锁 16111833。
+  case "$PLAT" in windows) CT_PLAT=win ;; *) CT_PLAT=linux ;; esac
+  CT_VER="16111833"
+  # 国内镜像优先(腾讯云 AndroidSDK 仓库,实测 200),官方 dl.google.com 兜底。
+  CT_MIRROR="https://mirrors.cloud.tencent.com/AndroidSDK/commandlinetools-${CT_PLAT}-${CT_VER}_latest.zip"
+  CT_OFFICIAL="https://dl.google.com/android/repository/commandlinetools-${CT_PLAT}-${CT_VER}_latest.zip"
   CT_ARCHIVE="$USER_DEPS/cmdline-tools.zip"
-  curl -fL --retry 3 -o "$CT_ARCHIVE" "$CT_URL" \
-    || die "cmdline-tools 下载失败(官方 URL 不可达;可手动下载同 URL 到 $CT_ARCHIVE 后重跑)"
+  curl -fL --retry 3 -o "$CT_ARCHIVE" "$CT_MIRROR" \
+    || curl -fL --retry 3 -o "$CT_ARCHIVE" "$CT_OFFICIAL" \
+    || die "cmdline-tools 下载失败(镜像与官方 URL 均不可达;可手动下载同 URL 到 $CT_ARCHIVE 后重跑)"
   unpack_zip "$CT_ARCHIVE" "$ANDROID_HOME/cmdline-tools"
   [ -d "$ANDROID_HOME/cmdline-tools/cmdline-tools" ] \
     && mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
@@ -102,14 +111,24 @@ if [ -n "${JAVA_HOME:-}" ]; then export JAVA_HOME; fi
   || info "许可证接受失败(不影响其他项目)"
 
 # --- ④ 写 env.sh(幂等:存在则保留既有行,追加/更新本脚本的导出)---
+# Windows 下 ANDROID_HOME/JAVA_HOME 是 MSYS POSIX 路径(/c/...),原生 Windows Python
+# (find_android_sdk 用 os.path.isdir 判存在)与 Android Studio(local.properties)都不认;
+# 写进 env.sh 前用 cygpath -m 转成 Windows 原生形式(C:\...),cygpath 不可用则退回原路径。
+if [ "$PLAT" = "windows" ]; then
+  AH_ENV="$(cygpath -m "$ANDROID_HOME" 2>/dev/null || printf '%s' "$ANDROID_HOME")"
+  JH_ENV="$(cygpath -m "$JAVA_HOME" 2>/dev/null || printf '%s' "$JAVA_HOME")"
+else
+  AH_ENV="$ANDROID_HOME"
+  JH_ENV="$JAVA_HOME"
+fi
 if [ ! -f "$ENV_SH" ]; then
   printf '# Android 工具链环境(由 tools/android-deps.sh 生成)\n' > "$ENV_SH"
 fi
 _san() { grep -v '^# ' "$1" 2>/dev/null | grep -v '^$' || true; }
 _san "$ENV_SH" | grep -qE '^export ANDROID_HOME=' \
-  || printf 'export ANDROID_HOME="%s"\n' "$ANDROID_HOME" >> "$ENV_SH"
+  || printf 'export ANDROID_HOME="%s"\n' "$AH_ENV" >> "$ENV_SH"
 if [ -n "${JAVA_HOME:-}" ]; then
   _san "$ENV_SH" | grep -qE '^export JAVA_HOME=' \
-    || printf 'export JAVA_HOME="%s"\n' "$JAVA_HOME" >> "$ENV_SH"
+    || printf 'export JAVA_HOME="%s"\n' "$JH_ENV" >> "$ENV_SH"
 fi
 info "④ Android 工具链就绪: ANDROID_HOME=$ANDROID_HOME"

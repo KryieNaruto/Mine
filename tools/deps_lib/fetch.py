@@ -135,6 +135,10 @@ def ensure_swiftshader_submodules(root: str) -> tuple:
             capture_output=True, text=True,
         )
         if r.returncode == 0 and _submodule_ready(src):
+            # 成功路径也要清除 insteadOf 改写,否则陈旧的镜像前缀会残留,让本仓库
+            # 之后(如 CMake configure 时的 submodule update)仍走镜像而非官方直连。
+            if prefix:
+                _unset_mirror_rewrite(src, prefix)
             return True, ""
         last = (r.stderr or r.stdout)[-800:]
         if prefix:
