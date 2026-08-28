@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 
 from . import cmake_driver, manifest, msvc_env, pool
@@ -67,6 +68,20 @@ def _gen_vs(root: str, project: str, variant: str, generator: str | None) -> tup
     # 生成器那样靠它切前缀)。同名复用会导致两个变体互相覆盖 build 目录。
     build_dir = os.path.join(project_dir, "build", "vs" if variant != "debug" else "vs-debug")
     config_type = "Debug" if variant == "debug" else "Release"
+    # build_dir 跨多次 regenerate 复用:find_package 的结果(如 glfw3_DIR)一旦被
+    # CMakeCache.txt 缓存住,哪怕 CMakeLists.txt 后来改了搜索范围,重新 configure
+    # 也不会重新搜——CMake 直接复用缓存里已定住的路径(哪怕是误链到 MinGW glfw3
+    # 的那份),新收窄的 find_package 形同虚设(本机复现:上一版收窄 find_package
+    # 搜索范围后 libglfw3.a 的 LNK2019 原样重现,根因在此,不在收窄逻辑本身)。每次
+    # configure 前清掉配置期缓存强制全新搜索;已编译产物(Debug/Release 下的
+    # obj/lib/exe)不在这两处,不受影响——这里只 configure 不编译,不该连带强制
+    # 整包重编。
+    cache_file = os.path.join(build_dir, "CMakeCache.txt")
+    cache_dir = os.path.join(build_dir, "CMakeFiles")
+    if os.path.isfile(cache_file):
+        os.remove(cache_file)
+    if os.path.isdir(cache_dir):
+        shutil.rmtree(cache_dir)
     # EasyPainter 等靠 $ENV{MINE_ROOT} 定位池,必须在 configure 进程环境里注入
     os.environ["MINE_ROOT"] = root
     prefixes = cmake_driver._built_prefixes(root, variant)

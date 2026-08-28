@@ -159,6 +159,40 @@ class TestGenVs(unittest.TestCase):
             self.assertIn("abseil-cpp-1", joined)
             self.assertEqual(os.environ.get("MINE_ROOT"), root)
 
+    def test_clears_stale_cmake_cache_before_reconfigure(self):
+        # 回归:_gen_vs 每次都 -B 进同一个 build/vs 目录复用。find_package 的结果
+        # (如 glfw3_DIR)一旦被 CMakeCache.txt 缓存住,哪怕后来 CMakeLists.txt 改了
+        # 搜索范围(收窄只认池前缀),重新 configure 也不会重新搜——CMake 直接复用
+        # 缓存里已经定住的(哪怕是误链到 MinGW glfw3 的)路径,新 CMakeLists 的收窄
+        # 形同虚设(本机复现:上一版修复后 libglfw3.a 的 LNK2019 原样重现)。必须在
+        # 每次 configure 前清掉配置期缓存(CMakeCache.txt + CMakeFiles/)强制全新搜索。
+        # 已编译产物(Debug/Release 下的 obj/lib/exe)不在这两处,不应被这次清理动到——
+        # _gen_vs 的职责是"只 configure 不编译",清缓存不该连带强制整包重编。
+        with tempfile.TemporaryDirectory() as root, \
+             mock.patch.object(project_gen.pool, "on_windows", return_value=True), \
+             mock.patch.object(project_gen, "discover_vs_generator", return_value="Visual Studio 17 2022"), \
+             mock.patch.object(project_gen.msvc_env, "ensure_msvc_env", return_value=True), \
+             mock.patch.object(project_gen.cmake_driver, "_built_prefixes", return_value=[]), \
+             mock.patch.object(project_gen.cmake_driver, "_stream", return_value=(True, "")):
+            project_dir = self._make_project(root)
+            build_dir = os.path.join(project_dir, "build", "vs")
+            os.makedirs(os.path.join(build_dir, "CMakeFiles"), exist_ok=True)
+            _write(os.path.join(build_dir, "CMakeCache.txt"),
+                   "glfw3_DIR:PATH=/mingw64/lib/cmake/glfw3\n")
+            _write(os.path.join(build_dir, "CMakeFiles", "stale.stamp"), "stale")
+            # 已编译产物:清缓存不该动它
+            _write(os.path.join(build_dir, "Release", "easypainter.exe"), "binary")
+
+            ok, _ = project_gen._gen_vs(root, "EasyPainter", "release", None)
+
+            self.assertTrue(ok)
+            self.assertFalse(os.path.exists(os.path.join(build_dir, "CMakeCache.txt")),
+                              "陈旧 CMakeCache.txt 必须在 configure 前清掉")
+            self.assertFalse(os.path.exists(os.path.join(build_dir, "CMakeFiles")),
+                              "陈旧 CMakeFiles/ 必须在 configure 前清掉")
+            self.assertTrue(os.path.isfile(os.path.join(build_dir, "Release", "easypainter.exe")),
+                             "已编译产物不应被清缓存动到")
+
     def test_debug_variant_uses_debug_configuration_and_separate_build_dir(self):
         # 回归:gen-projects.py 的 --variant 早就存在(CLI 默认 release),但 _gen_vs
         # 之前不论 variant 恒 -DCMAKE_CONFIGURATION_TYPES=Release 且写死 build/vs ——
