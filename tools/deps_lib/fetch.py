@@ -6,28 +6,39 @@ import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 
-from . import MINE_ROOT, manifest, pool
+from . import MINE_ROOT, manifest, mirror, pool
 from .manifest import LibSpec, ver_dir
 
 
 def clone_lib(root: str, lib: LibSpec):
-    """把 lib 源码 clone 到池 _src/<ver_dir>。返回 (ok, commit_or_err)。"""
+    """把 lib 源码 clone 到池 _src/<ver_dir>。镜像优先,官方直连兜底。
+    返回 (ok, commit_or_err)。"""
     src = pool.src_dir(root, lib.name, lib.tag)
     if os.path.isdir(src):
         return False, "already exists"
     os.makedirs(os.path.dirname(src), exist_ok=True)
 
-    # 主路径:tag/branch 浅克隆
-    r = subprocess.run(
-        ["git", "clone", "--depth", "1", "--branch", lib.tag, lib.repo, src],
-        capture_output=True, text=True,
-    )
-    if r.returncode != 0:
-        # 回退:全量克隆后 checkout 任意 ref(含 commit sha)
+    prefix = mirror.pick_mirror_prefix()
+    attempts = ([mirror.mirror_url(lib.repo, prefix)] if prefix else []) + [lib.repo]
+
+    ok = False
+    last_err = ""
+    for url in attempts:
+        r = subprocess.run(
+            ["git", "clone", "--depth", "1", "--branch", lib.tag, url, src],
+            capture_output=True, text=True,
+        )
+        if r.returncode == 0:
+            ok = True
+            break
+        shutil.rmtree(src, ignore_errors=True)  # 失败残留(镜像断流/半成品),清理后重试下一路
+        last_err = (r.stderr or r.stdout).strip()
+    if not ok:
+        # 全量克隆后 checkout 任意 ref(含 commit sha);只走官方源
         r2 = subprocess.run(["git", "clone", lib.repo, src], capture_output=True, text=True)
         if r2.returncode != 0:
             shutil.rmtree(src, ignore_errors=True)
-            return False, (r.stderr + "\n" + r2.stderr).strip()
+            return False, (last_err + "\n" + r2.stderr).strip()
         r3 = subprocess.run(["git", "-C", src, "checkout", lib.tag], capture_output=True, text=True)
         if r3.returncode != 0:
             shutil.rmtree(src, ignore_errors=True)
@@ -78,6 +89,23 @@ def _reset_submodule(src: str, sub: str) -> None:
     shutil.rmtree(sub, ignore_errors=True)
 
 
+def _set_mirror_rewrite(src: str, prefix: str) -> None:
+    """仓库级 url.<prefix>https://github.com/.insteadOf,让本仓库内所有 github
+    拉取(含子模块 clone)走镜像。git submodule 继承父仓库的 insteadOf 规则。"""
+    subprocess.run(
+        ["git", "-C", src, "config", f"url.{prefix}https://github.com/.insteadOf",
+         "https://github.com/"],
+        capture_output=True, text=True,
+    )
+
+
+def _unset_mirror_rewrite(src: str, prefix: str) -> None:
+    subprocess.run(
+        ["git", "-C", src, "config", "--unset-all", f"url.{prefix}https://github.com/.insteadOf"],
+        capture_output=True, text=True,
+    )
+
+
 def ensure_swiftshader_submodules(root: str) -> tuple:
     """确保 swiftshader 的 glslang 子模块就位(其 Vulkan 构建必需)。
 
@@ -96,6 +124,9 @@ def ensure_swiftshader_submodules(root: str) -> tuple:
     if not os.path.isdir(src) or not os.path.isfile(os.path.join(src, ".gitmodules")):
         return True, ""  # swiftshader 未拉取或无需子模块,交给后续流程
     last = ""
+    prefix = mirror.pick_mirror_prefix()
+    if prefix:
+        _set_mirror_rewrite(src, prefix)
     for _ in (1, 2, 3):
         _reset_submodule(src, sub)  # 清半成品,否则中断残留会让重试沿用坏状态
         r = subprocess.run(
@@ -106,6 +137,9 @@ def ensure_swiftshader_submodules(root: str) -> tuple:
         if r.returncode == 0 and _submodule_ready(src):
             return True, ""
         last = (r.stderr or r.stdout)[-800:]
+        if prefix:
+            _unset_mirror_rewrite(src, prefix)
+            prefix = None
     return False, f"glslang 子模块拉取失败(3 次尝试): {last}"
 
 

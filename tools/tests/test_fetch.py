@@ -31,12 +31,60 @@ class TestCloneLib(unittest.TestCase):
         _make_local_repo(self.repo, "v1.0.0")
         lib = LibSpec(name="demo", repo=self.repo, tag="v1.0.0")
 
-        ok, commit = fetch_mod.clone_lib(self.root, lib)
+        # 本地 repo 非 github URL,禁用镜像探测(避免测试碰网络/给本地路径挂镜像前缀)
+        with mock.patch.object(fetch_mod.mirror, "pick_mirror_prefix", return_value=None):
+            ok, commit = fetch_mod.clone_lib(self.root, lib)
         self.assertTrue(ok, msg=commit)
         self.assertTrue(commit)
         # 已拉取则跳过:再次 clone 到已存在目录应报错
         ok2, _ = fetch_mod.clone_lib(self.root, lib)
         self.assertFalse(ok2)
+
+
+class TestCloneLibMirror(unittest.TestCase):
+    """clone_lib 镜像路径:镜像优先,官方源只在镜像失败时才出现。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.lib = LibSpec(name="fmt", repo="https://github.com/fmtlib/fmt.git", tag="10.2.1")
+
+    def _fake_run(self, rc_map):
+        """按 (首 token, 全命令串) 匹配返回预设 returncode;否则抛错。"""
+        def _run(args, **kw):
+            joined = " ".join(args)
+            for key, rc in rc_map.items():
+                if key in joined:
+                    return subprocess.CompletedProcess(args, rc, stdout="", stderr="err")
+            raise AssertionError(f"未预期的命令: {joined}")
+        return _run
+
+    def test_mirror_clone_failure_falls_back_to_original(self):
+        with mock.patch("deps_lib.fetch.mirror.pick_mirror_prefix", return_value="https://ghproxy.net/"), \
+             mock.patch("deps_lib.fetch.subprocess.run",
+                        side_effect=self._fake_run({
+                            "ghproxy.net/https://github.com/fmtlib/fmt.git": 1,
+                            "clone --depth 1 --branch 10.2.1 https://github.com/fmtlib/fmt.git": 0,
+                            "rev-parse HEAD": 0,
+                        })):
+            ok, msg = fetch_mod.clone_lib(self.tmp.name, self.lib)
+        self.assertTrue(ok, msg)
+
+    def test_mirror_clone_success_skips_original(self):
+        with mock.patch("deps_lib.fetch.mirror.pick_mirror_prefix", return_value="https://ghproxy.net/"), \
+             mock.patch("deps_lib.fetch.subprocess.run",
+                        side_effect=self._fake_run({
+                            "ghproxy.net/https://github.com/fmtlib/fmt.git": 0,
+                            "rev-parse HEAD": 0,
+                        })) as run:
+            ok, _ = fetch_mod.clone_lib(self.tmp.name, self.lib)
+        self.assertTrue(ok)
+        # c.args[0] 是命令列表,展平所有调用的全部 token 拼成一条串
+        joined = " ".join(arg for c in run.call_args_list for arg in c.args[0])
+        self.assertIn("ghproxy.net", joined)
+        self.assertNotIn("ghproxy.net", joined.replace("ghproxy.net/https://github.com/fmtlib/fmt.git", "", 1))
+        # 官方源只在镜像失败时才出现
+        self.assertEqual(joined.count("https://github.com/fmtlib/fmt.git"), 1)
 
 
 class TestSubmoduleReady(unittest.TestCase):
@@ -114,6 +162,7 @@ class TestEnsureSwiftshaderSubmodules(unittest.TestCase):
 
         with mock.patch.object(fetch_mod, "_submodule_ready", side_effect=[False, True]) as ready, \
              mock.patch.object(fetch_mod, "_reset_submodule") as reset, \
+             mock.patch.object(fetch_mod.mirror, "pick_mirror_prefix", return_value=None), \
              mock.patch.object(fetch_mod.subprocess, "run", side_effect=_fake_run) as run:
             ok, err = fetch_mod.ensure_swiftshader_submodules(root)
         self.assertTrue(ok, err)
@@ -126,6 +175,7 @@ class TestEnsureSwiftshaderSubmodules(unittest.TestCase):
         fake = mock.Mock(returncode=128, stdout="", stderr="HTTP 502")
         with mock.patch.object(fetch_mod, "_submodule_ready", return_value=False), \
              mock.patch.object(fetch_mod, "_reset_submodule"), \
+             mock.patch.object(fetch_mod.mirror, "pick_mirror_prefix", return_value=None), \
              mock.patch.object(fetch_mod.subprocess, "run", return_value=fake) as run:
             ok, err = fetch_mod.ensure_swiftshader_submodules(root)
         self.assertFalse(ok)
@@ -146,6 +196,16 @@ class TestEnsureSwiftshaderSubmodules(unittest.TestCase):
             fetch_mod._reset_submodule(src, sub)
         self.assertFalse(os.path.exists(sub))
         self.assertFalse(os.path.exists(mod))
+
+
+class TestMirrorRewrite(unittest.TestCase):
+    def test_set_mirror_rewrite_invokes_git_config(self):
+        with mock.patch("deps_lib.fetch.subprocess.run") as run:
+            fetch_mod._set_mirror_rewrite("/src", "https://ghproxy.net/")
+        args = run.call_args[0][0]
+        self.assertIn("config", args)
+        self.assertIn("url.https://ghproxy.net/https://github.com/.insteadOf", args)
+        self.assertIn("https://github.com/", args)
 
 
 if __name__ == "__main__":
