@@ -32,17 +32,25 @@ endif()
 file(GLOB _pool_dirs LIST_DIRECTORIES true "${MINE_ROOT}/third_party/_install/*/${_variant}")
 list(APPEND CMAKE_PREFIX_PATH ${_pool_dirs})
 
-# CONFIG 模式 find_package 默认还会从 PATH 派生前缀(CMake 文档行为:PATH 里形如
-# X/bin 的项摘掉 bin 后缀当前缀去找 <Name>Config.cmake)、以及查 CMake 包注册表
-# (曾手动 export(PACKAGE)/装过的杂散库)。MSYS2 MINGW64 shell 恒把 /mingw64/bin
-# 挂 PATH,若装了同名 pacman 包(如 mingw-w64-x86_64-glfw)会抢在池的 MSVC 产物前
-# 被摸到 —— 链出来是 MinGW ar 格式 libglfw3.a,MSVC 链接期报 __mingw_vsnprintf 等
-# 一串 LNK2019(本机已复现)。这几个池自建的 CONFIG 包全部关掉这两路旁路,只认
-# 上面已显式收窄到池前缀的 CMAKE_PREFIX_PATH —— 只对这些 find_package(... CONFIG)
-# 调用生效,不动全局变量:Vulkan/PkgConfig 是 MODULE 模式(FindVulkan.cmake 内部靠
-# find_path/find_library,同样受 PATH 派生搜索控制,但走系统安装,不能一并关掉,
-# 否则 Linux 找不到系统 Vulkan——本机已复现过一次这个更宽的误伤)。
-set(_pool_only NO_SYSTEM_ENVIRONMENT_PATH NO_CMAKE_PACKAGE_REGISTRY NO_CMAKE_SYSTEM_PACKAGE_REGISTRY)
+# CONFIG 模式 find_package 除了上面已关掉的 PATH 派生前缀 + 包注册表,还有一路
+# 没堵上:CMAKE_SYSTEM_PREFIX_PATH(NO_CMAKE_SYSTEM_PATH 控制)。若 gen-projects.py
+# 实际调用到的 `cmake` 解析到 MSYS2 pacman 装的 mingw-w64-x86_64-cmake(即
+# /mingw64/bin/cmake.exe,和给 win-deps.sh/msvc_env.py 用的原生 Windows CMake 是
+# 两份不同的二进制),这份 cmake 自己编译时就把 /mingw64 焊进了内建的
+# CMAKE_SYSTEM_PREFIX_PATH——跟 PATH 环境变量、CMakeCache 是否干净都无关,查的是
+# cmake.exe 自身编译期常量。同样关掉;CMAKE_ENVIRONMENT_PATH(NO_CMAKE_ENVIRONMENT_PATH
+# 控制的 CMAKE_PREFIX_PATH 环境变量,不同于上面关的 OS PATH 变量)一并收窄,不留
+# 死角。这几个池自建的 CONFIG 包全部关掉,只认上面已显式收窄到池前缀的
+# CMAKE_PREFIX_PATH cmake 变量 —— 只对这些 find_package(... CONFIG) 调用生效,不动
+# 全局变量:Vulkan/PkgConfig 是 MODULE 模式(FindVulkan.cmake 内部靠
+# find_path/find_library),走系统安装,不能一并关掉,否则 Linux 找不到系统
+# Vulkan(本机已复现过一次这个更宽的误伤)。
+set(_pool_only
+  NO_CMAKE_ENVIRONMENT_PATH
+  NO_SYSTEM_ENVIRONMENT_PATH
+  NO_CMAKE_SYSTEM_PATH
+  NO_CMAKE_PACKAGE_REGISTRY
+  NO_CMAKE_SYSTEM_PACKAGE_REGISTRY)
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 find_package(absl CONFIG REQUIRED ${_pool_only})
