@@ -34,3 +34,24 @@ grep -q "setup-env.sh" "$SETUP_BAT" && echo "PASS setup.bat 存在且引用 setu
   echo "FAIL: setup.bat 未引用 setup-env.sh"
   exit 1
 }
+
+# 回归:setup.bat 必须纯 ASCII + CRLF。cmd.exe 按系统代码页(非 UTF-8)读批处理文件,
+# 文件里的 UTF-8 中文(如「。」E3 80 82)会被解析成非法 token,报
+# "。 was unexpected at this time." 后脚本中止 → 双击一闪即退(Windows 实测复现)。
+# 批处理稳健配方 = 纯 ASCII 内容 + CRLF 行尾(由 .gitattributes 的 eol=crlf 保证)。
+# 先剔除行尾符 CR/LF/TAB(0x0D/0x0A/0x09,属 ASCII 但不在可打印范围),剩下的若还有
+# [^ -~] 命中的就是高字节(0x80-0xFF,即 UTF-8 中文),那才是会让 cmd.exe 解析失败的。
+# 注意:grep 也必须 LC_ALL=C——zh_CN.UTF-8 等多字节 locale 下,grep 对 [^ -~] 的
+# 匹配会误判纯 ASCII(本机实测:LC_ALL=C tr 后接无 LC_ALL 的 grep,470 字节纯 ASCII
+# 被 grep 命中);两侧都强制 C locale 才按字节比较。
+if LC_ALL=C tr -d '\r\n\t' < "$SETUP_BAT" | LC_ALL=C grep -q '[^ -~]'; then
+  echo "FAIL: setup.bat 含非 ASCII 字节(cmd.exe 会解析失败闪退)"
+  exit 1
+fi
+cr="$(LC_ALL=C tr -cd '\r' < "$SETUP_BAT" | wc -c)"
+nl="$(wc -l < "$SETUP_BAT")"
+if [ "$cr" -ne "$nl" ]; then
+  echo "FAIL: setup.bat 行尾不是 CRLF(CR=$cr, LF=$nl)"
+  exit 1
+fi
+echo "PASS setup.bat 纯 ASCII + CRLF(规避 cmd.exe 解析闪退)"
