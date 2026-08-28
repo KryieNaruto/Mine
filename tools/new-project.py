@@ -10,12 +10,16 @@ import sys
 
 from deps_lib import MINE_ROOT, manifest
 
-LANGS = {"cpp", "python", "web"}
+LANGS = {"cpp", "python", "web", "as"}
 _NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 def render_template(src: str, dst: str, ctx: dict) -> None:
-    """递归复制 src 到 dst,替换文本文件中的 {{KEY}} 占位符。"""
+    """递归复制 src 到 dst,替换文本文件中的 {{KEY}} 占位符。
+
+    二进制文件(如 gradle/wrapper/gradle-wrapper.jar)原样复制字节、不做占位符替换;
+    复制时保留源文件权限位(gradlew 的可执行位)。
+    """
     os.makedirs(dst, exist_ok=True)
     for root, dirs, files in os.walk(src):
         rel = os.path.relpath(root, src)
@@ -26,19 +30,23 @@ def render_template(src: str, dst: str, ctx: dict) -> None:
             dst_path = os.path.join(target_dir, f)
             if f.endswith(".tmpl"):
                 dst_path = dst_path[:-5]
-                with open(src_path, "r", encoding="utf-8") as fh:
-                    content = fh.read()
-                for k, v in ctx.items():
-                    content = content.replace("{{" + k + "}}", v)
-                with open(dst_path, "w", encoding="utf-8") as fh:
-                    fh.write(content)
-            else:
-                with open(src_path, "r", encoding="utf-8") as fh:
-                    content = fh.read()
-                for k, v in ctx.items():
-                    content = content.replace("{{" + k + "}}", v)
-                with open(dst_path, "w", encoding="utf-8") as fh:
-                    fh.write(content)
+            with open(src_path, "rb") as fh:
+                raw = fh.read()
+            try:
+                content = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                content = None
+            if content is None or "\x00" in content:
+                # 二进制:原样复制字节与权限位
+                with open(dst_path, "wb") as fh:
+                    fh.write(raw)
+                shutil.copymode(src_path, dst_path)
+                continue
+            for k, v in ctx.items():
+                content = content.replace("{{" + k + "}}", v)
+            with open(dst_path, "w", encoding="utf-8") as fh:
+                fh.write(content)
+            shutil.copymode(src_path, dst_path)
     # 复制空目录(如 python/src 的包目录占位已含 __init__.py,此处兜底)
     for root, dirs, _files in os.walk(src):
         rel = os.path.relpath(root, src)
@@ -64,7 +72,7 @@ def main(argv=None) -> int:
     p.add_argument("name", help="项目名(目录名)")
     p.add_argument("--libs", default="", help="逗号分隔库名,写入 deps.yaml use(默认空)")
     p.add_argument("--type", default="vs", choices=("vs", "as"),
-                   help="IDE 工程类型,仅 cpp 生效(默认 vs)")
+                   help="IDE 工程类型(默认 vs;as 项目自动用 as)")
     args = p.parse_args(argv)
 
     if not _NAME_RE.match(args.name):
@@ -93,6 +101,8 @@ def main(argv=None) -> int:
         "DEPS_LINK": f"target_link_libraries({args.name} PRIVATE {link_frag})" if use else "",
         "TYPE": args.type,
     }
+    if args.lang == "as":
+        ctx["TYPE"] = "as"   # as 模板强制 Android Studio 类型,忽略 --type
 
     src_tpl = os.path.join(MINE_ROOT, "tools", "templates", args.lang)
     render_template(src_tpl, dst, ctx)

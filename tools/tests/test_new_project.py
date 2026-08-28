@@ -33,6 +33,37 @@ class TestRenderTemplate(unittest.TestCase):
             self.assertEqual(f.read(), "hello world")
 
 
+class TestNewProjectAndroid(unittest.TestCase):
+    """new-project.py as 类型:生成可被 _gen_as 消费的 Android 骨架。"""
+
+    def setUp(self):
+        # 不在真实 MINE_ROOT 上写项目:把 MINE_ROOT 指向临时目录(与 TestTypeFlag 同款)。
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = self.tmp.name
+        os.makedirs(os.path.join(self.root, "third_party"), exist_ok=True)
+        with open(os.path.join(self.root, "third_party", "deps.yaml"), "w", encoding="utf-8") as f:
+            f.write("libs: {}\n")
+        shutil.copytree(
+            os.path.join(_TOOLS, "templates"),
+            os.path.join(self.root, "tools", "templates"),
+        )
+
+    def test_as_lang_generates_android_skeleton(self):
+        with mock.patch.object(np_mod, "LANGS", {"cpp", "python", "web", "as"}), \
+             mock.patch.object(np_mod, "MINE_ROOT", self.root):
+            rc = np_mod.main(["as", "HelloAndroid"])
+        self.assertEqual(rc, 0)
+        dst = os.path.join(self.root, "HelloAndroid")
+        for rel in ("settings.gradle", "build.gradle", "gradle.properties",
+                    "app/build.gradle", "app/src/main/AndroidManifest.xml",
+                    "gradle/wrapper/gradle-wrapper.properties",
+                    "gradlew"):
+            self.assertTrue(os.path.isfile(os.path.join(dst, rel)), rel)
+        with open(os.path.join(dst, "deps.yaml"), encoding="utf-8") as f:
+            self.assertIn("type: as", f.read())
+
+
 class TestTypeFlag(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
