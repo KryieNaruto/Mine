@@ -55,3 +55,22 @@ if [ "$cr" -ne "$nl" ]; then
   exit 1
 fi
 echo "PASS setup.bat 纯 ASCII + CRLF(规避 cmd.exe 解析闪退)"
+
+# MSYS2-free:setup-env.sh 不再引导 MSYS2(双击直接用 Git Bash 跑全链路)。
+if grep -q "deps_lib/msys2.sh\|ensure_msys2" "$ROOT/setup-env.sh"; then
+  echo "FAIL: setup-env.sh 仍引用 msys2 引导(应 Git Bash 直接跑,不再引导 MSYS2)"
+  exit 1
+fi
+echo "PASS setup-env.sh 不再引导 MSYS2(Git Bash 直接跑)"
+
+# 空窗根因修复:setup.bat 设 MSYS=disable_pcon(Git for Windows 2.44 pcon 输出回归 workaround)
+# 并优先 Git for Windows 自己的 bash(避免 System32\bash.exe=WSL 抢到,把 Linux 路径跑进来)。
+if ! grep -q "MSYS=disable_pcon" "$SETUP_BAT"; then
+  echo "FAIL: setup.bat 未设 MSYS=disable_pcon(空窗输出回归 workaround)"
+  exit 1
+fi
+if ! grep -q 'ProgramFiles.*Git' "$SETUP_BAT"; then
+  echo "FAIL: setup.bat 未优先探测 Git for Windows 安装路径"
+  exit 1
+fi
+echo "PASS setup.bat MSYS=disable_pcon + 优先 Git for Windows bash"

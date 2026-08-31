@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Windows(MSYS2+MSVC)依赖部署:基础工具链 + Vulkan(pacman)+ SwiftShader(池构建) + Qt6(aqtinstall/MSVC 预编译)。
+# Windows(Git Bash + MSVC)依赖部署:工具链 + Vulkan(MSVC 兼容)+ Qt6(MSVC 预编译)+ SwiftShader(池构建)。
 # 由 install-user-deps.sh 平台分支调用;也可单独执行。
+# 不依赖 MSYS2/pacman:工具链按"复用现成 → VS Build Tools 自带(VCTools 含 CMake+Ninja)→ 独立下载"三级补齐。
 set -euo pipefail
 info() { printf '[INFO] %s\n' "$*"; }
 err()  { printf '[ERROR] %s\n' "$*" >&2; }
@@ -11,115 +12,130 @@ has()  { command -v "$1" >/dev/null 2>&1; }
 MINE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 USER_DEPS="$MINE_ROOT/.user-deps"
 DEB_CACHE="$USER_DEPS/.deb-cache"
-mkdir -p "$USER_DEPS" "$DEB_CACHE"
+TOOL_BIN="$USER_DEPS/bin"
+mkdir -p "$USER_DEPS" "$DEB_CACHE" "$TOOL_BIN"
+# 独立工具链(shims / standalone 二进制)前置;MSYS2-free 下 cmake/ninja/python3/7zr 都靠它或 VS。
+export PATH="$TOOL_BIN:$PATH"
 
-# --- 0.5 非 MSYS2 环境(如 Git Bash)引导:下载 msys2 base 到 .user-deps/msys64 ---
-# 根因:Git Bash 的 uname 也报 MINGW*,但无 pacman;必须回到真 MSYS2 才能跑 pacman。
-# 仅当 win-deps.sh 被单独直接执行时走到这里(setup-env.sh/install-user-deps.sh 已先行 ensure_msys2)。
-if ! command -v pacman >/dev/null 2>&1; then
-  info "0.5 未检测到 pacman(非 MSYS2 环境,如 Git Bash)。引导 MSYS2 到 \$USER_DEPS/msys64 …"
-  MSYS2_DIR="$USER_DEPS/msys64"
-  [ -x "$MSYS2_DIR/usr/bin/pacman.exe" ] || {
-    mkdir -p "$USER_DEPS"
-    # 镜像优先:清华/中科大 msys2 仓库的 msys2-base-x86_64-*.tar.xz(取最新一个)
-    MSYS2_BASE=""
-    for base in "https://mirrors.tuna.tsinghua.edu.cn/msys2/distrib/x86_64/" \
-                "https://mirrors.ustc.edu.cn/msys2/distrib/x86_64/"; do
-      idx="$(curl -fsSL --max-time 20 "$base" 2>/dev/null || true)"
-      fn="$(printf '%s' "$idx" | grep -oE 'msys2-base-x86_64-[0-9]{8}\.tar\.xz' | sort -r | head -1 || true)"
-      [ -n "$fn" ] && { MSYS2_BASE="$base$fn"; break; }
-    done
-    [ -n "$MSYS2_BASE" ] || die "MSYS2 base 下载源不可达(镜像全挂)"
-    curl -fL --retry 3 -o "$USER_DEPS/msys2-base.tar.xz" "$MSYS2_BASE" \
-      || die "MSYS2 base 下载失败"
-    tar -xJf "$USER_DEPS/msys2-base.tar.xz" -C "$USER_DEPS"   # 解出 msys64/
-    rm -f "$USER_DEPS/msys2-base.tar.xz"
-  }
-  # 用新 MSYS2 的 bash 重入本脚本(路径转换:MSYS2 内用 /d/qsw/Mine)
-  MSYS_ROOT="$(cygpath -u "$MINE_ROOT" 2>/dev/null || printf '%s' "$MINE_ROOT")"
-  exec "$MSYS2_DIR/usr/bin/bash.exe" -lc "cd '$MSYS_ROOT' && export USER_DEPS='$USER_DEPS' && bash tools/win-deps.sh"
-fi
+# 镜像优先下载:依次尝试各 URL,首个成功(非空文件)即返回;全部失败返回 1。
+# 每 URL 带 --max-time 防"卡死无输出"(git bash 下 github 直连常不可达,必须能失败继续/明确报错)。
+dl_mirror() {
+  local dest="$1"; shift
+  local url
+  for url in "$@"; do
+    if curl -fL --retry 3 --max-time 1800 -o "$dest" "$url" 2>/dev/null; then
+      [ -s "$dest" ] && return 0
+    fi
+  done
+  return 1
+}
 
-# MSVC 工具链发现/自动安装 + vcvars 导出(Task 1)
+# --- 0. MSVC 工具链:定位/自动安装 Build Tools(VCTools 工作负载自带 CMake + Ninja),写 vcvars.sh ---
 # shellcheck disable=SC1091
 . "$MINE_ROOT/tools/deps_lib/msvc.sh"
-
-# MSVC 工具链(替代 MinGW g++):定位/自动安装 Build Tools,并写 vcvars.sh。
 msvc_ensure
 MSVC_ROOT="$(msvc_locate)" || die "MSVC 定位失败"
 msvc_write_vcvars_sh "$MSVC_ROOT"
 
-# --- ① MSYS2 国内镜像源(加速 pacman;首个 pacman 前必须完成) ---
-# 镜像列表(均经实测 200 可达)。测速挑最快,写入 mirrorlist.mingw64 与 mirrorlist.msys。
-# 海外用户若全部不可达则保留官方默认,不影响使用。
-CN_MIRRORS=(
-  "https://mirrors.tuna.tsinghua.edu.cn/msys2"
-  "https://mirrors.ustc.edu.cn/msys2"
-  "https://mirrors.cloud.tencent.com/msys2"
-  "https://mirror.nju.edu.cn/msys2"
-  "https://mirrors.aliyun.com/msys2"
-)
-setup_mirrors() {
-  local -a good=()
-  local m t
-  # 测速:请求各镜像 mingw64.db 头部,取响应时间
-  for m in "${CN_MIRRORS[@]}"; do
-    t="$(curl -so /dev/null -w '%{time_total}' --max-time 8 "$m/mingw/mingw64/mingw64.db" 2>/dev/null || echo "999")"
-    t="${t:-999}"
-    # 用时间排序,跳过不可达
-    if [ "$t" != "999" ] && [ -n "$t" ]; then
-      good+=("$t $m")
-    fi
-  done
-  if [ "${#good[@]}" -eq 0 ]; then
-    warn "① 国内镜像均不可达,保留官方镜像源"
-    return 0
+# --- ① CMake / Ninja:复用现成 → VS 自带(VCTools)→ 独立下载到 $TOOL_BIN ---
+VS_CMAKE_BIN=""
+VS_NINJA_BIN=""
+if ! has cmake; then
+  if [ -x "$MSVC_ROOT/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe" ]; then
+    VS_CMAKE_BIN="$MSVC_ROOT/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin"
+    info "① cmake 复用 VS 自带: $VS_CMAKE_BIN"
+  else
+    CMAKE_VER="3.30.0"
+    info "① 未找到 cmake,下载独立包($CMAKE_VER)到 $TOOL_BIN ..."
+    CMAKE_ZIP="$DEB_CACHE/cmake.zip"
+    dl_mirror "$CMAKE_ZIP" \
+      "https://mirrors.tuna.tsinghua.edu.cn/github-release/Kitware/CMake/v$CMAKE_VER/cmake-$CMAKE_VER-windows-x86_64.zip" \
+      "https://github.com/Kitware/CMake/releases/download/v$CMAKE_VER/cmake-$CMAKE_VER-windows-x86_64.zip" \
+      || die "cmake 独立包下载失败(镜像全挂);可安装 VS Build Tools(自带 cmake)后重跑"
+    CMAKE_X="$DEB_CACHE/cmake-x"
+    rm -rf "$CMAKE_X"; mkdir -p "$CMAKE_X"
+    ( cd "$CMAKE_X" && unzip -qo "$CMAKE_ZIP" ) || die "cmake 独立包解压失败"
+    # zip 内为 cmake-<ver>-windows-x86_64/bin/*(cmake.exe 及其 DLL),整体拷进 TOOL_BIN
+    cp -f "$CMAKE_X"/*/bin/* "$TOOL_BIN/" 2>/dev/null || die "cmake 独立包结构异常"
+    rm -rf "$CMAKE_ZIP" "$CMAKE_X"
+    has cmake || die "cmake 安装后仍不可用"
+    info "① cmake 就绪: $TOOL_BIN/cmake.exe"
   fi
-  # 按时间升序排序
-  mapfile -t sorted < <(printf '%s\n' "${good[@]}" | sort -n)
-  # 写 mirrorlist(mingw64 与 msys),最快的放最前(Server 首行优先)
-  # win-deps.sh 只在 MSYS2 里运行,/usr/bin 即 /etc/pacman.d 所在。
-  for f in /etc/pacman.d/mirrorlist.mingw64 /etc/pacman.d/mirrorlist.msys; do
-    : > "$f"
-    for entry in "${sorted[@]}"; do
-      m="${entry#* }"
-      if [ "$f" = "/etc/pacman.d/mirrorlist.msys" ]; then
-        printf 'Server = %s/msys/$arch\n' "$m" >> "$f"
-      else
-        printf 'Server = %s/mingw/mingw64\n' "$m" >> "$f"
-      fi
-    done
-  done
-  info "① 已写入国内 MSYS2 镜像源(最快在前): ${sorted[0]#* }"
-}
-setup_mirrors
-
-# pacman 首次同步:刷新数据库与 keyring(新装 MSYS2 必需,幂等)
-pacman_sync() {
-  pacman -Sy --noconfirm || {
-    warn "pacman -Sy 失败,尝试初始化 keyring..."
-    pacman-key --init 2>/dev/null || true
-    pacman-key --populate msys2 2>/dev/null || true
-    pacman -Sy --noconfirm || die "pacman 数据库同步失败(检查镜像源/网络)"
-  }
-}
-pacman_sync
-
-# --- ② 基础工具链(不再装 MinGW g++,只保证 ninja/cmake/git/python3/glslc) ---
-MISS_TOOLS=()
-has ninja    || MISS_TOOLS+=(mingw-w64-x86_64-ninja)
-has cmake    || MISS_TOOLS+=(mingw-w64-x86_64-cmake)
-has git      || MISS_TOOLS+=(git)
-has python3  || MISS_TOOLS+=(mingw-w64-x86_64-python)
-has python3 && ! python3 -c 'import yaml' >/dev/null 2>&1 && MISS_TOOLS+=(mingw-w64-x86_64-python-yaml)
-if [ "${#MISS_TOOLS[@]}" -gt 0 ]; then
-  info "② pacman 安装基础工具链: ${MISS_TOOLS[*]}"
-  pacman -S --needed --noconfirm "${MISS_TOOLS[@]}"
-else
-  info "② 基础工具链齐全"
+fi
+if ! has ninja; then
+  if [ -x "$MSVC_ROOT/Common7/IDE/CommonExtensions/Microsoft/CMake/Ninja/ninja.exe" ]; then
+    VS_NINJA_BIN="$MSVC_ROOT/Common7/IDE/CommonExtensions/Microsoft/CMake/Ninja"
+    info "① ninja 复用 VS 自带: $VS_NINJA_BIN"
+  else
+    NINJA_VER="1.11.1"
+    info "① 未找到 ninja,下载独立包到 $TOOL_BIN ..."
+    NINJA_ZIP="$DEB_CACHE/ninja.zip"
+    dl_mirror "$NINJA_ZIP" \
+      "https://mirrors.tuna.tsinghua.edu.cn/github-release/ninja-build/ninja/v$NINJA_VER/ninja-win.zip" \
+      "https://github.com/ninja-build/ninja/releases/download/v$NINJA_VER/ninja-win.zip" \
+      || die "ninja 独立包下载失败(镜像全挂)"
+    ( cd "$DEB_CACHE" && unzip -qo "$NINJA_ZIP" -d "$TOOL_BIN" ) || die "ninja 独立包解压失败"
+    rm -f "$NINJA_ZIP"
+    has ninja || die "ninja 安装后仍不可用"
+    info "① ninja 就绪: $TOOL_BIN/ninja.exe"
+  fi
 fi
 
-# --- ③ windows_package:MSVC 下不再用 pacman 预编译三方库(pool.is_pacman_provided 恒 False)→ 删除 ---
+# --- ② Python3(需带 yaml):复用现成 → 独立安装到 .user-deps/python + pyyaml + python3 shim ---
+PYPI_MIRROR="https://pypi.tuna.tsinghua.edu.cn/simple"
+PY_VER="3.12.7"
+PY_DIR=""   # 非空 = 用独立 Python(其目录同时进 env.sh 的 PATH,python3 shim 是 exec 真实 python.exe 的包装脚本)
+ensure_pyyaml() { # $1 = python 命令;装 yaml 到该解释器
+  "$1" -m pip install --no-warn-script-location -q -i "$PYPI_MIRROR" pyyaml 2>/dev/null \
+    || "$1" -m pip install --no-warn-script-location -q pyyaml 2>/dev/null
+}
+install_standalone_python() {
+  local _exe="$DEB_CACHE/python-setup.exe"
+  PY_DIR="$USER_DEPS/python"
+  info "② 下载独立 Python($PY_VER)静默安装到 $PY_DIR ..."
+  dl_mirror "$_exe" \
+    "https://registry.npmmirror.com/-/binary/python/$PY_VER/python-$PY_VER-amd64.exe" \
+    "https://mirrors.huaweicloud.com/python/$PY_VER/python-$PY_VER-amd64.exe" \
+    "https://www.python.org/ftp/python/$PY_VER/python-$PY_VER-amd64.exe" \
+    || die "Python 安装器下载失败(镜像全挂);可手动装 Python 3.8+ 并确保 python3 可执行后重跑"
+  # --quiet 而非 /quiet:Git Bash/MSYS 会把 /xxx 参数做路径转换,双横线前缀不受影响(Burn 两种都认)。
+  "$_exe" --quiet InstallAllUsers=0 PrependPath=0 Include_launcher=0 \
+    Include_test=0 Include_doc=0 Include_pip=1 \
+    "TargetDir=$(cygpath -m "$PY_DIR")" || die "Python 静默安装失败(可手动装 Python 3.8+ 后重跑)"
+  rm -f "$_exe"
+  [ -x "$PY_DIR/python.exe" ] || die "Python 安装后缺 python.exe"
+  info "② 安装 pyyaml ..."
+  ensure_pyyaml "$PY_DIR/python.exe" || die "pyyaml 安装失败(检查网络)"
+  # python3 shim:脚本统一调 python3。用 bash 包装脚本 exec 真实 python.exe(而非 copy exe)——copy 会让
+  # python 按新位置解析 sys.prefix,stdlib/site-packages(pyyaml)全找不到;包装脚本无此问题。
+  cat > "$TOOL_BIN/python3" <<EOF
+#!/bin/bash
+exec "$PY_DIR/python.exe" "\$@"
+EOF
+  chmod +x "$TOOL_BIN/python3"
+  info "② python3 就绪: $TOOL_BIN/python3 → $PY_DIR/python.exe"
+}
+if has python3 && python3 -c 'import yaml' >/dev/null 2>&1; then
+  info "② python3 复用现成: $(command -v python3)"
+elif has python3; then
+  info "② python3 缺 yaml,补装 ..."
+  if ! ensure_pyyaml python3; then
+    warn "现有 python3 装不上 yaml,改装独立 Python"
+    install_standalone_python
+  fi
+else
+  install_standalone_python
+fi
+
+# --- ③ 7z / 7zr(Qt6 预编译 .7z 解压用;VS 不自带,Git Bash 也不带) ---
+if has 7z; then _7z="7z"
+elif has 7zr; then _7z="7zr"
+else
+  info "③ 下载 7zr.exe(解压 Qt 预编译)到 $TOOL_BIN ..."
+  dl_mirror "$TOOL_BIN/7zr.exe" "https://www.7-zip.org/a/7zr.exe" \
+    || die "7zr 下载失败;可手动放一份 7zr.exe 到 $TOOL_BIN/ 后重跑"
+  _7z="7zr"
+fi
 
 # --- ④ Vulkan(单一来源:一份 MSVC 兼容 Vulkan SDK,glslc.exe 与 find_package(Vulkan) 都用它) ---
 # 曾经拆两路:MSYS2 pacman 装 glslc/vulkan.h(MinGW ABI,给 shader 编译)+ 另装一份
@@ -162,7 +178,7 @@ if [ -z "$VULKAN_SDK_DIR" ]; then
   else
     info "④ 未检测到已安装的 Vulkan SDK,下载 LunarG 官方 SDK(约几百 MB)..."
     VK_SDK_EXE="$DEB_CACHE/vulkan_sdk.exe"
-    curl -fL --retry 3 -o "$VK_SDK_EXE" \
+    curl -fL --retry 3 --max-time 1800 -o "$VK_SDK_EXE" \
       "https://sdk.lunarg.com/sdk/download/latest/windows/vulkan_sdk.exe" \
       || die "Vulkan SDK 下载失败(需能出网)"
     info "④ 静默安装 Vulkan SDK 到 $VULKAN_SDK_DIR ..."
@@ -198,7 +214,7 @@ else
   SWSS_BIN=""
 fi
 
-# --- ⑥ Qt6:直接下载官方 MSVC 预编译(弃 aqtinstall/pip —— MSYS2 python 无 pip) ---
+# --- ⑥ Qt6:直接下载官方 MSVC 预编译(弃 aqtinstall/pip —— 独立 Python 也无 aqt;官方预编译即完整) ---
 # Qt 官方在线仓库的 qtbase-...-X86_64.7z 即完整 MSVC 预编译(含 bin/qmake.exe、lib/cmake/Qt6、
 # Qt6Core/Gui/Widgets/Test DLL 与 import lib),解压即用,CMake find_package(Qt6) 直接消费。
 QT_VER="6.5.3"
@@ -206,7 +222,7 @@ QT_MODULE="qt6_653"
 QT_MODULE_DIR="qt.qt6.653.win64_msvc2019_64"
 QT_PREFIX="$USER_DEPS/qt/$QT_VER/msvc2019_64"
 QT_REPO_BASE="online/qtsdkrepository/windows_x86/desktop/$QT_MODULE/$QT_MODULE_DIR"
-# Qt 在线仓库镜像根(与 ① MSYS2 镜像同思路,官方兜底放最后)
+# Qt 在线仓库镜像根(与下载源同思路,官方兜底放最后)
 QT_MIRRORS=(
   "https://mirrors.tuna.tsinghua.edu.cn/qt"
   "https://mirrors.ustc.edu.cn/qtproject"
@@ -220,7 +236,6 @@ install_qt_msvc() {
   if [ -f "$QT_PREFIX/bin/qmake.exe" ] && [ -d "$QT_PREFIX/lib/cmake/Qt6" ]; then
     info "⑥ Qt6 MSVC 已存在,跳过"; return 0
   fi
-  has 7z || { info "⑥ 安装 p7zip(解压 Qt 预编译)"; pacman -S --needed --noconfirm p7zip; }
   # 挑可达镜像:列出模块目录,提取 qtbase-...-X86_64.7z 文件名(不硬编码带时间戳的文件名)
   base=""; href=""
   for m in "${QT_MIRRORS[@]}"; do
@@ -235,12 +250,12 @@ install_qt_msvc() {
   [ -n "$base" ] && [ -n "$href" ] || die "Qt 在线仓库不可达(镜像全挂或找不到 qtbase MSVC 预编译)"
   arch="$DEB_CACHE/$href"
   info "⑥ 下载 Qt6 MSVC 预编译($QT_VER, qtbase, 约 50MB)← $base ..."
-  curl -fL --retry 3 -o "$arch" "$base/$QT_REPO_BASE/$href" || die "Qt6 预编译下载失败"
+  curl -fL --retry 3 --max-time 1800 -o "$arch" "$base/$QT_REPO_BASE/$href" || die "Qt6 预编译下载失败"
   info "⑥ 解压到 $qt_root ..."
   # 官方 7z 内部自带 <ver>/<arch> 两层(验证:6.5.3/msvc2019_64/),直接解到 qt_root,
   # 使 $QT_PREFIX(=$qt_root/$QT_VER/msvc2019_64)天然指向解压根,不产生嵌套。
   rm -rf "$qt_root"; mkdir -p "$qt_root"
-  7z x -y "$arch" -o"$qt_root" >/dev/null 2>&1 || { rm -f "$arch"; die "Qt6 预编译解压失败"; }
+  "$_7z" x -y "$arch" -o"$qt_root" >/dev/null 2>&1 || { rm -f "$arch"; die "Qt6 预编译解压失败"; }
   rm -f "$arch"
   # 防御:7z 内部布局若与预期不符(无 <ver>/<arch> 层),find 反推 prefix(<prefix>/bin/qmake.exe)
   if [ ! -f "$QT_PREFIX/bin/qmake.exe" ]; then
@@ -259,11 +274,14 @@ EOF
 }
 install_qt_msvc
 
-# --- ⑦ 生成 env.sh(MSVC 前缀 + Qt6 前缀 + SwiftShader ICD + Vulkan SDK;不含 /mingw64) ---
-# PATH 前置 $QT_PREFIX/bin(Qt6 运行期 DLL 需要)与 $VULKAN_SDK/Bin(glslc.exe——
-# EasyPainter/CMakeLists.txt 的 shader 自定义命令用裸命令 `glslc`,构建期靠 PATH 找到)。
+# --- ⑦ 生成 env.sh(工具链 + Qt6 + SwiftShader ICD + Vulkan SDK;不含 /mingw64) ---
+# PATH 前置:工具链(.user-deps/bin 及独立 python 目录/VS 自带 cmake&ninja)→ Qt6 bin → Vulkan Bin。
 # \$PATH 转义成字面量,source 时才展开,避免写成生成时刻的 PATH。
 # VULKAN_SDK:CMake FindVulkan.cmake 自动认 ENV{VULKAN_SDK},find_package(Vulkan) 靠它。
+TOOLCHAIN_PATH="$TOOL_BIN"
+[ -n "$PY_DIR" ] && TOOLCHAIN_PATH="$TOOLCHAIN_PATH:$PY_DIR"
+[ -n "$VS_CMAKE_BIN" ] && TOOLCHAIN_PATH="$TOOLCHAIN_PATH:$VS_CMAKE_BIN"
+[ -n "$VS_NINJA_BIN" ] && TOOLCHAIN_PATH="$TOOLCHAIN_PATH:$VS_NINJA_BIN"
 cat > "$USER_DEPS/env.sh" <<EOF
 export MINE_ROOT="$MINE_ROOT"
 export USER_DEPS="$USER_DEPS"
@@ -271,7 +289,7 @@ export VK_ICD_FILENAMES="$SWSS_ICD"
 export VK_DRIVER_FILES="$SWSS_ICD"
 export VULKAN_SDK="$VULKAN_SDK"
 export CMAKE_PREFIX_PATH="$QT_PREFIX:$MINE_ROOT/third_party/_install/glfw-3.4/release"
-export PATH="$QT_PREFIX/bin:$VULKAN_SDK/Bin:\$PATH"
+export PATH="$TOOLCHAIN_PATH:$QT_PREFIX/bin:$VULKAN_SDK/Bin:\$PATH"
 EOF
 info "⑦ 已生成 $USER_DEPS/env.sh"
 

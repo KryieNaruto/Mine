@@ -34,14 +34,14 @@ fi
 if grep -qE 'pip install aqtinstall|aqt install-qt' "$WIN_DEPS"; then
   echo "FAIL: win-deps 仍依赖 pip/aqtinstall(MSYS2 python 无 pip)"; exit 1
 fi
-if ! grep -qE '7z x ' "$WIN_DEPS"; then
-  echo "FAIL: win-deps 缺 7z 解压 Qt 预编译"; exit 1
+if ! grep -qE '"\$_7z" x ' "$WIN_DEPS"; then
+  echo "FAIL: win-deps 缺 7z/7zr 解压 Qt 预编译"; exit 1
 fi
 # runtime:env.sh 应前置 $QT_PREFIX/bin 到 PATH(Qt6 DLL 运行期可寻)。Vulkan SDK 的
 # Bin 也前置在后(glslc.exe——见下方专门断言),故这里只锚定 QT_PREFIX/bin 是 PATH
 # 的第一个前置项,不再要求它后面立刻紧跟 $PATH。
-printf '%s\n' "$env_block" | grep -qE 'export PATH="\$QT_PREFIX/bin:' \
-  || { echo "FAIL: env.sh 未把 Qt bin 前置到 PATH"; exit 1; }
+printf '%s\n' "$env_block" | grep -qE 'export PATH="\$TOOLCHAIN_PATH:\$QT_PREFIX/bin:' \
+  || { echo "FAIL: env.sh 未把工具链→Qt bin 前置到 PATH"; exit 1; }
 
 # Vulkan SDK(MSVC 兼容,find_package(Vulkan) 需要):win-deps.sh 静默装 LunarG SDK 到
 # .user-deps 下(自包含,不碰系统 C:\VulkanSDK),并把 VULKAN_SDK 写进 env.sh 供
@@ -84,9 +84,27 @@ fi
 
 # runtime:EasyPainter/CMakeLists.txt 的 shader 自定义命令用裸命令 `glslc`(不是硬编码
 # 路径),构建期(cmake --build 或 VS IDE)靠 PATH 找到,所以 Vulkan SDK 的 Bin 也要
-# 前置进 PATH,和 QT_PREFIX/bin 一样。
-if ! printf '%s\n' "$env_block" | grep -qE 'export PATH="\$QT_PREFIX/bin:\$VULKAN_SDK/Bin:\\\$PATH"'; then
-  echo "FAIL: env.sh 未把 Vulkan SDK 的 Bin 前置到 PATH(glslc 裸命令构建期需要)"; exit 1
+# 前置进 PATH,和 QT_PREFIX/bin 一样。工具链(.user-deps/bin/独立 python/VS cmake&ninja)
+# 在最前——MSYS2-free 下 cmake/ninja/python3 都靠 env.sh 的 PATH 才可解析。
+if ! printf '%s\n' "$env_block" | grep -qE 'export PATH="\$TOOLCHAIN_PATH:\$QT_PREFIX/bin:\$VULKAN_SDK/Bin:\\\$PATH"'; then
+  echo "FAIL: env.sh PATH 未按 工具链→Qt bin→Vulkan Bin 前置(glslc 裸命令构建期需要)"; exit 1
 fi
 
-echo "PASS env.sh no /mingw64 + QT_PREFIX 含 6.5.3/msvc2019_64 + 直下预编译 + Vulkan SDK 复用优先/单一来源"
+# MSYS2-free:win-deps.sh 不再用 pacman 装任何东西,工具链改"复用现成 → VS 自带 → 独立下载"。
+if grep -qE 'pacman (install|-S|-Sy)|pacman-key' "$WIN_DEPS"; then
+  echo "FAIL: win-deps 仍用 pacman(应 Git Bash + VS/独立工具链)"; exit 1
+fi
+if ! grep -qE 'VS_CMAKE_BIN|CommonExtensions/Microsoft/CMake' "$WIN_DEPS"; then
+  echo "FAIL: win-deps 未探测 VS 自带 CMake(VCTools 工作负载附带)"; exit 1
+fi
+if ! grep -qE '7zr\.exe' "$WIN_DEPS"; then
+  echo "FAIL: win-deps 未下载 7zr.exe(Qt 预编译解压,VS 不附带)"; exit 1
+fi
+if ! grep -qE 'install_standalone_python|Include_pip=1' "$WIN_DEPS"; then
+  echo "FAIL: win-deps 未实现独立 Python 安装(MSYS2-free 必需)"; exit 1
+fi
+if ! grep -qE 'dl_mirror' "$WIN_DEPS"; then
+  echo "FAIL: win-deps 缺镜像优先下载助手 dl_mirror(防 github 直连挂起)"; exit 1
+fi
+
+echo "PASS env.sh no /mingw64 + QT_PREFIX 6.5.3/msvc2019_64 + 直下预编译 + Vulkan 单一来源 + MSYS2-free 工具链"

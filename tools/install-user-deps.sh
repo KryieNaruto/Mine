@@ -26,22 +26,11 @@ case "$(uname -s)" in
   *)            OS_PLATFORM="linux" ;;
 esac
 
-SELF_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
-
-# --- Windows 但缺 pacman(Git Bash / cmd)→ 定位/自动安装 MSYS2 并重进 ---
-# 根因:在 Git Bash 里 uname 也报 MINGW*,但没有 pacman;必须回到 MSYS2 环境才能跑 pacman。
-if [ "$OS_PLATFORM" = "windows" ] && ! has pacman; then
-  # shellcheck disable=SC1091
-  . "$MINE_ROOT/tools/deps_lib/msys2.sh"
-  ensure_msys2 "$@"
-fi
-
-# --- 前置工具检查 -----------------------------------------------------------
+# --- 前置工具检查(Git Bash 自带 curl/tar/unzip/sed) --------------------------
 if [ "$OS_PLATFORM" = "windows" ]; then
   for c in curl tar unzip sed; do
-    has "$c" || die "缺少命令: $c(MSYS2 需安装)"
+    has "$c" || die "缺少命令: $c(Git Bash 自带,请用 Git for Windows 打开)"
   done
-  has pacman || die "缺少 pacman(MSYS2 需安装)"
 else
   for c in curl tar dpkg-deb dpkg sed; do
     has "$c" || die "缺少命令: $c"

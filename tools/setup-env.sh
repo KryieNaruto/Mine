@@ -18,14 +18,8 @@ has()  { command -v "$1" >/dev/null 2>&1; }
 
 MINE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 USER_DEPS_ENV="$MINE_ROOT/.user-deps/env.sh"
-SELF_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
-# Windows 但缺 pacman(Git Bash / cmd)→ 定位/自动安装 MSYS2 并用其 bash 重进整条链路
-if [ "$OS_PLATFORM" = "windows" ] && ! has pacman; then
-  # shellcheck disable=SC1091
-  . "$MINE_ROOT/tools/deps_lib/msys2.sh"
-  ensure_msys2 "$@"
-fi
+# Windows 直接在 Git Bash 里继续;工具链(VS Build Tools / 独立下载)由 win-deps.sh 部署。
 
 extract_version() {
   local s="$1"
@@ -69,6 +63,10 @@ chk_user_deps_windows() {
 }
 
 probe() {
+  # 工具链在 .user-deps/env.sh 的 PATH 里(Windows 由 win-deps.sh 部署);探测前先 source,
+  # 否则 Windows --check 会把已装的 cmake/ninja/python3(只在 env.sh PATH)误报 MISS。
+  # shellcheck disable=SC1090
+  [ -f "$USER_DEPS_ENV" ] && . "$USER_DEPS_ENV"
   info "=== 系统工具链探测(${OS_PLATFORM:-linux}) ==="
   HARD_MISS=0; MISS_DETAILS=()
   if [ "$OS_PLATFORM" = "windows" ]; then
@@ -108,7 +106,7 @@ print_help() {
 用法: tools/setup-env.sh [--check] [--help]
 
   默认(全链路一键):检测系统工具链与用户级系统依赖缺失 → 自动安装
-  (Windows:MSYS2 pacman;Linux:无 sudo dpkg -x 到 .user-deps/usr)→
+  (Windows:VS Build Tools/独立工具链;Linux:无 sudo dpkg -x 到 .user-deps/usr)→
   拉取三方库源码并预编译进共享池(fetch-deps --all + build-deps --all)→ 最终探针验证。
   幂等:已装/已编自动跳过。
 
@@ -116,7 +114,7 @@ print_help() {
   -h,--help  打印本帮助。
 
 Linux:   无 sudo,全部落盘 $MINE_ROOT/.user-deps/(工具链/Vulkan/X11/lavapipe/Xvfb)。
-Windows: MSYS2 pacman 安装工具链 + Vulkan + Qt6;SwiftShader 走池构建。
+Windows: Git Bash 直接跑;工具链用 VS Build Tools / 独立下载,再部署 Vulkan + Qt6;SwiftShader 走池构建。
 完成后再于每个构建/运行 shell 中 source .user-deps/env.sh。
 EOF
 }
@@ -149,7 +147,7 @@ auto_install() {
 
   # 1) 用户级系统依赖(含工具链) —— Linux 无 sudo dpkg -x;Windows 自动转交 win-deps.sh
   if [ "$OS_PLATFORM" = "windows" ]; then
-    info "Windows: 依赖部署由 install-user-deps.sh 转交 win-deps.sh(pacman)"
+    info "Windows: 依赖部署由 install-user-deps.sh 转交 win-deps.sh(工具链/VS/Vulkan/Qt6)"
   fi
   bash "$MINE_ROOT/tools/install-user-deps.sh"
 

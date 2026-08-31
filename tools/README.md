@@ -8,7 +8,7 @@
 |---|---|
 | `setup-env.sh` | 一键搭建:检测缺失→自动安装→拉取并预编译三方库→探针验证 |
 | `install-user-deps.sh` | 无 sudo 用户级系统依赖部署(Vulkan/X11/lavapipe/Xvfb/Qt + 工具链) |
-| `win-deps.sh` | Windows(MSYS2)依赖部署(pacman 工具链 + Vulkan + Qt6,SwiftShader 走池) |
+| `win-deps.sh` | Windows(Git Bash + MSVC)依赖部署(独立/VS 工具链 + Vulkan + Qt6,SwiftShader 走池) |
 | `fetch-deps.py` | 拉取三方库源码进 `third_party/_src/`(只拉不编) |
 | `build-deps.py` | 预编译三方库进 `third_party/_install/<name>-<ver>/<variant>/` |
 | `new-project.py` | 新建项目骨架(cpp / python / web) |
