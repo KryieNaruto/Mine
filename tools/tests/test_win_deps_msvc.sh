@@ -107,4 +107,15 @@ if ! grep -qE 'dl_mirror' "$WIN_DEPS"; then
   echo "FAIL: win-deps 缺镜像优先下载助手 dl_mirror(防 github 直连挂起)"; exit 1
 fi
 
+# 现成 Python 优先复用:Git Bash 下 python.org 安装常只有 python.exe(无 python3),探测必须覆盖
+# python3/python/py 三候选——否则用户明明有 python,却误下独立 3.12.7。
+if ! grep -qE 'for cand in python3 python py;' "$WIN_DEPS"; then
+  echo "FAIL: win-deps 现成 Python 探测未覆盖 python3/python/py(有用户 python 仍会下独立版)"; exit 1
+fi
+# 复用/独立两条路都要产出 python3 shim(exec 真实解释器绝对路径)——否则用户只有 python/py 时,
+# 后续 setup-env.sh 调 python3 会失败;且 shim 必须 exec 绝对路径(避免 shim 自我递归)。
+if ! grep -qE 'exec "\$PY_CMD" "\\\$@"' "$WIN_DEPS"; then
+  echo "FAIL: win-deps 未生成指向所选解释器绝对路径的 python3 shim(复用用户 python 后 python3 不可用)"; exit 1
+fi
+
 echo "PASS env.sh no /mingw64 + QT_PREFIX 6.5.3/msvc2019_64 + 直下预编译 + Vulkan 单一来源 + MSYS2-free 工具链"

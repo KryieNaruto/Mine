@@ -81,11 +81,13 @@ if ! has ninja; then
   fi
 fi
 
-# --- ② Python3(需带 yaml):复用现成 → 独立安装到 .user-deps/python + pyyaml + python3 shim ---
+# --- ② Python3(需带 yaml):复用现成(python3/python/py 任一)→ 独立装 .user-deps/python + python3 shim ---
+# Git Bash 下 python.org 安装通常只把 python.exe(及 py launcher)放进 PATH,python3 常常不存在;
+# 三个候选都要试,优先带 yaml 的,其次补装 yaml,都没有才独立下载。
 PYPI_MIRROR="https://pypi.tuna.tsinghua.edu.cn/simple"
 PY_VER="3.12.7"
-PY_DIR=""   # 非空 = 用独立 Python(其目录同时进 env.sh 的 PATH,python3 shim 是 exec 真实 python.exe 的包装脚本)
-ensure_pyyaml() { # $1 = python 命令;装 yaml 到该解释器
+PY_DIR=""   # 非空 = 用独立 Python(其目录同时进 env.sh 的 PATH)
+ensure_pyyaml() { # $1 = python 绝对路径;装 yaml 到该解释器
   "$1" -m pip install --no-warn-script-location -q -i "$PYPI_MIRROR" pyyaml 2>/dev/null \
     || "$1" -m pip install --no-warn-script-location -q pyyaml 2>/dev/null
 }
@@ -97,7 +99,7 @@ install_standalone_python() {
     "https://registry.npmmirror.com/-/binary/python/$PY_VER/python-$PY_VER-amd64.exe" \
     "https://mirrors.huaweicloud.com/python/$PY_VER/python-$PY_VER-amd64.exe" \
     "https://www.python.org/ftp/python/$PY_VER/python-$PY_VER-amd64.exe" \
-    || die "Python 安装器下载失败(镜像全挂);可手动装 Python 3.8+ 并确保 python3 可执行后重跑"
+    || die "Python 安装器下载失败(镜像全挂);可手动装 Python 3.8+ 后重跑"
   # --quiet 而非 /quiet:Git Bash/MSYS 会把 /xxx 参数做路径转换,双横线前缀不受影响(Burn 两种都认)。
   "$_exe" --quiet InstallAllUsers=0 PrependPath=0 Include_launcher=0 \
     Include_test=0 Include_doc=0 Include_pip=1 \
@@ -106,26 +108,39 @@ install_standalone_python() {
   [ -x "$PY_DIR/python.exe" ] || die "Python 安装后缺 python.exe"
   info "② 安装 pyyaml ..."
   ensure_pyyaml "$PY_DIR/python.exe" || die "pyyaml 安装失败(检查网络)"
-  # python3 shim:脚本统一调 python3。用 bash 包装脚本 exec 真实 python.exe(而非 copy exe)——copy 会让
-  # python 按新位置解析 sys.prefix,stdlib/site-packages(pyyaml)全找不到;包装脚本无此问题。
-  cat > "$TOOL_BIN/python3" <<EOF
-#!/bin/bash
-exec "$PY_DIR/python.exe" "\$@"
-EOF
-  chmod +x "$TOOL_BIN/python3"
-  info "② python3 就绪: $TOOL_BIN/python3 → $PY_DIR/python.exe"
+  PY_CMD="$PY_DIR/python.exe"
 }
-if has python3 && python3 -c 'import yaml' >/dev/null 2>&1; then
-  info "② python3 复用现成: $(command -v python3)"
-elif has python3; then
-  info "② python3 缺 yaml,补装 ..."
-  if ! ensure_pyyaml python3; then
-    warn "现有 python3 装不上 yaml,改装独立 Python"
-    install_standalone_python
+# 探测现成解释器:command -v 取绝对路径——既避开下面生成的 $TOOL_BIN/python3 shim(避免自我递归),
+# 也让 shim 能 exec 绝对路径(copy exe 会按新位置解析 sys.prefix,stdlib/site-packages 全找不到)。
+# WindowsApps 的 MS Store 别名(python/python3 都指向它)能被 command -v 命中但根本跑不起来,
+# 由 import yaml 探测自然排除。
+PY_CMD=""            # 选中的解释器绝对路径;空 = 装独立版
+PY_CMD_NEED_YAML=""  # 可运行但缺 yaml 的候选(补装 pyyaml 用)
+for cand in python3 python py; do
+  has "$cand" || continue
+  _py="$(command -v "$cand")"
+  case "$_py" in "$TOOL_BIN"/*) continue ;; esac  # 跳过上次生成的 shim,交给末尾统一重写
+  if "$_py" -c 'import yaml' >/dev/null 2>&1; then
+    PY_CMD="$_py"
+    info "② python3 复用现成: $_py"
+    break
   fi
-else
-  install_standalone_python
+  [ -n "$PY_CMD_NEED_YAML" ] || PY_CMD_NEED_YAML="$_py"
+done
+if [ -z "$PY_CMD" ] && [ -n "$PY_CMD_NEED_YAML" ]; then
+  info "② 复用 $PY_CMD_NEED_YAML,补装 pyyaml ..."
+  ensure_pyyaml "$PY_CMD_NEED_YAML" && PY_CMD="$PY_CMD_NEED_YAML" \
+    || warn "现有 $PY_CMD_NEED_YAML 装不上 yaml,改装独立 Python"
 fi
+if [ -z "$PY_CMD" ]; then install_standalone_python; fi
+# python3 shim:脚本统一调 python3。bash 包装脚本 exec 真实解释器绝对路径(绝对路径不触发 PATH
+# 查找,天然避开 shim 自我递归;copy exe 则会按新位置解析 sys.prefix 导致 stdlib 找不到)。
+cat > "$TOOL_BIN/python3" <<EOF
+#!/bin/bash
+exec "$PY_CMD" "\$@"
+EOF
+chmod +x "$TOOL_BIN/python3"
+info "② python3 就绪: $TOOL_BIN/python3 → $PY_CMD"
 
 # --- ③ 7z / 7zr(Qt6 预编译 .7z 解压用;VS 不自带,Git Bash 也不带) ---
 if has 7z; then _7z="7z"
