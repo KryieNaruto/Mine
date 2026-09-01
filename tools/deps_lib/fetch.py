@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 import subprocess
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 from . import MINE_ROOT, manifest, mirror, pool
@@ -49,76 +51,42 @@ def clone_lib(root: str, lib: LibSpec):
     return True, commit
 
 
-def _submodule_ready(src: str) -> bool:
-    """glslang 子模块是否已就位可用。
+GLSLANG_URL = "https://github.com/KhronosGroup/glslang.git"
 
-    现代 git 把子模块仓库放进父仓 .git/modules/,子模块工作树里只有指向它的 .git
-    「文件」——「存在 .git 目录」不是可靠判据(本机复现:浅拉成功后 .git 是 47 字节
-    文件,os.path.isdir 误判失败,已拉取仍报错中断 setup)。以 git 自身状态为准:
-    `git submodule status` 首字符为空格(已初始化且与索引一致)或 +(检出不同 commit,
-    仍可用)即视为就位;`-`(未初始化)或命令失败则未就位。
+
+def _rm_rf(path: str) -> bool:
+    """跨平台强制删除文件/目录:先清只读属性,失败重试数次再放弃。
+
+    Windows 上删除可能因只读属性或瞬时文件锁失败(PermissionError);git 子模块
+    中断残留的 .git gitfile 是本次痛点,必须删得掉(旧实现在此静默失败,导致 git
+    内部重试撞上残留 gitfile 报 "BUG: submodule considered for cloning",本机复现)。
     """
-    sub = os.path.join(src, "third_party", "glslang")
-    if not os.path.isdir(sub):
-        return False
-    r = subprocess.run(
-        ["git", "-C", src, "submodule", "status", "third_party/glslang"],
-        capture_output=True, text=True,
-    )
-    if r.returncode != 0:
-        return False
-    # 首字符即状态前缀:「 」(已初始化且与索引一致)、「+」(检出不同 commit)。
-    # 注意绝不能 strip() —— 会把就位的空格前缀剥掉,误判未就位(本机已复现)。
-    line = r.stdout or r.stderr
-    return line[:1] in (" ", "+")
-
-
-def _reset_submodule(src: str, sub: str) -> None:
-    """清除 glslang 子模块半成品(反注册 + 删残留 gitdir/工作树/.git gitfile)。
-
-    网络中断(如 502)会让 update 留下指向不完整 .git/modules 的 .git gitfile;
-    git 内部重试遇此状态会误判("BUG: submodule considered for cloning, doesn't need
-    cloning any more?",本机已复现),不清理直接重试会反复失败。deinit 反注册并删
-    工作树,再手动删 .git/modules 下的模块仓库与工作树里的 .git gitfile,让下一次
-    update 从零重克隆。
-    """
-    subprocess.run(
-        ["git", "-C", src, "submodule", "deinit", "-f", "third_party/glslang"],
-        capture_output=True, text=True,
-    )
-    # deinit 依赖 gitdir 可解析;残缺 gitfile 会挡路,先删 gitfile → 工作树 → gitdir。
-    # Windows 下 rmtree 可能因文件锁静默失败,gitfile 单独 os.remove 兜底。
-    gitdir = os.path.join(src, ".git", "modules", "third_party", "glslang")
-    for p in (os.path.join(sub, ".git"), sub, gitdir):
-        if os.path.isfile(p):
-            try:
-                os.remove(p)
-            except OSError:
-                pass
-        elif os.path.isdir(p):
-            shutil.rmtree(p, ignore_errors=True)
-    # 清掉 .git/config 里的子模块注册,让下一次 update 干净地重新 init/clone
-    subprocess.run(
-        ["git", "-C", src, "config", "--remove-section", "submodule.third_party/glslang"],
-        capture_output=True, text=True,
-    )
-
-
-def _set_mirror_rewrite(src: str, prefix: str) -> None:
-    """仓库级 url.<prefix>https://github.com/.insteadOf,让本仓库内所有 github
-    拉取(含子模块 clone)走镜像。git submodule 继承父仓库的 insteadOf 规则。"""
-    subprocess.run(
-        ["git", "-C", src, "config", f"url.{prefix}https://github.com/.insteadOf",
-         "https://github.com/"],
-        capture_output=True, text=True,
-    )
-
-
-def _unset_mirror_rewrite(src: str, prefix: str) -> None:
-    subprocess.run(
-        ["git", "-C", src, "config", "--unset-all", f"url.{prefix}https://github.com/.insteadOf"],
-        capture_output=True, text=True,
-    )
+    def _chmod_and_retry(func, p, exc_info):
+        try:
+            os.chmod(p, stat.S_IWRITE)
+        except OSError:
+            pass
+        try:
+            func(p)
+        except OSError:
+            pass  # 仍删不掉则放弃,由返回值的 lexists 判定
+    if not os.path.lexists(path):
+        return True
+    if os.path.isdir(path) and not os.path.islink(path):
+        for _ in range(4):
+            shutil.rmtree(path, onerror=_chmod_and_retry)
+            if not os.path.lexists(path):
+                return True
+            time.sleep(0.5)  # 锁通常是瞬时的,重试
+        return not os.path.lexists(path)
+    for _ in range(4):
+        try:
+            os.chmod(path, stat.S_IWRITE)
+            os.remove(path)
+            return True
+        except OSError:
+            time.sleep(0.5)
+    return not os.path.lexists(path)
 
 
 def _clear_mirror_rewrites(src: str) -> None:
@@ -134,20 +102,121 @@ def _clear_mirror_rewrites(src: str) -> None:
         )
 
 
+def _glslang_commit(src: str) -> str:
+    """读 SwiftShader 索引里固定的 glslang commit SHA(gitlink)。"""
+    r = subprocess.run(
+        ["git", "-C", src, "ls-tree", "HEAD", "third_party/glslang"],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        return ""
+    parts = r.stdout.strip().split()
+    return parts[2] if len(parts) >= 3 else ""
+
+
+def _submodule_ready(src: str) -> bool:
+    """glslang 是否已就位可用。现代 git 子模块(.git 为 gitfile 且 gitdir 有效)
+    与独立克隆(.git 为目录)都算就位。"""
+    sub = os.path.join(src, "third_party", "glslang")
+    if not os.path.isdir(sub):
+        return False
+    # 独立克隆:自带 .git 目录(本次修复的产物),直接可用
+    if os.path.isdir(os.path.join(sub, ".git")):
+        r = subprocess.run(["git", "-C", sub, "rev-parse", "--git-dir"],
+                           capture_output=True, text=True)
+        return r.returncode == 0
+    # 标准 git 子模块形态:.git 是 gitfile,以 git submodule status 为准。
+    # 首字符即状态前缀:「 」(已初始化且与索引一致)、「+」(检出不同 commit)。
+    # 注意绝不能 strip() —— 会把就位的空格前缀剥掉,误判未就位(本机已复现)。
+    if os.path.isfile(os.path.join(sub, ".git")):
+        r = subprocess.run(
+            ["git", "-C", src, "submodule", "status", "third_party/glslang"],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            return False
+        line = r.stdout or r.stderr
+        return line[:1] in (" ", "+")
+    return False
+
+
+def _clone_glslang(src: str, sub: str, commit: str, prefix: str | None) -> tuple:
+    """把 glslang 按固定 commit 克隆成独立仓库(自带 .git 目录)。
+
+    完全绕开 git submodule 机制:`git submodule update` 在克隆失败中断后会留下
+    半成品 .git gitfile,内部重试撞上它报 "BUG: submodule considered for cloning,
+    doesn't need cloning any more?"(git 自身 BUG,本机复现);Windows 上清理该
+    gitfile 还可能失败。独立克隆不产生 gitfile —— SwiftShader CMake 判据
+    `if(NOT EXISTS <dir>/.git)` 命中目录 .git 即跳过其自身 submodule update。
+
+    浅拉固定 commit:`git init + remote add + fetch --depth 1 origin <sha> +
+    checkout FETCH_HEAD`(GitHub 与 ghproxy 镜像都支持按 SHA 浅拉)。镜像→官方兜底;
+    全失败再退官方全量 clone + checkout commit(兼容不支持按 SHA 浅拉的源)。
+    返回 (ok, err)。
+    """
+    urls = [mirror.mirror_url(GLSLANG_URL, prefix)] if prefix else []
+    urls.append(GLSLANG_URL)
+    last = ""
+    for u in urls:
+        if os.path.isdir(sub):
+            _rm_rf(sub)  # 清上一路失败残留(含坏 gitfile),再 init
+        # 兜底:整个目录可能因 Windows 文件锁删不掉,至少单独删掉坏 .git gitfile,
+        # 让 git init 能在空目录上成功(否则 git init 撞坏 gitfile 直接失败)
+        _rm_rf(os.path.join(sub, ".git"))
+        r = subprocess.run(["git", "init", "-q", sub], capture_output=True, text=True)
+        if r.returncode != 0:
+            last = (r.stderr or r.stdout).strip()[-800:]
+            continue
+        # remote 幂等:已有 origin 则换 URL,否则新增
+        gurl = subprocess.run(["git", "-C", sub, "remote", "get-url", "origin"],
+                              capture_output=True, text=True)
+        if gurl.returncode == 0:
+            subprocess.run(["git", "-C", sub, "remote", "set-url", "origin", u],
+                           capture_output=True, text=True)
+        else:
+            subprocess.run(["git", "-C", sub, "remote", "add", "origin", u],
+                           capture_output=True, text=True)
+        ok = True
+        for cmd in (["git", "-C", sub, "fetch", "--depth", "1", "origin", commit],
+                    ["git", "-C", sub, "checkout", "-q", "FETCH_HEAD"]):
+            rc = subprocess.run(cmd, capture_output=True, text=True)
+            if rc.returncode != 0:
+                ok = False
+                last = (rc.stderr or rc.stdout).strip()[-800:]
+                break
+        if ok:
+            rc = subprocess.run(["git", "-C", sub, "rev-parse", "HEAD"],
+                                capture_output=True, text=True)
+            if rc.returncode == 0 and rc.stdout.strip() == commit:
+                return True, ""
+            ok = False
+            last = (rc.stderr or "checkout 后 HEAD 与固定 commit 不一致").strip()[-800:]
+    # 浅拉全失败(如源不支持按 SHA 拉取):官方全量 clone + checkout commit 兜底
+    if os.path.isdir(sub):
+        _rm_rf(sub)
+    rc = subprocess.run(["git", "clone", GLSLANG_URL, sub], capture_output=True, text=True)
+    if rc.returncode == 0:
+        rc2 = subprocess.run(["git", "-C", sub, "checkout", commit],
+                             capture_output=True, text=True)
+        if rc2.returncode == 0:
+            return True, ""
+        last = (rc2.stderr or rc.stdout).strip()[-800:]
+    else:
+        last = (rc.stderr or rc.stdout).strip()[-800:]
+    return False, last
+
+
 def ensure_swiftshader_submodules(root: str) -> tuple:
     """确保 swiftshader 的 glslang 子模块就位(其 Vulkan 构建必需)。
 
-    SwiftShader 的 InitSubmodule 在 CMake configure 时跑 `git submodule update --init`
-    (全量,glslang 数百 MB,国内/弱网下 GitHub HTTP 502 常现,本机已复现两次失败)。
-    这里提前用 --depth 1 浅克隆 + 重试预取,并利用其 CMake `if(NOT EXISTS <dir>/.git)`
-    逻辑:glslang 就位(带 .git 文件/目录)后 configure 直接跳过 submodule update,
-    不再走网络。就位判定以 `git submodule status` 为准(现代 git 子模块 .git 是文件
-    而非目录,os.path.isdir 会误判);重试前清理半成品,避免中断残留让重试沿用坏状态。
+    SwiftShader 的 InitSubmodule 在 CMake configure 时对缺 .git 的 glslang 跑
+    `git submodule update --init`(全量,数百 MB,国内/弱网下常 502)。这里提前把
+    glslang 按索引固定 commit 浅克隆就位;CMake 判据 `if(NOT EXISTS <dir>/.git)`
+    命中后直接跳过,不再走网络。
 
-    镜像优先、官方兜底:子模块 clone 走 `git submodule update --init`(借助 insteadOf
-    镜像改写),镜像全失败后清掉改写再用官方直连重试 —— 否则只有镜像一路,镜像对
-    glslang 挂了(如 ghproxy.net 证书错)就永远失败。每次 update 前 _reset_submodule
-    清掉上一轮失败残留的 .git gitfile,规避 git 内部重试的 BUG。
+    实现:直接克隆成独立仓库,完全绕开 `git submodule update`——它克隆失败中断
+    会留半成品 .git gitfile,内部重试撞上即报 git BUG(本机复现);Windows 上删该
+    gitfile 又可能失败。独立克隆不产生 gitfile,天然规避。镜像→官方兜底。
     返回 (ok, err)。
     """
     src = pool.src_dir(root, "swiftshader", "master")
@@ -156,31 +225,23 @@ def ensure_swiftshader_submodules(root: str) -> tuple:
         return True, ""  # 已就位
     if not os.path.isdir(src) or not os.path.isfile(os.path.join(src, ".gitmodules")):
         return True, ""  # swiftshader 未拉取或无需子模块,交给后续流程
-    last = ""
+    commit = _glslang_commit(src)
+    if not commit:
+        return False, "读不到 swiftshader 索引中 glslang 的固定 commit(git ls-tree 失败)"
+
+    _clear_mirror_rewrites(src)  # 清陈旧 insteadOf(旧代码可能留 ghproxy.net 的坏改写)
     prefix = mirror.pick_mirror_prefix()
-    if prefix:
-        _clear_mirror_rewrites(src)   # 清陈旧残留,再设当前选定镜像
-        _set_mirror_rewrite(src, prefix)
-    rounds = [prefix, None] if prefix else [None]  # 镜像 → 官方
-    for rnd in rounds:
-        for _ in (1, 2, 3):
-            _reset_submodule(src, sub)  # 清半成品(含坏 .git gitfile),否则重试沿用坏状态
-            r = subprocess.run(
-                ["git", "-C", src, "submodule", "update", "--init", "--depth", "1",
-                 "third_party/glslang"],
-                capture_output=True, text=True,
-            )
-            if r.returncode == 0 and _submodule_ready(src):
-                # 成功路径也要清 insteadOf 改写,否则陈旧的镜像前缀会残留,让本仓库
-                # 之后(如 CMake configure 时的 submodule update)仍走镜像而非官方直连。
-                if prefix:
-                    _clear_mirror_rewrites(src)
-                return True, ""
-            last = (r.stderr or r.stdout)[-800:]
-        if prefix:
-            _clear_mirror_rewrites(src)  # 镜像全失败,退官方直连
-            prefix = None
-    return False, f"glslang 子模块拉取失败(镜像→官方各最多 3 次): {last}"
+    ok, err = _clone_glslang(src, sub, commit, prefix)
+    if not ok and prefix:
+        ok, err = _clone_glslang(src, sub, commit, None)  # 镜像失败,退官方直连
+    if not ok:
+        return False, f"glslang 拉取失败(镜像→官方): {err}"
+    # 清父仓残留子模块注册与坏 gitdir,保持仓库整洁(独立克隆后不再需要它们)
+    _rm_rf(os.path.join(src, ".git", "modules", "third_party", "glslang"))
+    subprocess.run(["git", "-C", src, "config", "--remove-section",
+                    "submodule.third_party/glslang"],
+                   capture_output=True, text=True)
+    return True, ""
 
 
 def run(root: str, libs: list, jobs: int) -> dict:
