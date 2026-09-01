@@ -19,8 +19,8 @@ fi
 if ! grep -qE 'mirrors\.cloud\.tencent\.com/AndroidSDK' "$ANDROID_DEPS"; then
   echo "FAIL: android-deps.sh 缺 cmdline-tools 国内镜像"; exit 1
 fi
-# 许可证自动接受
-if ! grep -qE 'sdkmanager.*--licenses' "$ANDROID_DEPS"; then
+# 许可证自动接受(SDKMANAGER 变量为解析出的 sdkmanager/sdkmanager.bat)
+if ! grep -qE '\$SDKMANAGER.*--licenses' "$ANDROID_DEPS"; then
   echo "FAIL: android-deps.sh 缺 sdkmanager --licenses"; exit 1
 fi
 # env.sh 导出
@@ -34,5 +34,14 @@ fi
 # 复用优先:先探测现成 SDK,找不到才下载
 if ! grep -qE 'ANDROID_HOME|ANDROID_SDK_ROOT' "$ANDROID_DEPS"; then
   echo "FAIL: android-deps.sh 未优先探测已存在的 SDK"; exit 1
+fi
+# Windows cmdline-tools zip 的 bin/ 只有 *.bat,无扩展名 sdkmanager 脚本根本不存在(实测
+# commandlinetools-win-16111833);必须 sdkmanager 与 sdkmanager.bat 都认,否则 Windows 上误判缺 sdkmanager
+if ! grep -qE 'sdkmanager\.bat' "$ANDROID_DEPS"; then
+  echo "FAIL: android-deps.sh 未认 Windows 的 sdkmanager.bat(win zip 无扩展名 sdkmanager,会误判缺 sdkmanager)"; exit 1
+fi
+# cmdline-tools zip 布局兼容:带顶层 cmdline-tools/ 包装目录改名 latest;个别版本直接摆 bin/lib 在根
+if ! grep -qE 'cmdline-tools/cmdline-tools' "$ANDROID_DEPS"; then
+  echo "FAIL: android-deps.sh 未处理 cmdline-tools zip 顶层包装目录(需改名 latest)"; exit 1
 fi
 echo "PASS android-deps.sh 无 sudo + 镜像 + 许可证 + env.sh 导出 + 复用优先"

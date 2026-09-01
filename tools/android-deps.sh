@@ -75,10 +75,24 @@ fi
 # --- ② Android SDK cmdline-tools:探测现成,缺失下载 ---
 # 注:cmdline-tools 只是最小 SDK 管理器本体,不含 platforms/android-34 与 build-tools;
 # 这些由 AGP 首次构建时按 compileSdk 自动经 sdkmanager 下载(需联网 + 已接受许可证)。
+# sdkmanager 可执行文件名因平台而异:Linux zip 只有无扩展名 shell 脚本 sdkmanager,
+# Windows zip 只有 sdkmanager.bat(实测 commandlinetools-win-16111833 的 bin/ 全是 .bat,
+# 无扩展名脚本根本不存在)——两者都要认,否则 Windows 上误判"缺 sdkmanager"。
+resolve_sdkmanager() { # $1 = sdk root;设 SDKMANAGER(shell 脚本或 .bat);找不到返回非零
+  local b="$1/cmdline-tools/latest/bin"
+  SDKMANAGER=""
+  if [ -x "$b/sdkmanager" ]; then SDKMANAGER="$b/sdkmanager"
+  # Windows zip 只有 sdkmanager.bat(无扩展名脚本根本不存在);MSYS 视 .bat 为可执行,
+  # 用 -f 而非 -x(Windows 下两者等价,Linux 上 -x 对 .bat 恒假、无法本地验证)
+  elif [ -f "$b/sdkmanager.bat" ]; then SDKMANAGER="$b/sdkmanager.bat"; fi
+  [ -n "$SDKMANAGER" ]
+}
+
 ANDROID_HOME=""
 for cand in "${ANDROID_HOME:-}" "${ANDROID_SDK_ROOT:-}" "$USER_DEPS/android-sdk" \
             "${LOCALAPPDATA:-}/Android/Sdk" "$HOME/Android/Sdk" "/opt/android-sdk"; do
-  [ -n "$cand" ] && [ -f "$cand/cmdline-tools/latest/bin/sdkmanager" ] && { ANDROID_HOME="$cand"; break; }
+  [ -n "$cand" ] || continue
+  if resolve_sdkmanager "$cand"; then ANDROID_HOME="$cand"; break; fi
 done
 if [ -n "$ANDROID_HOME" ]; then
   info "② 复用已安装 Android SDK: $ANDROID_HOME"
@@ -98,16 +112,31 @@ else
     || curl -fL --retry 3 -o "$CT_ARCHIVE" "$CT_OFFICIAL" \
     || die "cmdline-tools 下载失败(镜像与官方 URL 均不可达;可手动下载同 URL 到 $CT_ARCHIVE 后重跑)"
   unpack_zip "$CT_ARCHIVE" "$ANDROID_HOME/cmdline-tools"
-  [ -d "$ANDROID_HOME/cmdline-tools/cmdline-tools" ] \
-    && mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+  # cmdline-tools zip 结构:老版本带 cmdline-tools/ 顶层包装目录(需改名 latest);个别版本
+  # 可能直接把 bin/lib 摆在根。两种情况都归一到 latest/bin/sdkmanager。
+  if [ -d "$ANDROID_HOME/cmdline-tools/cmdline-tools" ]; then
+    mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+  elif [ -d "$ANDROID_HOME/cmdline-tools/bin" ] && [ ! -d "$ANDROID_HOME/cmdline-tools/latest" ]; then
+    mkdir -p "$ANDROID_HOME/cmdline-tools/latest"
+    mv "$ANDROID_HOME/cmdline-tools/bin" "$ANDROID_HOME/cmdline-tools/latest/" 2>/dev/null || true
+    mv "$ANDROID_HOME/cmdline-tools/lib" "$ANDROID_HOME/cmdline-tools/latest/" 2>/dev/null || true
+    mv "$ANDROID_HOME/cmdline-tools/source.properties" "$ANDROID_HOME/cmdline-tools/latest/" 2>/dev/null || true
+    mv "$ANDROID_HOME/cmdline-tools/NOTICE.txt" "$ANDROID_HOME/cmdline-tools/latest/" 2>/dev/null || true
+  fi
   rm -f "$CT_ARCHIVE"
-  [ -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ] || die "cmdline-tools 解压后缺 sdkmanager"
+  resolve_sdkmanager "$ANDROID_HOME" || die "cmdline-tools 解压后缺 sdkmanager(.bat)"
 fi
 
 # --- ③ 接受许可证(sdkmanager 需要 JAVA_HOME)---
 if [ -n "${JAVA_HOME:-}" ]; then export JAVA_HOME; fi
+# sdkmanager.bat 走 cmd.exe,只认 Windows 路径(MSYS 的参数转换不一定覆盖 --flag= 形式),显式 cygpath -m。
+if [ "$PLAT" = windows ]; then
+  SDK_ROOT_ARG="--sdk_root=$(cygpath -m "$ANDROID_HOME")"
+else
+  SDK_ROOT_ARG="--sdk_root=$ANDROID_HOME"
+fi
 # yes 在 sdkmanager 退出后必收 SIGPIPE,pipefail 下会误报;包一层 || true 只让 sdkmanager 的退出码决定成败。
-{ yes || true; } | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses --sdk_root="$ANDROID_HOME" >/dev/null 2>&1 \
+{ yes || true; } | "$SDKMANAGER" --licenses "$SDK_ROOT_ARG" >/dev/null 2>&1 \
   || info "许可证接受失败(不影响其他项目)"
 
 # --- ④ 写 env.sh(幂等:存在则保留既有行,追加/更新本脚本的导出)---
