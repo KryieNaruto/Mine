@@ -112,14 +112,23 @@ install_standalone_python() {
 }
 # 探测现成解释器:command -v 取绝对路径——既避开下面生成的 $TOOL_BIN/python3 shim(避免自我递归),
 # 也让 shim 能 exec 绝对路径(copy exe 会按新位置解析 sys.prefix,stdlib/site-packages 全找不到)。
-# WindowsApps 的 MS Store 别名(python/python3 都指向它)能被 command -v 命中但根本跑不起来,
-# 由 import yaml 探测自然排除。
+# 关键坑:WindowsApps 的 MS Store 别名 stub(python/python3 都指向它)能被 command -v 命中、却根本
+# 跑不起来(pip 装不上 yaml),还常排在 PATH 最前、遮蔽后面真实安装的 python。所以:
+#   ① 候选先用 `import sys` 验真——stub 直接跳过,不再当"缺 yaml 待补装"候选;
+#   ② 补 py launcher 探测(它能运行机器上所有已装版本,真 python 被遮蔽时的入口);
+#   ③ 再按 python.org 常见安装目录扫描兜底(Program Files\Python3x / C:\Python3x / %LOCALAPPDATA%);
+#   ④ 全都没有,才独立下载。
 PY_CMD=""            # 选中的解释器绝对路径;空 = 装独立版
-PY_CMD_NEED_YAML=""  # 可运行但缺 yaml 的候选(补装 pyyaml 用)
-for cand in python3 python py; do
+PY_CMD_NEED_YAML=""  # 真 python 但缺 yaml 的候选(补装 pyyaml 用)
+# ① 命令名直接解析(python3 → python)
+for cand in python3 python; do
   has "$cand" || continue
   _py="$(command -v "$cand")"
   case "$_py" in "$TOOL_BIN"/*) continue ;; esac  # 跳过上次生成的 shim,交给末尾统一重写
+  if ! "$_py" -c 'import sys' >/dev/null 2>&1; then
+    warn "② $_py 不可运行(疑似 MS Store 别名 stub),跳过"
+    continue
+  fi
   if "$_py" -c 'import yaml' >/dev/null 2>&1; then
     PY_CMD="$_py"
     info "② python3 复用现成: $_py"
@@ -127,6 +136,32 @@ for cand in python3 python py; do
   fi
   [ -n "$PY_CMD_NEED_YAML" ] || PY_CMD_NEED_YAML="$_py"
 done
+# ② py launcher
+if [ -z "$PY_CMD" ] && has py; then
+  if py -c 'import yaml' >/dev/null 2>&1; then
+    PY_CMD="$(command -v py)"
+    info "② python3 复用现成(py launcher): $PY_CMD"
+  elif [ -z "$PY_CMD_NEED_YAML" ]; then
+    PY_CMD_NEED_YAML="$(command -v py)"
+  fi
+fi
+# ③ 常见安装目录扫描(WindowsApps 别名遮蔽 PATH 时兜底)
+if [ -z "$PY_CMD" ] && [ -z "$PY_CMD_NEED_YAML" ]; then
+  _lp="$(cygpath -u "${LOCALAPPDATA:-/nonexistent}" 2>/dev/null || printf /nonexistent)"
+  for _p in \
+      /c/Program\ Files/Python*/python.exe \
+      /c/Python*/python.exe \
+      "$_lp"/Programs/Python/Python*/python.exe; do
+    [ -x "$_p" ] || continue
+    "$_p" -c 'import sys' >/dev/null 2>&1 || continue
+    if "$_p" -c 'import yaml' >/dev/null 2>&1; then
+      PY_CMD="$_p"
+      info "② python3 复用现成(扫描安装目录): $_p"
+      break
+    fi
+    [ -n "$PY_CMD_NEED_YAML" ] || PY_CMD_NEED_YAML="$_p"
+  done
+fi
 if [ -z "$PY_CMD" ] && [ -n "$PY_CMD_NEED_YAML" ]; then
   info "② 复用 $PY_CMD_NEED_YAML,补装 pyyaml ..."
   ensure_pyyaml "$PY_CMD_NEED_YAML" && PY_CMD="$PY_CMD_NEED_YAML" \

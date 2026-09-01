@@ -108,9 +108,20 @@ if ! grep -qE 'dl_mirror' "$WIN_DEPS"; then
 fi
 
 # 现成 Python 优先复用:Git Bash 下 python.org 安装常只有 python.exe(无 python3),探测必须覆盖
-# python3/python/py 三候选——否则用户明明有 python,却误下独立 3.12.7。
-if ! grep -qE 'for cand in python3 python py;' "$WIN_DEPS"; then
-  echo "FAIL: win-deps 现成 Python 探测未覆盖 python3/python/py(有用户 python 仍会下独立版)"; exit 1
+# python3/python 命令名 + py launcher + 常见安装目录扫描——否则用户明明有 python,却误下独立 3.12.7。
+if ! grep -qE 'for cand in python3 python;' "$WIN_DEPS"; then
+  echo "FAIL: win-deps 现成 Python 探测未覆盖 python3/python"; exit 1
+fi
+# WindowsApps 的 MS Store 别名 stub 能被 command -v 命中但跑不起来,还会遮蔽真 python;必须先验真
+# (import sys),stub 不得当作"缺 yaml 待补装"候选,否则又要误下独立版。
+if ! grep -qE "'import sys'" "$WIN_DEPS"; then
+  echo "FAIL: win-deps 未先验真候选是真 python(MS Store 别名 stub 会被误当 yaml 候选)"; exit 1
+fi
+if ! grep -qE 'has py' "$WIN_DEPS"; then
+  echo "FAIL: win-deps 未用 py launcher 兜底探测(真 python 被别名遮蔽时的入口)"; exit 1
+fi
+if ! grep -qE 'Python\*/python\.exe' "$WIN_DEPS"; then
+  echo "FAIL: win-deps 未扫描常见安装目录(别名遮蔽 PATH 时找不到真 python)"; exit 1
 fi
 # 复用/独立两条路都要产出 python3 shim(exec 真实解释器绝对路径)——否则用户只有 python/py 时,
 # 后续 setup-env.sh 调 python3 会失败;且 shim 必须 exec 绝对路径(避免 shim 自我递归)。
