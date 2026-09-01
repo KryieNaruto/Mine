@@ -74,19 +74,34 @@ def _submodule_ready(src: str) -> bool:
 
 
 def _reset_submodule(src: str, sub: str) -> None:
-    """清除 glslang 子模块半成品(反注册 + 删残留 gitdir/工作树)。
+    """清除 glslang 子模块半成品(反注册 + 删残留 gitdir/工作树/.git gitfile)。
 
-    网络中断(如 502)会让 update 留下指向不完整 .git/modules 的 .git 文件;
-    不清理直接重试,git 会沿用坏状态反复失败。deinit 反注册并删工作树,再手动删
-    .git/modules 下的模块仓库,让下一次 update 从零重克隆。
+    网络中断(如 502)会让 update 留下指向不完整 .git/modules 的 .git gitfile;
+    git 内部重试遇此状态会误判("BUG: submodule considered for cloning, doesn't need
+    cloning any more?",本机已复现),不清理直接重试会反复失败。deinit 反注册并删
+    工作树,再手动删 .git/modules 下的模块仓库与工作树里的 .git gitfile,让下一次
+    update 从零重克隆。
     """
     subprocess.run(
         ["git", "-C", src, "submodule", "deinit", "-f", "third_party/glslang"],
         capture_output=True, text=True,
     )
-    shutil.rmtree(os.path.join(src, ".git", "modules", "third_party", "glslang"),
-                  ignore_errors=True)
-    shutil.rmtree(sub, ignore_errors=True)
+    # deinit 依赖 gitdir 可解析;残缺 gitfile 会挡路,先删 gitfile → 工作树 → gitdir。
+    # Windows 下 rmtree 可能因文件锁静默失败,gitfile 单独 os.remove 兜底。
+    gitdir = os.path.join(src, ".git", "modules", "third_party", "glslang")
+    for p in (os.path.join(sub, ".git"), sub, gitdir):
+        if os.path.isfile(p):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        elif os.path.isdir(p):
+            shutil.rmtree(p, ignore_errors=True)
+    # 清掉 .git/config 里的子模块注册,让下一次 update 干净地重新 init/clone
+    subprocess.run(
+        ["git", "-C", src, "config", "--remove-section", "submodule.third_party/glslang"],
+        capture_output=True, text=True,
+    )
 
 
 def _set_mirror_rewrite(src: str, prefix: str) -> None:
@@ -106,6 +121,19 @@ def _unset_mirror_rewrite(src: str, prefix: str) -> None:
     )
 
 
+def _clear_mirror_rewrites(src: str) -> None:
+    """清掉仓库内全部 url.*.insteadOf 改写(任一镜像前缀残留),保证拉取走当前选定源。"""
+    r = subprocess.run(
+        ["git", "-C", src, "config", "--name-only", "--get-regexp", r"url\..*\.insteadOf"],
+        capture_output=True, text=True,
+    )
+    for key in r.stdout.splitlines():
+        subprocess.run(
+            ["git", "-C", src, "config", "--unset-all", key],
+            capture_output=True, text=True,
+        )
+
+
 def ensure_swiftshader_submodules(root: str) -> tuple:
     """确保 swiftshader 的 glslang 子模块就位(其 Vulkan 构建必需)。
 
@@ -115,6 +143,11 @@ def ensure_swiftshader_submodules(root: str) -> tuple:
     逻辑:glslang 就位(带 .git 文件/目录)后 configure 直接跳过 submodule update,
     不再走网络。就位判定以 `git submodule status` 为准(现代 git 子模块 .git 是文件
     而非目录,os.path.isdir 会误判);重试前清理半成品,避免中断残留让重试沿用坏状态。
+
+    镜像优先、官方兜底:子模块 clone 走 `git submodule update --init`(借助 insteadOf
+    镜像改写),镜像全失败后清掉改写再用官方直连重试 —— 否则只有镜像一路,镜像对
+    glslang 挂了(如 ghproxy.net 证书错)就永远失败。每次 update 前 _reset_submodule
+    清掉上一轮失败残留的 .git gitfile,规避 git 内部重试的 BUG。
     返回 (ok, err)。
     """
     src = pool.src_dir(root, "swiftshader", "master")
@@ -126,25 +159,28 @@ def ensure_swiftshader_submodules(root: str) -> tuple:
     last = ""
     prefix = mirror.pick_mirror_prefix()
     if prefix:
+        _clear_mirror_rewrites(src)   # 清陈旧残留,再设当前选定镜像
         _set_mirror_rewrite(src, prefix)
-    for _ in (1, 2, 3):
-        _reset_submodule(src, sub)  # 清半成品,否则中断残留会让重试沿用坏状态
-        r = subprocess.run(
-            ["git", "-C", src, "submodule", "update", "--init", "--depth", "1",
-             "third_party/glslang"],
-            capture_output=True, text=True,
-        )
-        if r.returncode == 0 and _submodule_ready(src):
-            # 成功路径也要清除 insteadOf 改写,否则陈旧的镜像前缀会残留,让本仓库
-            # 之后(如 CMake configure 时的 submodule update)仍走镜像而非官方直连。
-            if prefix:
-                _unset_mirror_rewrite(src, prefix)
-            return True, ""
-        last = (r.stderr or r.stdout)[-800:]
+    rounds = [prefix, None] if prefix else [None]  # 镜像 → 官方
+    for rnd in rounds:
+        for _ in (1, 2, 3):
+            _reset_submodule(src, sub)  # 清半成品(含坏 .git gitfile),否则重试沿用坏状态
+            r = subprocess.run(
+                ["git", "-C", src, "submodule", "update", "--init", "--depth", "1",
+                 "third_party/glslang"],
+                capture_output=True, text=True,
+            )
+            if r.returncode == 0 and _submodule_ready(src):
+                # 成功路径也要清 insteadOf 改写,否则陈旧的镜像前缀会残留,让本仓库
+                # 之后(如 CMake configure 时的 submodule update)仍走镜像而非官方直连。
+                if prefix:
+                    _clear_mirror_rewrites(src)
+                return True, ""
+            last = (r.stderr or r.stdout)[-800:]
         if prefix:
-            _unset_mirror_rewrite(src, prefix)
+            _clear_mirror_rewrites(src)  # 镜像全失败,退官方直连
             prefix = None
-    return False, f"glslang 子模块拉取失败(3 次尝试): {last}"
+    return False, f"glslang 子模块拉取失败(镜像→官方各最多 3 次): {last}"
 
 
 def run(root: str, libs: list, jobs: int) -> dict:

@@ -182,6 +182,39 @@ class TestEnsureSwiftshaderSubmodules(unittest.TestCase):
         self.assertEqual(run.call_count, 3)
         self.assertIn("HTTP 502", err)
 
+    def test_mirror_fails_then_official_fallback(self):
+        # 根因回归:镜像对 glslang 全挂(证书/超时)时,原来只有镜像一路、永远失败;
+        # 现在镜像 3 次失败后清掉改写,官方直连兜底成功。
+        root, src = self._make_src()
+        results = [mock.Mock(returncode=128, stdout="", stderr="mirror 502")] * 3 + \
+                  [mock.Mock(returncode=0, stdout="", stderr="")]
+        with mock.patch.object(fetch_mod, "_submodule_ready",
+                               side_effect=[False, True]), \
+             mock.patch.object(fetch_mod, "_reset_submodule"), \
+             mock.patch.object(fetch_mod, "_clear_mirror_rewrites") as clear, \
+             mock.patch.object(fetch_mod, "_set_mirror_rewrite"), \
+             mock.patch.object(fetch_mod.mirror, "pick_mirror_prefix",
+                               return_value="https://ghproxy.net/"), \
+             mock.patch.object(fetch_mod.subprocess, "run", side_effect=results) as run:
+            ok, err = fetch_mod.ensure_swiftshader_submodules(root)
+        self.assertTrue(ok, err)
+        self.assertEqual(run.call_count, 4)   # 镜像 3 次失败 + 官方 1 次成功
+        self.assertEqual(clear.call_count, 2)  # 入口清残留 + 镜像轮结束退官方
+
+    def test_reset_removes_stale_gitfile_when_gitdir_missing(self):
+        # 中断残留的 .git gitfile(指向已不存在的 gitdir)是 git 内部重试 BUG 的触发器,
+        # _reset_submodule 必须连 gitfile 一起清掉,否则重试沿用坏状态。
+        root, src = self._make_src()
+        sub = os.path.join(src, "third_party", "glslang")
+        os.makedirs(sub)
+        with open(os.path.join(sub, ".git"), "w") as f:
+            f.write("gitdir: ../../.git/modules/third_party/glslang")
+        with mock.patch.object(fetch_mod.subprocess, "run") as run:
+            run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+            fetch_mod._reset_submodule(src, sub)
+        self.assertFalse(os.path.exists(sub))
+        self.assertFalse(os.path.exists(os.path.join(sub, ".git")))
+
     def test_reset_removes_broken_gitdir_and_worktree(self):
         # 中断残留(坏 .git 文件 + 半成品 .git/modules)必须清掉,否则重试沿用坏状态
         root, src = self._make_src()
@@ -206,6 +239,24 @@ class TestMirrorRewrite(unittest.TestCase):
         self.assertIn("config", args)
         self.assertIn("url.https://ghproxy.net/https://github.com/.insteadOf", args)
         self.assertIn("https://github.com/", args)
+
+    def test_clear_mirror_rewrites_unsets_all(self):
+        results = [
+            mock.Mock(returncode=0, stdout=(
+                "url.https://ghproxy.net/https://github.com/.insteadOf\n"
+                "url.https://gh-proxy.com/https://github.com/.insteadOf\n")),
+            mock.Mock(returncode=0, stdout="", stderr=""),
+            mock.Mock(returncode=0, stdout="", stderr=""),
+        ]
+        with mock.patch("deps_lib.fetch.subprocess.run", side_effect=results) as run:
+            fetch_mod._clear_mirror_rewrites("/src")
+        self.assertEqual(run.call_count, 3)  # get-regexp 列名 + 两个 unset
+        keys = [c.args[0][c.args[0].index("--unset-all") + 1]
+                for c in run.call_args_list[1:]]
+        self.assertEqual(keys, [
+            "url.https://ghproxy.net/https://github.com/.insteadOf",
+            "url.https://gh-proxy.com/https://github.com/.insteadOf",
+        ])
 
 
 if __name__ == "__main__":
