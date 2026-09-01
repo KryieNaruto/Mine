@@ -69,6 +69,54 @@ class TestPrefixPathInjection(unittest.TestCase):
         self.assertNotIn("-DCMAKE_PREFIX_PATH=", " ".join(cmd))
 
 
+class TestFetchContentSourceInjection(unittest.TestCase):
+    """ink 的 googletest FetchContent 必须指到池内源码,不直连 GitHub。"""
+
+    def _make_root(self, gtest_tag="v1.15.2", with_src=True):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = tmp.name
+        os.makedirs(os.path.join(root, "third_party"))
+        with open(os.path.join(root, "third_party", "deps.yaml"), "w", encoding="utf-8") as f:
+            f.write(
+                "libs:\n"
+                "  googletest:\n"
+                "    repo: https://github.com/google/googletest.git\n"
+                f"    tag: \"{gtest_tag}\"\n"
+                "    build: cmake\n"
+            )
+        if with_src:
+            os.makedirs(os.path.join(root, "third_party", "_src", f"googletest-{gtest_tag}"))
+        return root
+
+    def test_ink_injects_local_gtest_source(self):
+        root = self._make_root()
+        lib = LibSpec(name="ink-stroke-modeler", repo="r", tag="main")
+        cmd = cmake_driver.configure_command(root, lib, "release")
+        expected = os.path.join(root, "third_party", "_src", "googletest-v1.15.2")
+        self.assertIn(f"-DFETCHCONTENT_SOURCE_DIR_GOOGLETEST={expected}", " ".join(cmd))
+
+    def test_ink_no_injection_when_src_missing(self):
+        root = self._make_root(with_src=False)
+        lib = LibSpec(name="ink-stroke-modeler", repo="r", tag="main")
+        cmd = cmake_driver.configure_command(root, lib, "release")
+        self.assertNotIn("FETCHCONTENT_SOURCE_DIR_GOOGLETEST", " ".join(cmd))
+
+    def test_ink_no_injection_when_manifest_missing(self):
+        # 与既有 test_injects_only_built_release_prefixes 相同的临时 root:无 deps.yaml
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        lib = LibSpec(name="ink-stroke-modeler", repo="r", tag="main")
+        cmd = cmake_driver.configure_command(tmp.name, lib, "release")
+        self.assertNotIn("FETCHCONTENT_SOURCE_DIR_GOOGLETEST", " ".join(cmd))
+
+    def test_non_ink_lib_no_injection(self):
+        root = self._make_root()
+        lib = LibSpec(name="fmt", repo="r", tag="10.2.1")
+        cmd = cmake_driver.configure_command(root, lib, "release")
+        self.assertNotIn("FETCHCONTENT_SOURCE_DIR_GOOGLETEST", " ".join(cmd))
+
+
 class _FakeProc:
     def __init__(self, lines, rc):
         self._lines = list(lines)

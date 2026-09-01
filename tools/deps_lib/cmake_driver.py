@@ -7,8 +7,34 @@ import subprocess
 import sys
 from collections import deque
 
-from . import pool
+from . import manifest, pool
 from .manifest import LibSpec, ver_dir
+
+
+def _fetchcontent_source_opts(root: str, lib: LibSpec) -> list:
+    """给需 FetchContent 的三方库注入本地源码目录,避免 configure 期直连 GitHub。
+
+    ink-stroke-modeler 的 CMakeLists 在 INK_STROKE_MODELER_FIND_GTEST=OFF 时用
+    FetchContent 从 https://github.com/google/googletest.git 现拉 googletest(不走
+    本脚本的镜像层)。Windows 实测直连失败(Recv failure / Failed to connect)→
+    configure 崩、两变体全 FAILED。把 FETCHCONTENT_SOURCE_DIR_GOOGLETEST 指到池内
+    已(镜像)拉好的 googletest 源码,FetchContent 直接复用本地目录、不走网络。
+    googletest 的拉取由 deps.yaml 的 depends_on 保证在 ink 之前完成。
+    清单缺失/目录未就位时静默跳过(宁可走原逻辑报错,也不指错路径)。
+    """
+    if lib.name != "ink-stroke-modeler":
+        return []
+    try:
+        gm = manifest.load_global_manifest(root)
+    except FileNotFoundError:
+        return []
+    g = (gm.get("libs") or {}).get("googletest")
+    if not g:
+        return []
+    src = os.path.join(root, "third_party", "_src", f"googletest-{str(g.get('tag', ''))}")
+    if not os.path.isdir(src):
+        return []
+    return [f"-DFETCHCONTENT_SOURCE_DIR_GOOGLETEST={src}"]
 
 
 def _built_prefixes(root: str, variant: str) -> list:
@@ -35,6 +61,8 @@ def configure_command(root: str, lib: LibSpec, variant: str) -> list:
     ]
     for opt in lib.options:
         cmd.append("-D" + opt)
+    # FetchContent 依赖指到池内源码(ink 的 googletest),避免 configure 期直连 GitHub
+    cmd.extend(_fetchcontent_source_opts(root, lib))
     # 注入池内已建前缀,使 find_package(absl) 等能命中池产物
     prefixes = _built_prefixes(root, variant)
     if prefixes:

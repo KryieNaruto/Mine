@@ -13,6 +13,10 @@ libs:
     repo: https://github.com/g-truc/glm.git
     tag: "1.0.1"
     build: cmake
+    # master project 默认 GLM_BUILD_TESTS=ON,会把 372 个测试目标全编一遍——
+    # MSVC 下某个测试编译失败(Windows 实测 4 个 FAILED 之二)。消费方只用库,
+    # 关掉测试只编 glm 库 + install。
+    options: [GLM_BUILD_TESTS=OFF]
   abseil-cpp:
     repo: https://github.com/abseil/abseil-cpp.git
     tag: "20260817.0"
@@ -22,8 +26,13 @@ libs:
     repo: https://github.com/google/ink-stroke-modeler.git
     tag: "main"
     build: cmake
+    # FIND_GTEST=OFF 时 ink 的 CMakeLists 用 FetchContent 直连 GitHub 拉 googletest,
+    # Windows 常连不上(Recv failure/Failed to connect)→ configure 崩。cmake_driver 会
+    # 把 FETCHCONTENT_SOURCE_DIR_GOOGLETEST 指到池内(镜像拉好的)googletest 源码;这里
+    # depends_on googletest 保证它在 ink 之前先被拉取(否则新机器上 ink 先 configure,
+    # 池里还没有 googletest 源码)。
     options: [INK_STROKE_MODELER_FIND_DEPENDENCIES=ON, INK_STROKE_MODELER_FIND_ABSL=ON, INK_STROKE_MODELER_FIND_GTEST=OFF, INK_STROKE_MODELER_BUILD_TESTING=OFF]
-    depends_on: [abseil-cpp]
+    depends_on: [abseil-cpp, googletest]
   glfw:
     repo: https://github.com/glfw/glfw.git
     tag: "3.4"
