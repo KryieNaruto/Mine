@@ -33,6 +33,13 @@ if(WIN32 AND MSVC)
     set_property(TARGET main PROPERTY VS_DEBUGGER_ENVIRONMENT "PATH=$<TARGET_FILE_DIR:Qt6::Core>;$(PATH)")
 endif()
 
+# 构建树里 F5/双击即用:POST_BUILD 用 windeployqt 把 Qt DLL + 平台插件拷到 exe 旁,不依赖 PATH。
+# (install 期那处 windeployqt 只管 cmake --install 的产物,管不到 VS 直接运行的构建树 exe。)
+if(WIN32)
+    include("${CMAKE_CURRENT_LIST_DIR}/../../tools/cmake/qt_windeploy.cmake")
+    qt_windeploy(main)
+endif()
+
 # Vulkan 为可选：有 SDK（且能编 shader）则启用离屏渲染，没有也不要导致配置/编译失败
 find_package(Vulkan QUIET)
 if(Vulkan_FOUND)

@@ -29,3 +29,14 @@ target_compile_definitions(image_golden_test PRIVATE
   STICKYNOTES_CLI="$<TARGET_FILE:stickynotes-cli>"
   STICKYNOTES_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../golden")
 add_test(NAME image_golden_test COMMAND image_golden_test)
+
+# Qt 测试 exe 同样部署运行库(qt_windeploy 由父目录 tools/cmake/qt_windeploy.cmake 提供)
+if(WIN32)
+  get_property(_st_tgts DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" PROPERTY BUILDSYSTEM_TARGETS)
+  foreach(_t ${_st_tgts})
+    get_target_property(_tt "${_t}" TYPE)
+    if(_tt STREQUAL "EXECUTABLE")
+      qt_windeploy("${_t}")
+    endif()
+  endforeach()
+endif()

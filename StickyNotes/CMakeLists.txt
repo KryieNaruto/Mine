@@ -4,6 +4,9 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 
+# Qt exe 部署函数(WIN32 下 POST_BUILD windeployqt;见 tools/cmake/qt_windeploy.cmake)
+include("${CMAKE_CURRENT_LIST_DIR}/../tools/cmake/qt_windeploy.cmake")
+
 find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Test)
 
 add_library(stickynotes_core STATIC
@@ -48,6 +51,17 @@ target_link_libraries(stickynotes-cli PRIVATE stickynotes_app stickynotes_assets
 # 窗口版入口：装配多窗口/控制器/组，自动加载+防抖保存
 add_executable(stickynotes src/app/main.cpp)
 target_link_libraries(stickynotes PRIVATE stickynotes_app stickynotes_assets)
+
+# 构建树里 F5/双击即用:给本目录所有 Qt 可执行目标加 windeployqt POST_BUILD(不依赖 PATH)
+if(WIN32)
+  get_property(_sn_tgts DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" PROPERTY BUILDSYSTEM_TARGETS)
+  foreach(_t ${_sn_tgts})
+    get_target_property(_tt "${_t}" TYPE)
+    if(_tt STREQUAL "EXECUTABLE")
+      qt_windeploy("${_t}")
+    endif()
+  endforeach()
+endif()
 
 enable_testing()
 add_subdirectory(tests)
