@@ -1,0 +1,3 @@
+type: vs
+use: []
+# Qt6 经 tools/install-user-deps.sh 部署到 .user-deps；本项目无第三方 C++ 池依赖。

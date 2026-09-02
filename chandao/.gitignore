@@ -1,0 +1,20 @@
+# 构建产物
+_build/
+_install/
+_shottest/
+
+# 临时凭证（不提交）
+.github_token
+
+# 用户/IDE 文件
+.vs/
+*.user
+*.userosscache
+*.suo
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
+
+# Cursor 日志（不整体忽略 .cursor，因为 skills/agents 要进库）
+.cursor/*.log
