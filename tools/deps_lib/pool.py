@@ -82,8 +82,20 @@ def _src_fingerprint(root: str, name: str, tag: str) -> str:
         return ""
 
 
-def is_built(root: str, name: str, tag: str, variant: str) -> bool:
-    """已建且源码指纹一致才视为 built;源码被本地修改(补丁)时触发重编。"""
+def options_sig(options) -> str:
+    """构建选项签名:排序后按 '|' 连接,写入 .built 的 opts= 行。
+
+    用于判断 deps.yaml 里某库的 options 是否变过 —— 变了则 is_built/setup-env 探针判定
+    需要重编(如 googletest 加 gtest_force_shared_crt 后,旧静态 CRT 池库要自动重建)。
+    旧 .built(改版前建的)没有 opts= 行、无法回溯当时选项,按"已建"放行,避免误伤全池
+    重编;迁移期对确实变过 options 的库(googletest)需手动删一次 install/build 目录,
+    重建后即带 opts 签名,以后再改 options 就能自动失效。
+    """
+    return "|".join(sorted(options or []))
+
+
+def is_built(root: str, name: str, tag: str, variant: str, options=None) -> bool:
+    """已建且源码指纹一致才算 built;源码被本地修改(dirty)或构建选项(options)变化时重编。"""
     if is_pacman_provided(root, name):
         return True
     bfile = os.path.join(install_dir(root, name, tag, variant), ".built")
@@ -95,9 +107,15 @@ def is_built(root: str, name: str, tag: str, variant: str) -> bool:
     try:
         with open(bfile, "r", encoding="utf-8") as f:
             content = f.read()
-        if "src=" not in content:
+        if "src=" in content:
+            src_ok = ("src=" + fp) in content
+        else:
             # 旧格式 .built:源码 dirty(本地补丁)则重编,否则视为已建
-            return "0" == fp.split("|", 1)[1]
-        return ("src=" + fp) in content
+            src_ok = "0" == fp.split("|", 1)[1]
+        if options is not None:
+            if "opts=" in content:
+                return src_ok and (("opts=" + options_sig(options)) in content)
+            return src_ok  # 旧 .built 无 opts 记录:无法回溯,按已建放行
+        return src_ok
     except Exception:
         return False

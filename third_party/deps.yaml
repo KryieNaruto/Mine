@@ -42,6 +42,11 @@ libs:
     repo: https://github.com/google/googletest.git
     tag: "v1.15.2"
     build: cmake
+    # googletest 的 internal_utils.cmake 在 MSVC + 静态库且 gtest_force_shared_crt 未开时,
+    # 会把 /MD 强换成 -MT(无视 cmake_driver 传的 CMAKE_MSVC_RUNTIME_LIBRARY)。消费方
+    # (EasyPainter 测试目标 / Qt 预编译)都是动态 CRT /MD → gtest.lib MT 与之相链即
+    # LNK2038 RuntimeLibrary 不匹配 + LNK2005 重复符号。开共享 CRT 让 gtest 池产物归 /MD。
+    options: [gtest_force_shared_crt=ON]
   swiftshader:
     repo: https://github.com/google/swiftshader.git
     tag: "master"

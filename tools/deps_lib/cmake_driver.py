@@ -162,6 +162,8 @@ def build_lib(root: str, lib: LibSpec, variant: str, jobs: int) -> tuple:
     with open(os.path.join(idir, ".built"), "w", encoding="utf-8") as f:
         f.write(f"variant={variant}\n")
         f.write(f"src={pool._src_fingerprint(root, lib.name, lib.tag)}\n")
+        # 记录当时构建选项:再改 deps.yaml 的 options 后 is_built/setup-env 探针据此自动重编
+        f.write(f"opts={pool.options_sig(lib.options)}\n")
     return True, ""
 
 

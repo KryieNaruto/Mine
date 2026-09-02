@@ -125,7 +125,7 @@ def main(argv=None) -> int:
                 continue
         for v in variants:
             key = f"{manifest.ver_dir(lib.name, lib.tag)} [{v}]"
-            if pool.is_built(MINE_ROOT, lib.name, lib.tag, v):
+            if pool.is_built(MINE_ROOT, lib.name, lib.tag, v, lib.options):
                 summary["skipped"].append(key)
                 continue
             print(f"编译 {manifest.ver_dir(lib.name, lib.tag)} [{v}] …", flush=True)

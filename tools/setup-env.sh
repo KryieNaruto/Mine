@@ -136,8 +136,17 @@ root = os.environ["MINE_ROOT"]
 m = yaml.safe_load(open(os.path.join(root, "third_party", "deps.yaml"), encoding="utf-8"))
 variant = m.get("default_variant") or "release"
 for name, spec in (m.get("libs") or {}).items():
-    if not os.path.exists(os.path.join(root, "third_party", "_install", f"{name}-{spec.get('tag','')}", variant, ".built")):
+    bf = os.path.join(root, "third_party", "_install", f"{name}-{spec.get('tag','')}", variant, ".built")
+    if not os.path.exists(bf):
+        sys.exit(1)  # 缺 .built → 需重编(触发下方 fetch+build)
+    # 选项指纹:改 deps.yaml 的 options 后应触发重编;旧 .built 无 opts= 行(无法回溯)则放行
+    try:
+        content = open(bf, encoding="utf-8").read()
+    except Exception:
         sys.exit(1)
+    opts = "|".join(sorted(spec.get("options") or []))
+    if "opts=" in content and ("opts=" + opts) not in content:
+        sys.exit(1)  # 已记录过选项但和现在不一致 → 需重编
 sys.exit(0)
 PYEOF
 }

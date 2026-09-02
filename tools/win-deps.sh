@@ -324,6 +324,65 @@ EOF
 }
 install_qt_msvc
 
+# Qt 6.5.x 的 qcompilerdetection.h 在 MSVC 分支无条件把 QT_MAKE_UNCHECKED/CHECKED_ARRAY_ITERATOR
+# 定义成 stdext::make_unchecked/checked_array_iterator。较新 MSVC(>=1938,即 VS2022 17.8+;本机
+# 实测 VS18/19.51)的 STL 已删除 stdext,凡实例化 Qt 容器(QVarLengthArray/QVector…)的 TU 直接
+# C2065/C3861 'stdext' 未声明(报错在宏展开点 qvarlengtharray.h:379/890)。按 Qt 上游同款 guard
+# 修补:两条宏整体包进 '#if _MSC_VER < 1938',新 MSVC 下由文件下方 #ifndef 兜底成恒等 (x)。
+# 两个要点:① 必须按"整行"边界包 —— 旧版曾把 #endif 插进宏定义行中间,把 CHECKED 行拦腰截断、
+# 尾巴 (x, size_t(N)) 变成孤儿行,头文件直接语法崩(已在 Win 实测踩过);② 幂等修复那个"已打坏
+# 但 guard 已存在"的历史状态:把被截断的宏行续回尾巴、删孤儿行。对已正确的文件(含更新 Qt 自带
+# guard)不产生任何改动。
+patch_qt_msvc_stdext() {
+  local hdr="$QT_PREFIX/include/QtCore/qcompilerdetection.h"
+  if [ ! -f "$hdr" ]; then
+    warn "⑥ QtCore qcompilerdetection.h 缺失($hdr),跳过 stdext 补丁"
+    return 0
+  fi
+  "${PY_CMD:-python3}" - "$hdr" <<'PYEOF'
+import re, sys
+p = sys.argv[1]
+src = open(p, encoding="utf-8").read()
+changed = False
+
+# --- 1) 修复历史损坏:CHECKED 宏行被 #endif 拦腰截断 → 尾段 (x, size_t(N)) 变孤儿行 ---
+pat_partial = re.compile(
+    r'^[ \t]*# *define[ \t]+QT_MAKE_CHECKED_ARRAY_ITERATOR\(x, N\)[ \t]+stdext::make_checked_array_iterator[ \t]*$')
+pat_orphan = re.compile(r'^[ \t]*\(x, size_t\(N\)\)[^\n]*$')
+lines = []
+for ln in src.split("\n"):
+    if pat_orphan.match(ln):      # 孤儿尾段,丢弃
+        changed = True
+        continue
+    if pat_partial.match(ln):     # 被截断的宏行,续回尾巴
+        lines.append(ln + "(x, size_t(N)) // Since _MSC_VER >= 1500")
+        changed = True
+        continue
+    lines.append(ln)
+src = "\n".join(lines)
+
+# --- 2) 原始未打 guard 的 6.5.3:把两条宏(整行)包进 _MSC_VER<1938 guard ---
+if "_MSC_VER < 1938" not in src:
+    un = re.compile(r'^[ \t]*# *define[ \t]+QT_MAKE_UNCHECKED_ARRAY_ITERATOR\(x\)[ \t]+stdext::make_unchecked_array_iterator[^\n]*$', re.M)
+    ch = re.compile(r'^[ \t]*# *define[ \t]+QT_MAKE_CHECKED_ARRAY_ITERATOR\(x, N\)[ \t]+stdext::make_checked_array_iterator[^\n]*$', re.M)
+    um = un.search(src); cm = ch.search(src)
+    if um and cm and um.start() < cm.start():
+        nl = src.find("\n", cm.start())
+        eol = nl + 1 if nl != -1 else len(src)
+        guard = "#  if _MSC_VER < 1938 // stdext removed in newer MSVC (mirror Qt upstream)\n"
+        src = src[:um.start()] + guard + src[um.start():eol] + "#  endif\n" + src[eol:]
+        changed = True
+    # 排布不符(如更新的 Qt 已自带 guard)或宏已改名 → 不动,不静默改错
+
+if changed:
+    open(p, "w", encoding="utf-8", newline="\n").write(src)
+    print("  已修补 QtCore stdext guard(MSVC >= 1938 退化为恒等): %s" % p)
+else:
+    print("  QtCore stdext 头无需修改: %s" % p)
+PYEOF
+}
+patch_qt_msvc_stdext
+
 # --- ⑦ 生成 env.sh(工具链 + Qt6 + SwiftShader ICD + Vulkan SDK;不含 /mingw64) ---
 # PATH 前置:工具链(.user-deps/bin 及独立 python 目录/VS 自带 cmake&ninja)→ Qt6 bin → Vulkan Bin。
 # \$PATH 转义成字面量,source 时才展开,避免写成生成时刻的 PATH。

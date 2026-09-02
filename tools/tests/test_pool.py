@@ -58,6 +58,38 @@ class TestPool(unittest.TestCase):
             f.write("")
         self.assertTrue(pool.is_built(self.root, "fmt", "10.2.1", "release"))
 
+    def test_options_sig_sorted_and_empty(self):
+        self.assertEqual(pool.options_sig(["FMT_TEST=OFF"]), "FMT_TEST=OFF")
+        self.assertEqual(pool.options_sig(["b=1", "a=2"]), "a=2|b=1")
+        self.assertEqual(pool.options_sig(None), "")
+        self.assertEqual(pool.options_sig([]), "")
+
+    def test_built_options_change_invalidates(self):
+        # 模拟有 git 元数据(否则指纹为空直接放行,测不到 opts 分支)
+        with mock.patch.object(pool, "_src_fingerprint", return_value="abc123|0"):
+            inst = pool.install_dir(self.root, "fmt", "10.2.1", "release")
+            os.makedirs(inst)
+            with open(os.path.join(inst, ".built"), "w", encoding="utf-8") as f:
+                f.write("variant=release\nsrc=abc123|0\nopts=FMT_TEST=OFF\n")
+            # 选项没变 → 已建
+            self.assertTrue(
+                pool.is_built(self.root, "fmt", "10.2.1", "release", ["FMT_TEST=OFF"]))
+            # 选项变了 → 需重编
+            self.assertFalse(
+                pool.is_built(self.root, "fmt", "10.2.1", "release", ["FMT_TEST=ON"]))
+            # 不传 options → 保持旧的只看源码行为
+            self.assertTrue(pool.is_built(self.root, "fmt", "10.2.1", "release"))
+
+    def test_built_legacy_without_opts_is_allowed(self):
+        # 旧 .built(改版前)没有 opts= 行:无法回溯,按已建放行,避免误伤全池重编
+        with mock.patch.object(pool, "_src_fingerprint", return_value="abc123|0"):
+            inst = pool.install_dir(self.root, "fmt", "10.2.1", "release")
+            os.makedirs(inst)
+            with open(os.path.join(inst, ".built"), "w", encoding="utf-8") as f:
+                f.write("variant=release\nsrc=abc123|0\n")
+            self.assertTrue(
+                pool.is_built(self.root, "fmt", "10.2.1", "release", ["FMT_TEST=OFF"]))
+
 
 if __name__ == "__main__":
     unittest.main()
