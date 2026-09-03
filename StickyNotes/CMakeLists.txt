@@ -36,11 +36,13 @@ add_library(stickynotes_app STATIC
   src/app/note_window.cpp
   src/app/note_group.cpp
   src/app/edge_dock_controller.cpp
+  src/app/startup.cpp
   src/app/palette_dialog.h
   src/app/note_widget.h
   src/app/note_window.h
   src/app/note_group.h
-  src/app/edge_dock_controller.h)
+  src/app/edge_dock_controller.h
+  src/app/startup.h)
 target_include_directories(stickynotes_app PUBLIC src)
 target_link_libraries(stickynotes_app PUBLIC stickynotes_core Qt6::Widgets Qt6::Gui)
 
@@ -49,8 +51,16 @@ add_executable(stickynotes-cli src/cli/main.cpp)
 target_link_libraries(stickynotes-cli PRIVATE stickynotes_app stickynotes_assets)
 
 # 窗口版入口：装配多窗口/控制器/组，自动加载+防抖保存
-add_executable(stickynotes src/app/main.cpp)
+add_executable(stickynotes WIN32 src/app/main.cpp)
 target_link_libraries(stickynotes PRIVATE stickynotes_app stickynotes_assets)
+
+# WIN32 自守卫:stickynotes 必须为 GUI 子系统(否则 Windows 上弹黑控制台)
+if(WIN32)
+  get_target_property(_sn_win32 stickynotes WIN32_EXECUTABLE)
+  if(NOT _sn_win32)
+    message(FATAL_ERROR "stickynotes 目标必须声明 WIN32(GUI 子系统),否则运行会弹黑控制台")
+  endif()
+endif()
 
 # 构建树里 F5/双击即用:给本目录所有 Qt 可执行目标加 windeployqt POST_BUILD(不依赖 PATH)
 if(WIN32)

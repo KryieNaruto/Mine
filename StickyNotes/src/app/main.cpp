@@ -9,6 +9,7 @@
 #include "app/edge_dock_controller.h"
 #include "app/note_group.h"
 #include "app/note_window.h"
+#include "app/startup.h"
 #include "core/note_store.h"
 #include "core/persistence.h"
 
@@ -31,6 +32,7 @@ int main(int argc, char** argv) {
 
   NoteStore store;
   loadStore(store, kStorePath);
+  seedFirstRunNoteIfMissing(store, kStorePath); // 首启播种:开箱即有 ≥1 便签窗口
 
   QHash<QUuid, NoteWindow*> windows;
   auto createWindow = [&](QUuid id) {
