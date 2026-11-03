@@ -24,11 +24,21 @@
 |---|---|---|
 | **L0** | `device/` 设备与平台层 | ✅ **已完成** |
 | **L1** | `resources/` 资源层 + VMA 分页分配器 + ICommandList | ✅ **已完成**（20 用例全绿） |
-| L2 | scene / 渲染图 | ⬜ 未开始 |
-| L3 | primitives | ⬜ 未开始 |
+| **L2** | scene / 渲染图 / 命令流录制回放 | ✅ **已完成**（123 用例，1 例已知失败） |
+| **UI 消费层** | Presenter 状态机 / HUD / 输入路由 / 离屏出图 | ✅ **已完成**（3 张 golden） |
+| L3 | primitives（三角化=libtess2、布尔=Clipper2、OBJ=tinyobjloader） | ⬜ 未开始 |
 | L4 | features（玩法层，**唯一允许出现玩法名**的地方） | ⬜ 未开始 |
 
-L2 要开始时的第一件事：读 §7「给后续层的接口契约」，别重新发明抽象。
+> **定位裁定（R-1，2026-11-03）**：SDK 是 **"计算/几何库 + 离屏渲染器"**，上屏与控件 UI 移交
+> 平台壳层（Android SurfaceView + Compose）。已落地的 `ISwapchain` / `Presenter` /
+> `vulkan_swapchain_*` **一行未删**，降级为桌面调试与录制入口，R-2 可随时回滚。
+> 详见 `docs/superpowers/specs/2026-11-03-magicblocks-r1-positioning-ruling.md`。
+> 产品级出口 = 离屏 RGBA8：`magicblocks-ui-cli render --width 320 --height 240 --output x.png`
+> （无窗口、无显示服务，实测与 `tests/data/golden_ui.png` 逐字节一致）。
+> 门控：`python tools/check_offscreen_first.py`。
+
+L3 要开始时的第一件事：读 §7「给后续层的接口契约」，别重新发明抽象；
+计算类**先找已验证的三方库**（见 `docs/superpowers/specs/2026-11-03-magicblocks-compute-deps-selection.md`）。
 
 ---
 
