@@ -318,3 +318,47 @@ add_test(NAME magicblocks_cli_ui_present
 add_test(NAME magicblocks_cli_ui_bad_arg
   COMMAND magicblocks-ui-cli render --bogus 1)
 set_tests_properties(magicblocks_cli_ui_bad_arg PROPERTIES WILL_FAIL TRUE)
+
+# --- CLI 级 CTest:L2 场景层录制/回放/复现(spec §5 命令模式,plans-l2 §6.4) ---
+# `record` 同时产出命令流(--record,二进制)与离屏 PNG(--output)。
+# 后续三条用例都读这条流,因此用 FIXTURES 把它们排到 record 之后。
+set(MB_L2_STREAM "${MB_CLI_OUT}/l2_scene.mbl2")
+set(MB_L2_PNG "${MB_CLI_OUT}/l2_scene.png")
+
+add_test(NAME magicblocks_l2_record
+  COMMAND magicblocks-l2-cli record --scene demo --width 320 --height 240
+          --frame-index 0 --record ${MB_L2_STREAM} --output ${MB_L2_PNG})
+set_tests_properties(magicblocks_l2_record PROPERTIES FIXTURES_SETUP mb_l2_stream)
+
+add_test(NAME magicblocks_l2_replay_verify
+  COMMAND magicblocks-l2-cli replay --replay ${MB_L2_STREAM} --verify)
+set_tests_properties(magicblocks_l2_replay_verify PROPERTIES
+  FIXTURES_REQUIRED mb_l2_stream)
+
+add_test(NAME magicblocks_l2_reproduce_verify
+  COMMAND magicblocks-l2-cli reproduce --replay ${MB_L2_STREAM} --verify)
+set_tests_properties(magicblocks_l2_reproduce_verify PROPERTIES
+  FIXTURES_REQUIRED mb_l2_stream)
+
+# dump 必须给出稳定的 JSON(含 format_version / backend / hash)
+add_test(NAME magicblocks_l2_dump_json
+  COMMAND magicblocks-l2-cli dump --replay ${MB_L2_STREAM} --json)
+set_tests_properties(magicblocks_l2_dump_json PROPERTIES
+  FIXTURES_REQUIRED mb_l2_stream)
+
+# 读不存在的流 → 退出码 1(不是 0,也不是崩溃)
+add_test(NAME magicblocks_l2_replay_missing_cap
+  COMMAND magicblocks-l2-cli replay --replay ${MB_CLI_OUT}/does_not_exist.mbl2)
+set_tests_properties(magicblocks_l2_replay_missing_cap PROPERTIES
+  PASS_REGULAR_EXPRESSION "无法打开文件")
+
+# 玩法预设属 L4:L2 的 --scene 只认 demo,其它必须显式拒绝(退出码 2)
+add_test(NAME magicblocks_l2_scene_preset_rejected
+  COMMAND magicblocks-l2-cli record --scene voxel --output ${MB_CLI_OUT}/l2_voxel.png)
+set_tests_properties(magicblocks_l2_scene_preset_rejected PROPERTIES
+  PASS_REGULAR_EXPRESSION "L4")
+
+# 未知参数 → 退出码 2(不静默忽略)
+add_test(NAME magicblocks_l2_cli_bad_arg
+  COMMAND magicblocks-l2-cli record --bogus 1)
+set_tests_properties(magicblocks_l2_cli_bad_arg PROPERTIES WILL_FAIL TRUE)
