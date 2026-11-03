@@ -32,6 +32,8 @@ class TestFindAndroidSdk(unittest.TestCase):
         with mock.patch("os.path.expanduser", return_value=fake_home):
             os.environ.pop("ANDROID_HOME", None)
             os.environ.pop("ANDROID_SDK_ROOT", None)
+            # 本机(LOCALAPPDATA)若有真实 Android SDK 会按探测顺序抢先命中,隔离掉才能测到 home 分支
+            os.environ.pop("LOCALAPPDATA", None)
             self.assertEqual(android.find_android_sdk(), sdk)
 
     def test_user_deps_android_sdk_fallback(self):
@@ -43,6 +45,7 @@ class TestFindAndroidSdk(unittest.TestCase):
              mock.patch("os.environ.get", wraps=os.environ.get):
             os.environ.pop("ANDROID_HOME", None)
             os.environ.pop("ANDROID_SDK_ROOT", None)
+            os.environ.pop("LOCALAPPDATA", None)
             os.environ["USER_DEPS"] = deps
             self.assertEqual(android.find_android_sdk(), sdk)
 

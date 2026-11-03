@@ -52,3 +52,38 @@ libs:
     tag: "master"
     build: cmake
     options: [SWIFTSHADER_BUILD_TESTS=OFF, SWIFTSHADER_BUILD_HEADLESS=OFF, SWIFTSHADER_BUILD_VULKAN=ON]
+  vma:
+    repo: https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git
+    tag: "v3.5.0"
+    # VMA 官方只有 CMake 目标(vulkanmemoryallocator, INTERFACE 头文件库),没有 install() 规则,
+    # 由 cmake_driver._post_install_copy 把 src/vk_mem_alloc.h + LICENSE 拷进池前缀 —— 消费方
+    # 用 ${MINE_ROOT}/third_party/_install/vma-v3.5.0/<variant>/include/vk_mem_alloc.h 即可,
+    # 不依赖 find_package。header-only、无编译产物 → 不做 options 差异重编。
+    build: cmake
+    options: []
+  tinyobjloader:
+    repo: https://github.com/tinyobjloader/tinyobjloader.git
+    tag: "v1.0.7"
+    # OBJ 解析(计算方向,不自研)：官方为 CMake INTERFACE 头文件库 + 可选外部依赖。
+    # TINYOBJLOADER_USE_DOUBLE=OFF 固定 float 精度(默认即 float,显式声明防止环境差异)；
+    # 关掉其自带测试/示例,避免拉外网依赖。无 install() 规则 → 由 cmake_driver 的
+    # HEADER_ONLY_LIBS 拷 tiny_obj_loader.h + LICENSE 进池前缀。
+    build: cmake
+    options: [TINYOBJLOADER_USE_DOUBLE=OFF, TINYOBJLOADER_BUILD_TESTING=OFF]
+  clipper2:
+    repo: https://github.com/AngusJohnson/Clipper2.git
+    tag: "Clipper2_2.0.1/CPP"
+    # 2D 多边形布尔运算(并/差/交)：涂鸦笔画合并、印章外形裁切。实探最新 tag 为
+    # Clipper2_2.0.1(命名带前缀,不是裸版本号)。**tag 形如 "ref/subdir" 时,** 斜杠后为
+    # CMake 子目录(本库 CMakeLists 在 CPP/ 下)——由 manifest.split_tag 拆分。
+    # CLIPPER2_UTILS/EXAMPLES 关掉(它们依赖额外工具),只编核心 C++ 库。
+    build: cmake
+    options: [CLIPPER2_UTILS=OFF, CLIPPER2_EXAMPLES=OFF]
+  libtess2:
+    repo: https://github.com/memononen/libtess2.git
+    tag: "v1.0.2"
+    # 2D 轮廓带孔三角化(GL 官方 GLU tessellator 的重写版,处理自交/多孔稳健)：
+    # 魔法涂鸦挤出 + 印章底板轮廓都靠它。上游**没有 CMake**,只有 premake4.lua →
+    # build: source-objects(本仓 tools/deps_lib 里按 .c 清单直接编静态库并 install)。
+    build: source-objects
+    options: []

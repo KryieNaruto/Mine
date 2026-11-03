@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import os
 import sys
 
@@ -30,14 +31,16 @@ def topo_expand(libs: list, global_libs: dict) -> list:
         d = global_libs.get(name)
         if d is None:
             raise RuntimeError(f"依赖库 '{name}' 未在全局清单定义")
+        ref, sub = manifest.split_tag(d)
         lib = LibSpec(
             name=name,
             repo=d["repo"],
-            tag=str(d["tag"]),
+            tag=ref,
             build=d.get("build", "cmake"),
             options=d.get("options", []) or [],
             depends_on=d.get("depends_on", []) or [],
             windows_package=d.get("windows_package", "") or "",
+            cmake_subdir=sub or (d.get("cmake_subdir", "") or ""),
         )
         by_name[name] = lib
         return lib
@@ -129,6 +132,9 @@ def main(argv=None) -> int:
                 summary["skipped"].append(key)
                 continue
             print(f"编译 {manifest.ver_dir(lib.name, lib.tag)} [{v}] …", flush=True)
+            # 纯头文件库(如 VMA)从源码树拷头,需要知道池内源码目录
+            lib = dataclasses.replace(
+                lib, source_dir=pool.src_dir(MINE_ROOT, lib.name, lib.tag))
             ok, err = cmake_driver.build_lib(MINE_ROOT, lib, v, args.jobs)
             if ok:
                 summary["built"].append(key)

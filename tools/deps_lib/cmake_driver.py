@@ -52,6 +52,11 @@ def _built_prefixes(root: str, variant: str) -> list:
 
 def configure_command(root: str, lib: LibSpec, variant: str) -> list:
     src = pool.src_dir(root, lib.name, lib.tag)
+    # 部分仓库的 CMakeLists 不在根目录(如 Clipper2 的 CPP/ 子目录),按清单 CMake
+    # 子目录配置;标签为 "a/b" 形式时与库名里的 '/' 替换规则保持一致。
+    sub = (lib.cmake_subdir or "").strip("/")
+    if sub:
+        src = os.path.join(src, sub)
     bdir = pool.build_dir(root, lib.name, lib.tag, variant)
     idir = pool.install_dir(root, lib.name, lib.tag, variant)
     cmd = [
@@ -136,6 +141,85 @@ def _stream(cmd: list, tail_lines: int = 60, cwd: str | None = None) -> tuple:
     return rc == 0, "\n".join(tail).strip()
 
 
+# 纯头文件库:无编译产物,跳过 configure/build/install,由 _post_install_copy 把源码里的
+# 头文件直接拷进池前缀。值为「需要拷贝的相对路径」(目录则整棵拷)。
+HEADER_ONLY_LIBS = {
+    "vma": ["include/vk_mem_alloc.h", "LICENSE.txt"],
+}
+
+# 无 CMake 的纯 C 库(libtess2 只有 premake4.lua):
+# {"源文件": [...相对源码根], "头文件": [...], "库名": "libtess2"}
+SOURCE_OBJECT_LIBS = {
+    "libtess2": {
+        "sources": [
+            "Source/bucketalloc.c", "Source/dict.c", "Source/geom.c",
+            "Source/mesh.c", "Source/priorityq.c", "Source/sweep.c", "Source/tess.c",
+        ],
+        "headers": ["Include/tesselator.h"],
+        "lib": "tess2",
+    },
+}
+
+
+def _build_source_objects(root: str, lib: LibSpec, variant: str, jobs: int) -> tuple:
+    """按硬编码源文件清单编静态库(给没有 CMake 的 C 库用),再 install。
+
+    与 cmake 分支的落盘一致:`<idir>/include/*.h` + `<idir>/lib/<lib>.lib|.a`
+    + `<idir>/lib/cmake/<lib>/<lib>Config.cmake`(消费者用 find_package(<lib> CONFIG))。
+    """
+    src_root = pool.src_dir(root, lib.name, lib.tag)
+    spec = SOURCE_OBJECT_LIBS[lib.name]
+    bdir = pool.build_dir(root, lib.name, lib.tag, variant)
+    idir = pool.install_dir(root, lib.name, lib.tag, variant)
+    inc, libdir = os.path.join(idir, "include"), os.path.join(idir, "lib")
+    os.makedirs(inc, exist_ok=True)
+    os.makedirs(libdir, exist_ok=True)
+
+    cflags = ["/MD"] if variant.lower() == "release" else ["/MDd"]
+    if variant.lower() != "release":
+        cflags.append("/Zi")
+    else:
+        cflags.append("/O2")
+    objs = []
+    for rel in spec["sources"]:
+        src = os.path.join(src_root, rel)
+        if not os.path.isfile(src):
+            return False, f"source-objects: 源文件缺失 {src}"
+        obj = os.path.join(bdir, os.path.splitext(os.path.basename(src))[0] + ".obj")
+        cmd = ["cl", "/nologo", "/c", "/TC", *cflags,
+               "/I", os.path.join(src_root, "Include"),
+               "/I", os.path.join(src_root, "Source"), "/Fo" + obj, src]
+        ok, tail = _stream(cmd)
+        if not ok:
+            return False, f"source-objects 编译失败 {rel}:\n{tail}"
+        objs.append(obj)
+
+    libfile = os.path.join(libdir, spec["lib"] + ".lib")
+    ok, tail = _stream(["lib", "/nologo", "/OUT:" + libfile, *objs])
+    if not ok:
+        return False, f"source-objects 打包失败:\n{tail}"
+
+    for rel in spec["headers"]:
+        shutil.copy2(os.path.join(src_root, rel), inc)
+    lic = os.path.join(src_root, "LICENSE.txt")
+    if os.path.isfile(lic):
+        shutil.copy2(lic, idir)
+
+    cdir = os.path.join(libdir, "cmake", spec["lib"])
+    os.makedirs(cdir, exist_ok=True)
+    with open(os.path.join(cdir, spec["lib"] + "Config.cmake"), "w", encoding="utf-8") as f:
+        f.write(
+            f'# 由 Mine 工作区 tools/build-deps.py 生成:源码编译的 {spec["lib"]} 静态库\n'
+            'if(NOT TARGET ' + spec["lib"] + ')\n'
+            '  add_library(' + spec["lib"] + " STATIC IMPORTED)\n"
+            '  set_target_properties(' + spec["lib"] + " PROPERTIES\n"
+            '    IMPORTED_LOCATION "${CMAKE_CURRENT_LIST_DIR}/../../' + spec["lib"] + '.lib"\n'
+            '    INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_CURRENT_LIST_DIR}/../../include")\n'
+            'endif()\n'
+        )
+    return True, ""
+
+
 def build_lib(root: str, lib: LibSpec, variant: str, jobs: int) -> tuple:
     """configure + build + install,成功后写 .built。返回 (ok, err_log)。"""
     bdir = pool.build_dir(root, lib.name, lib.tag, variant)
@@ -144,11 +228,21 @@ def build_lib(root: str, lib: LibSpec, variant: str, jobs: int) -> tuple:
     os.makedirs(idir, exist_ok=True)
 
     key = f"{ver_dir(lib.name, lib.tag)} [{variant}]"
-    cmds = [
-        (f"configure {key}", configure_command(root, lib, variant)),
-        (f"build {key}", ["cmake", "--build", bdir, "-j", str(jobs)]),
-        (f"install {key}", ["cmake", "--install", bdir]),
-    ]
+    if lib.build == "source-objects":
+        print(f"---- source-objects {key}: 直接编译源文件", flush=True)
+        ok, err = _build_source_objects(root, lib, variant, jobs)
+        if not ok:
+            return False, err
+        cmds = []
+    elif lib.name in HEADER_ONLY_LIBS:
+        print(f"---- header-only {key}: 跳过 configure/build/install", flush=True)
+        cmds = []
+    else:
+        cmds = [
+            (f"configure {key}", configure_command(root, lib, variant)),
+            (f"build {key}", ["cmake", "--build", bdir, "-j", str(jobs)]),
+            (f"install {key}", ["cmake", "--install", bdir]),
+        ]
     for phase, cmd in cmds:
         print(f"---- {phase}: {' '.join(cmd)}", flush=True)
         ok, tail = _stream(cmd)
@@ -175,7 +269,12 @@ def _post_install_copy(lib: LibSpec, bdir: str, idir: str) -> tuple:
     构建树目录里,`cmake --install` 只装了 SPIRV-Tools。这里把 ICD 及同目录动态库
     拷进池安装前缀,使 `_install/<ver_dir>/<variant>/vk_swiftshader_icd.json` 可达
     (供 win-deps.sh / VK_ICD_FILENAMES 引用)。
+
+    VMA 官方只有 INTERFACE 目标、无 install() 规则 —— 头文件从源码树
+    `<repo>/src/vk_mem_alloc.h` 直接拷到 `_install/<ver_dir>/<variant>/include/`。
     """
+    if lib.name in HEADER_ONLY_LIBS:
+        return _copy_header_only(lib, idir)
     if lib.name != "swiftshader":
         return True, ""
     icd_dir = None
@@ -190,4 +289,24 @@ def _post_install_copy(lib: LibSpec, bdir: str, idir: str) -> tuple:
         src = os.path.join(icd_dir, fn)
         if os.path.isfile(src):
             shutil.copy2(src, os.path.join(idir, fn))
+    return True, ""
+
+
+def _copy_header_only(lib: LibSpec, idir: str) -> tuple:
+    """纯头文件库:从 pool 源码树拷指定文件/目录到安装前缀。
+
+    bdir 不可靠(纯头库的 build_dir 没建过),这里用 build_dir 的父级
+    `third_party/_build` 反推不可能 —— 直接靠 pool.src_dir(lib 的 root 在 CMakeLists
+    层不易拿到),改由调用方在 build_lib 里把源码目录传进来,故此处校验 src 存在。
+    """
+    if not lib.source_dir:
+        return False, f"{lib.name}: 纯头库缺少源码目录信息"
+    for rel in HEADER_ONLY_LIBS[lib.name]:
+        src = os.path.join(lib.source_dir, rel)
+        dst = os.path.join(idir, "include" if rel.endswith(".h") else "", os.path.basename(rel))
+        if rel.endswith(".h"):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+        if not os.path.exists(src):
+            return False, f"{lib.name}: 源码树缺少 {rel}（{src}）"
+        shutil.copy2(src, dst)
     return True, ""

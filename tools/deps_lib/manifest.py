@@ -16,10 +16,30 @@ class LibSpec:
     options: tuple = ()
     depends_on: tuple = ()
     windows_package: str = ""  # Windows 用 MSYS2 pacman 预编译包名;非空则 Windows 不源码编译
+    source_dir: str = ""  # 池内源码树绝对路径(build 阶段填充;纯头文件库拷头用)
+    cmake_subdir: str = ""  # CMakeLists 所在子目录(相对源码根;空=根目录,如 Clipper2 的 CPP)
 
     def __post_init__(self):
         object.__setattr__(self, "options", tuple(self.options or ()))
         object.__setattr__(self, "depends_on", tuple(self.depends_on or ()))
+
+
+def cmake_subdir_of(d: dict) -> str:
+    """清单里 cmake_subdir 或 tag 形如 'a/b' 时的子目录(如 'CPP'),否则空串。"""
+    sub = (d.get("cmake_subdir") or "").strip("/")
+    if sub:
+        return sub
+    tag = str(d.get("tag", ""))
+    return tag if "/" in tag else ""
+
+
+def split_tag(d: dict) -> tuple:
+    """tag 形如 'v1.2.3/CPP' 时,分隔出真 git ref 与子目录 → (ref, subdir)。"""
+    tag = str(d.get("tag", ""))
+    if "/" in tag:
+        ref, _, sub = tag.partition("/")
+        return ref, sub
+    return tag, ""
 
 
 def ver_dir(name: str, tag: str) -> str:
@@ -56,14 +76,16 @@ def resolve_libs(global_manifest: dict, use: list) -> list:
     out = []
     for name in use:
         d = libs[name]
+        ref, sub = split_tag(d)
         out.append(LibSpec(
             name=name,
             repo=d["repo"],
-            tag=str(d["tag"]),
+            tag=ref,
             build=d.get("build", "cmake"),
             options=d.get("options", []) or [],
             depends_on=d.get("depends_on", []) or [],
             windows_package=d.get("windows_package", "") or "",
+            cmake_subdir=sub or (d.get("cmake_subdir", "") or ""),
         ))
     return out
 
