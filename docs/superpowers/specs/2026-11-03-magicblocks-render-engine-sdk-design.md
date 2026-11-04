@@ -41,7 +41,7 @@
 ├────────────────────────────────────────────────────────────┤
 │ L4 features/    玩法组合层（每个功能 = L0–L3 通用调用的组合）    │
 ├────────────────────────────────────────────────────────────┤
-│ L3 primitives/  通用能力层（mesh factory / path fill / voxel    │
+│ L3 primitives/  通用能力层（mesh factory / path fill / block set   │
 │                 / picker / gizmo / overlay2d / pbr material）  │
 ├────────────────────────────────────────────────────────────┤
 │ L2 scene/       场景与渲染图（IScene / IRenderGraph /           │
@@ -74,7 +74,7 @@
 | 点击模型自动找空位（洪水） | `IPicker`（射线求交）+ 场景包围盒查询 + `IWorldGrid`（均匀网格占用查询） | 写放置搜索策略 |
 | 选中虚线无深度包围盒 / 操作 UI 跟随视角不缩放 | `IOverlay2D`（屏幕空间线、虚线、恒宽）+ `IGizmoSystem`（屏幕恒定尺寸 + 屏幕空间拾取） | 声明包围盒与轴 |
 | 透视、0,0,0 网格地面 | `ICamera`（正交/透视）、`IOverlay2D` | 配置 |
-| 体素内面渲染 / 关深度测 / 网格指示 / 颜色模式 / 层 | `IVoxelGrid` + 通用 `DepthState`（含 constant depth write）+ `IOverlay2D` | 组织笔刷逻辑 |
+| 叠叠乐内面渲染 / 关深度测 / 网格指示 / 颜色模式 / 层 / 整笔撤销 | `IBlockSet`（方块实例，按 `stroke_id` 整笔增删）+ `IBlockBrush`（扫掠求交）+ 通用 `DepthState`（含 constant depth write）+ `IOverlay2D` | 组织笔刷逻辑（**不用体素网格**，见 §4.1） |
 | 印章底板轮廓 / 印面深度突出五官 / 金属把手 | `IMeshFactory::FromOutline` + `IMaterial`(PBR/纯色) + 纹理双通道（颜色+深度） | 选择资源与参数 |
 
 **结论**：玩法之间共享的每一条需求都有对应通用接口；没有一条需求需要新增"玩法专用渲染分支"。
@@ -137,20 +137,47 @@
 
 ### L3 primitives —— 通用能力（覆盖所有需求）
 
+> **2026-11-04 修正（叠叠乐数据模型）**：原 `P7 IVoxelGrid`（稠密 chunk）**不是叠叠乐的正确数据模型**。
+> 叠叠乐的本质是"**一堆小方块沿画笔扫过的路径叠加**"，需要的是**方块实例集合 + 扫描求交**，
+> 而不是体素网格。体素化只是"OBJ 精模 → 方块"的**一次性预处理**，不是运行时数据结构。
+> 详见 §4.1。修正后 P7 → P7a/P7b/P7c，P6 也随之调整。
+
 | # | 接口 | 覆盖需求 |
 |---|---|---|
 | P1 | `IMeshFactory`：`Cube / Box / Cylinder / Cone / Sphere / Tetrahedron / Trapezoid / Prism`，参数化（尺寸、分段、封盖） | 积木基础模型 |
-| P2 | `IMeshFactory::FromOutline`：2D 轮廓（可带孔）→ 三角化 → 上下盖 + 侧壁挤出 | 涂鸦挤出、印章底板轮廓 |
-| P3 | `IMeshLoader::Obj`：`v/vt/f`（多边形三角化、缺法线重算），失败明确报错 | 积木导入 OBJ |
-| P4 | `IPicker`：屏幕 → 世界射线（正交/透视）；求交器 AABB / 三角面 / 平面 / 体素 DDA | 积木点选、叠叠乐刷子、印章落印 |
+| P2 | `IMeshFactory::FromOutline`：2D 轮廓（可带孔）→ 三角化 → 上下盖 + 侧壁挤出（libtess2） | 涂鸦挤出、印章底板轮廓 |
+| P3 | `IMeshLoader::Obj`：`v/vt/f`（多边形三角化、缺法线重算），失败明确报错（tinyobjloader） | 积木导入 OBJ |
+| P4 | `IPicker`：屏幕 → 世界射线（正交/透视）；求交器 AABB / 三角面 / 平面 / **方块实例** | 积木点选、叠叠乐刷子、印章落印 |
 | P5 | `IOverlay2D`：屏幕/像素空间线、虚线、描边、矩形（**屏幕恒宽**） | 积木虚线线框、叠叠乐网格指示 |
-| P6 | `IFillPath`：路径光栅化（线段 walk / 胶囊）、圆头笔刷、最近体素落笔（Bresenham） | 涂鸦笔画、叠叠乐笔刷 |
-| P7 | `IVoxelGrid`：稠密 chunk（≤ 32³）、单通道体素值、脏区增量重建、**面生成器可替换** | 叠叠乐；"任意形状" = 换面生成器 |
+| P6 | `IFillPath`：2D 路径光栅化（线段 walk / 胶囊）、圆头笔刷 → 输出**路径采样点集**（不再是"最近体素落笔"） | 涂鸦笔画、叠叠乐笔刷路径 |
+| **P7a** | **`IBlockSet`（原 `IVoxelGrid`）**：方块**实例列表**（`position/rotation/size/color/stroke_id`）；按 `stroke_id` 整笔增删、按 AABB 范围查询；**线性存储，非网格** | 叠叠乐主数据结构；撤销一笔 = O(n) 删整笔 |
+| **P7b** | **`IBlockBrush`**：画笔扫掠求解 —— 路径采样点 + 笔刷半径/层高 → 与已存在方块求交去重 → 批量 emit 新方块；**"格子"概念由调用方策略注入**（轴对齐网格 / 自由放置 / 模板） | 叠叠乐落笔；自动堆叠不穿模 |
+| **P7c** | **`IShapeTemplate`**："任意形状" = 一组方块实例（模板文件），不是体素网格；`IVoxelizer`（一次性）把 OBJ/网格 → 方块实例（**只在导入时用**） | 叠叠乐任意形状扩展点、OBJ 精模转方块 |
 | P8 | `IMaterial` / `PbrParams`：纯色 + 可选 PBR（metallic/roughness）、半球光近似 | 积木纯色、印章金属把手 |
 | P9 | `ICamera`：正交 + 透视（fovY / near / far / rev-Z 可选）、orbit/pan/zoom、屏幕↔世界 | 四个功能共用 |
 | P10 | `IWorldGrid`：均匀网格占用查询（洪水搜索空位） | 积木自动放置 |
 | P11 | `IGizmoSystem`：轴/环几何（实例化 + 程序化顶点）+ **屏幕恒定尺寸** + 跟随视角 + 屏幕空间拾取解算 | 积木移动/旋转/缩放 UI |
 | P12 | 通用状态：`DepthState{depthTest, depthWrite, depthOp, depthConstWrite}`，`CullState` | 叠叠乐"永远显示内面"= `depthTest=OFF + depthWrite=ON(depthConst=near)` + 背面可见 |
+| P13 | **可选** `ISpatialIndex`（BVH）：方块实例数量大时的占用查询加速；**不引入时 `IBlockSet` 线性扫描即可** | 叠叠乐大场景、积木大模型拾取 |
+
+#### 4.1 叠叠乐数据模型裁定（为什么放弃体素）
+
+| 需求 | 体素网格 | **方块实例集合（采纳）** |
+|---|---|---|
+| 一笔扫过路径叠一堆小方块 | ⚠️ 丢失方块身份 | ✅ 天然 |
+| **撤销一笔**（整笔消失） | ❌ 只能逐格改 | ✅ `erase_if(stroke_id)` |
+| 一笔一个颜色 | ⚠️ 靠逐格染色模拟 | ✅ `Block.color` |
+| 方块不贴轴对齐网格（描边/旋转笔） | ❌ 根本不行 | ✅ `position/rotation` 是浮点 |
+| 方块数 > 数万 | ❌ 内存与重建爆 | ✅ 10k 方块 ≈ 480 KB；体素同规模 16 MB+ |
+| 改一笔不动几何 | ❌ 需重编 chunk 面 | ✅ 只增删实例，零重编 |
+| **任意形状** | ❌ 只能是单位立方联合 | ✅ 换一个 `IShapeTemplate` |
+| **OBJ 精模转小方块** | ✅ **体素化唯一真正合适的场景** | ✅ 走一次性 `IVoxelizer`，输出**同一个 `IBlockSet`** |
+
+**结论**：体素是**输入侧的一次性预处理**（P7c 的 `IVoxelizer`），不是运行时数据结构。
+运行时只有 `IBlockSet`（存什么）+ `IBlockBrush`（怎么长）+ `IShapeTemplate`（长成什么形状）。
+
+> 待确认（见 §11 Q1）：方块"与网格对齐"是指**必须贴齐 0,0,0 网格**（有格子感），
+> 还是**尺寸统一但位置可自由**？这决定 `IBlockBrush` 的落点策略注入方式。
 
 ### L4 features —— 玩法组合（只用 L0–L3）
 
@@ -158,7 +185,7 @@
 |---|---|---|
 | F-SK 魔法涂鸦 | `IFillPath`（透明 2D 画布）→ `FromOutline` 挤出 → `ICamera` 正交/透视 | 2D 透明 → 3D 挤出面 |
 | F-BL 魔法积木 | `MeshFactory`/`Obj` → `ICamera` 透视 → `IPicker` 点选 → 实例化绘制；放置 = 包围盒 + `IWorldGrid` + 沿法线洪水搜索（`min.y ≥ 0`）；选中 = `IOverlay2D` 无深度虚线包围盒 + `IGizmoSystem` 屏幕恒定尺寸 | 积木 6 条（含 0,0,0 网格平面） |
-| F-VX 魔法叠叠乐 | `IVoxelGrid` + 内面渲染（只画朝相机的 3 个内侧面；`depthTest=OFF + depthWrite const`）+ `IOverlay2D` 网格；笔刷锁层；**颜色模式 = 写体素索引**，不重建几何 | 叠叠乐 6 条（含"体素任意形状"扩展点） |
+| F-VX 魔法叠叠乐 | `IFillPath` 采样笔刷路径 → `IBlockBrush` 扫掠求交 → `IBlockSet` 增删（按 `stroke_id` 整笔可撤销）→ **一次实例化 draw call**；内面渲染（只画朝相机的 3 个内侧面；`depthTest=OFF + depthWrite const`）+ `IOverlay2D` 网格；笔刷锁层；**颜色模式 = 改 `Block.color`**，不动几何；"任意形状" = `IShapeTemplate` | 叠叠乐 6 条（含任意形状扩展点） |
 | F-ST 印章 | 底板轮廓 `FromOutline` / 模板；印面 = 颜色 + 深度双贴图（透视下靠深度遮挡凸显五官）；把手 = `PbrParams` 金属 + 圆柱/圆台 | 印章 3 条 |
 | F-PN 捏捏乐 | 本轮不做（不建桩） | — |
 
@@ -246,7 +273,7 @@ IMemoryAllocator            ← L1 公共接口（SDK 不暴露 vkAllocateMemory
 | 深度 | D16 或 D24S8（按能力）；rev-Z 可选（为精度要求高的场景） |
 | 纹理 | 256 色动态色表（叠叠乐/印章）；可选 ASTC/ETC2 |
 | 面数 / drawcall | 单场景 ≤ 200k 三角面、≤ 300 drawcall（目标值，正确性优先） |
-| 帧时间 | 60 fps 目标；体素 chunk 增量重建（脏区） |
+| 帧时间 | 60 fps 目标；**叠叠乐方块改色/撤销笔迹只改实例列表，不重编任何几何**（方块实例 10k 级 ≈ 480 KB） |
 | 排序 | 统一在 L2 排序，透明按距离，tie-break 稳定 |
 | 同步 | 单队列单线程录制 |
 
@@ -267,6 +294,7 @@ IMemoryAllocator            ← L1 公共接口（SDK 不暴露 vkAllocateMemory
 | 多线程录制 / 多队列 / 异步计算 | 不做（单队列单线程） |
 | 模型格式 | 只 OBJ；glTF 后续再议 |
 | 捏捏乐 | 不做 |
+| **运行时体素网格** | **不做**（2026-11-04 修正）—— 叠叠乐用 `IBlockSet` 方块实例集合；体素化只作为 OBJ→方块的**一次性预处理**（`IVoxelizer`），不进入运行时数据结构 |
 | 每帧新建资源 | 允许但计入分配计数门槛（稳态帧必须 0） |
 | 纹理图集 / bindless | 本轮不做（后续在 `IMaterial` 层扩展） |
 | 动态分辨率 | 不做 |
@@ -277,7 +305,7 @@ IMemoryAllocator            ← L1 公共接口（SDK 不暴露 vkAllocateMemory
 2. **内存门槛**：稳态帧 VMA alloc/free = 0；页复用与子块合并单测通过；`vkAllocateMemory` 零裸调用。
 3. **CLI + 离屏出图**：四个功能各 ≥ 1 张 PNG（无头、无显示服务）。
 4. **命令模式**：录制 → 回放 → 复现，命令哈希与 PNG 一致（golden 固定）；序列化往返一致。
-5. **单元测试**：图元生成、轮廓挤出（含孔）、OBJ 解析、DDA 拾取、体素内面算法、gizmo 屏幕恒定尺寸、命令序列化往返、内存分页分配。
+5. **单元测试**：图元生成、轮廓挤出（含孔）、OBJ 解析、DDA 拾取、**方块扫掠求交（含撤销整笔）**、`IShapeTemplate` 实例化、gizmo 屏幕恒定尺寸、命令序列化往返、内存分页分配。
 6. **单一 golden**：Linux（lavapipe）+ Windows（SwiftShader）逐像素一致，不建分平台基线。
 
 ## 12. 本次改动清单（本轮已落地的部分）
@@ -300,6 +328,12 @@ IMemoryAllocator            ← L1 公共接口（SDK 不暴露 vkAllocateMemory
 
 1. **L0/L1 + Vulkan 后端 + VMA 分页分配器**（含 §7 门控脚本）
 2. **L2 场景 / 渲染图 / 命令录制回放**
-3. **L3 核心接口**（MeshFactory 图元、ICamera、IPicker、IOverlay2D）
+3. **L3 核心接口**（MeshFactory 图元、ICamera、IPicker、IOverlay2D、IBlockSet/IBlockBrush）
 4. **CLI + 离屏 golden + 三态命令校验**
 5. **依次组合玩法**：F-SK → F-VX → F-BL → F-ST
+
+## 14. 待确认
+
+| # | 问题 | 影响 |
+|---|---|---|
+| Q1 | **叠叠乐方块"与网格对齐"的确切含义**：必须贴齐 0,0,0 轴对齐网格（有格子感），还是尺寸统一但位置可自由？ | 决定 `IBlockBrush` 的落点策略（`SpecSnap` 到网格 / 自由浮点）；也决定 `IOverlay2D` 网格指示的画法 |
