@@ -167,7 +167,7 @@
 | 一笔扫过路径叠一堆小方块 | ⚠️ 丢失方块身份 | ✅ 天然 |
 | **撤销一笔**（整笔消失） | ❌ 只能逐格改 | ✅ `erase_if(stroke_id)` |
 | 一笔一个颜色 | ⚠️ 靠逐格染色模拟 | ✅ `Block.color` |
-| 方块不贴轴对齐网格（描边/旋转笔） | ❌ 根本不行 | ✅ `position/rotation` 是浮点 |
+| 改色不动几何 | ❌ 需重建 chunk | ✅ 改 4 字节 |
 | 方块数 > 数万 | ❌ 内存与重建爆 | ✅ 10k 方块 ≈ 480 KB；体素同规模 16 MB+ |
 | 改一笔不动几何 | ❌ 需重编 chunk 面 | ✅ 只增删实例，零重编 |
 | **任意形状** | ❌ 只能是单位立方联合 | ✅ 换一个 `IShapeTemplate` |
@@ -176,8 +176,10 @@
 **结论**：体素是**输入侧的一次性预处理**（P7c 的 `IVoxelizer`），不是运行时数据结构。
 运行时只有 `IBlockSet`（存什么）+ `IBlockBrush`（怎么长）+ `IShapeTemplate`（长成什么形状）。
 
-> 待确认（见 §11 Q1）：方块"与网格对齐"是指**必须贴齐 0,0,0 网格**（有格子感），
-> 还是**尺寸统一但位置可自由**？这决定 `IBlockBrush` 的落点策略注入方式。
+> **Q1 已裁定（2026-11-04，选 A）**：方块**必须贴齐 0,0,0 轴对齐网格**，尺寸统一，位置只能落在整格点上。
+> 实现上 `Block.cell` 用 **`int32[3]`** 格点索引而非浮点位置 —— 抗浮点漂移、命令流哈希稳定、省内存。
+> 落笔链路 = 射线 → 落笔层平面 → `floor((p-origin)/cell_size)` 格点吸附 → 3D 超覆盖 DDA 扫掠去重。
+> 详见 L3 设计 §6A。
 
 ### L4 features —— 玩法组合（只用 L0–L3）
 
@@ -185,7 +187,7 @@
 |---|---|---|
 | F-SK 魔法涂鸦 | `IFillPath`（透明 2D 画布）→ `FromOutline` 挤出 → `ICamera` 正交/透视 | 2D 透明 → 3D 挤出面 |
 | F-BL 魔法积木 | `MeshFactory`/`Obj` → `ICamera` 透视 → `IPicker` 点选 → 实例化绘制；放置 = 包围盒 + `IWorldGrid` + 沿法线洪水搜索（`min.y ≥ 0`）；选中 = `IOverlay2D` 无深度虚线包围盒 + `IGizmoSystem` 屏幕恒定尺寸 | 积木 6 条（含 0,0,0 网格平面） |
-| F-VX 魔法叠叠乐 | `IFillPath` 采样笔刷路径 → `IBlockBrush` 扫掠求交 → `IBlockSet` 增删（按 `stroke_id` 整笔可撤销）→ **一次实例化 draw call**；内面渲染（只画朝相机的 3 个内侧面；`depthTest=OFF + depthWrite const`）+ `IOverlay2D` 网格；笔刷锁层；**颜色模式 = 改 `Block.color`**，不动几何；"任意形状" = `IShapeTemplate` | 叠叠乐 6 条（含任意形状扩展点） |
+| F-VX 魔法叠叠乐 | `IBlockBrush`（射线 → 格点吸附 → 超覆盖扫掠）→ `IBlockSet` 增删（按 `stroke_id` 整笔可撤销）→ **2 次实例化 draw**（表面 + 内面 pass）；内面渲染（`depthTest=OFF + depthWrite const`）+ `IOverlay2D` 网格；笔刷锁层；**颜色模式 = 改 `Block.color`**，不动几何；"任意形状" = `IShapeTemplate`。**方块坐标 `int32 cell[3]`，贴齐 0,0,0 网格** | 叠叠乐 6 条（含任意形状扩展点） |
 | F-ST 印章 | 底板轮廓 `FromOutline` / 模板；印面 = 颜色 + 深度双贴图（透视下靠深度遮挡凸显五官）；把手 = `PbrParams` 金属 + 圆柱/圆台 | 印章 3 条 |
 | F-PN 捏捏乐 | 本轮不做（不建桩） | — |
 
@@ -334,6 +336,14 @@ IMemoryAllocator            ← L1 公共接口（SDK 不暴露 vkAllocateMemory
 
 ## 14. 待确认
 
-| # | 问题 | 影响 |
+| # | 问题 | 状态 |
 |---|---|---|
-| Q1 | **叠叠乐方块"与网格对齐"的确切含义**：必须贴齐 0,0,0 轴对齐网格（有格子感），还是尺寸统一但位置可自由？ | 决定 `IBlockBrush` 的落点策略（`SpecSnap` 到网格 / 自由浮点）；也决定 `IOverlay2D` 网格指示的画法 |
+| Q1 | 叠叠乐方块"与网格对齐"的确切含义 | ✅ **已裁定 2026-11-04：选 A** —— 必须贴齐 0,0,0 轴对齐网格，`Block.cell` 为 `int32[3]`，详见 §4.1 与 L3 设计 §6A |
+
+> **Q1 裁定（2026-11-04，用户选定方案 A）**：**两者都支持，策略注入** —— `IBlockBrush` 不内置落点规则，
+> 而是持有 `IPlacementPolicy`：`SnapToGrid`（贴齐 `grid_size` 整数倍，有格子感）与 `FreeFloat`
+> （`position/rotation` 全浮点，支持描边/旋转笔）两种实现，玩法在创建笔刷时选一个。
+> `IOverlay2D` 的网格指示因此也由同一个 policy 提供 `grid_size`，保证"看到的格子"与"落的格子"一致。
+>
+> 注:`IBlockSet` / `IBlockBrush` / `IShapeTemplate` 属 **L4 玩法层**（主 spec §4 P7a/P7b/P7c），
+> 不在 L3 primitives 范围内（用户 2026-11-04 明确：严格按 L3 需求，未列入 L3 的不做）。

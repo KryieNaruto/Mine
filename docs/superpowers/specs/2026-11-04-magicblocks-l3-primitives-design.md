@@ -1,4 +1,4 @@
-# 魔法功能预览 —— L3 primitives 设计（抽象 + 性能 + ECS/材质/Gizmo/命令流）
+﻿# 魔法功能预览 —— L3 primitives 设计（抽象 + 性能 + ECS/材质/Gizmo/命令流）
 
 日期：2026-11-04
 状态：设计定稿（第 1 版，承接 L0~L2 已落地）
@@ -327,10 +327,105 @@ InputEvent ──map──► StrokeEvent ──► IPainter::feed()
 - **不变量**：`painter.commands() == recorder 已录命令`（命令流是唯一真源）。
 
 ### 6.4 与 L4 的关系
-
 `IPainter` 只做"画在 2D 画布"。**挤出成 3D** 是 L4 的 `FromOutline` 组合。
 `IPainter::extract_outline()` 提供轮廓（`std::vector<std::vector<Vec2>>`，含孔），
 L4 拿它去 `IMeshFactory::FromOutline()`。这就把"涂鸦"变成"painter + mesh_factory 两步"。
+
+---
+
+## 6A. `IBlockBrush` —— 叠叠乐落笔（**格点吸附 = A 方案，2026-11-04 定**）
+
+> **用户裁定 Q1 = A**：方块**必须贴齐 0,0,0 轴对齐网格**，有格子感。
+> 尺寸统一，位置只能落在整格点上（不是"自由浮点位置"）。
+
+### 6A.1 数据模型（承接总 spec §4 P7a/P7b）
+
+叠叠乐**不用体素网格**，运行时是一个**方块实例列表**：
+
+```cpp
+struct Block {                       // 32 B，SOA 拆列存放（§4）
+  std::int32_t cell[3] = {0, 0, 0};  // ★ 整格坐标，不是 float —— A 方案的核心
+  std::uint32_t color = 0;           // 调色板下标（改色不动几何）
+  std::uint32_t stroke_id = 0;       // 来源笔迹：撤销一笔 = 按此整笔删除
+  std::uint32_t flags = 0;           // 层号 / 选中 / 临时
+};
+```
+
+**为什么 `cell` 是整数**：A 方案下"位置"本身就是格点索引，
+用 `int32` 存既省内存又天然**抗浮点漂移**（同一次点击永远落到同一格），
+并且命令流里是整数 → 哈希稳定（C-L3-a 的确定性要求）。
+
+坐标换算：`world = origin + cell * cell_size`（`origin`/`cell_size` 是场景常量，进快照）。
+
+### 6A.2 落笔链路（屏幕射线 → 格点 → 扫掠去重）
+
+```
+InputEvent(Down/Move)
+   │
+   ▼  ICamera::screen_to_ray()                      ← 复用 L3 已有能力，零新增
+   射线 ∩ 落笔平面（层高 y = layer * cell_size）       ← 层在 Down 时锁定，Move 期间不变
+   │
+   ▼  world → 格点：cell = floor((p - origin) / cell_size)   ← ★ A 方案的吸附点
+   │
+   ▼  从上一格到当前格走一遍 3D 超覆盖 DDA（Amanatides-Woo）
+       ├─ 逐格查 IBlockSet 是否已有方块
+       ├─ 有 → 跳过（不重复叠，也不叠两层）
+       └─ 无 → emit Block{cell, color, stroke_id}
+   │
+   ▼  批量追加进 IBlockSet（本帧一次 upload）
+```
+
+**关键点**：
+
+1. **格点吸附发生在射线求交之后**，所以"点哪落哪"的手感来自 `floor`，不来自浮点位置；
+2. **一笔的所有方块共享同一个 `stroke_id`** → 撤销整笔是 `erase_if(stroke_id)`，O(n)；
+3. **层在 `Down` 时锁定**（用户需求"层锁定"），`Move` 期间不会自动往上叠；
+4. **改色模式**只改 `Block.color`，**不动任何几何**（这是实例列表相对体素的直接收益）。
+
+### 6A.3 与"内面渲染"的关系（渲染策略，与存储无关）
+
+"永远显示 3 个内侧面"**不是数据模型的事**，是 `DepthState` + cull 的配置：
+
+```cpp
+// L1 已有能力，L3 只组合：
+DepthState{ depthTest = false,          // 关深度测试 → 穿透遮挡
+            depthWrite = true,
+            depthConstWrite = near,     // 写常量深度 → 稳定排序
+            depthOp = Always };
+CullState{ cull = None };               // 内表面可见
+```
+
+因为方块是**一次实例化 draw**（同一 `MeshRef(Cube)` + 每实例 `cell/color`），
+所以"内面"只是**换个深度状态重画一遍**，不需要重建任何网格。
+
+### 6A.4 渲染批次
+
+| 项 | 值 |
+|---|---|
+| drawcall | **2**（不透明面 + 内面 pass），与方块数无关 |
+| 每实例数据 | `cell`(12 B) + `color`(4 B) + transform 可省（用 `gl_InstanceIndex` 查表） |
+| 上传 | 只有**新增/改色的方块**进 staging 环，不是全量重传 |
+| 10k 方块 | 实例属性 ≈ 160 KB；与体素方案同规模的 16 MB+ 不可比 |
+
+### 6A.5 为什么"任意形状"仍然成立
+
+`IShapeTemplate` = 一组预先算好的 `Block` 列表（模板文件），加载即用；
+`IVoxelizer` 把 OBJ 精模一次性**体素化**成同一份 `Block` 列表（这里才用到体素 —— 输入预处理）。
+运行时数据结构始终只有 `IBlockSet`。
+
+---
+
+## 6B. 数据模型速查（一句话对比）
+
+| | 体素网格（**已否决**） | `IBlockSet` 实例列表（**采纳**） |
+|---|---|---|
+| 存什么 | 格子里有没有东西 | 每个方块的身份 |
+| 撤销一笔 | ❌ 逐格改 | ✅ `erase_if(stroke_id)` |
+| 一笔一色 | ⚠️ 逐格染色 | ✅ 天然 |
+| 改色 | ❌ 需重建 | ✅ 改 4 字节 |
+| 10k 规模内存 | 16 MB+ | 160~480 KB |
+| 任意形状 | ❌ 只能是单位立方联合 | ✅ 换模板 |
+| 体素化 | — | ✅ 仅 OBJ 导入时一次性用 |
 
 ---
 
@@ -717,7 +812,7 @@ L2 门控与既有 198 个 deps 测试**完全不受影响**。
 |---|---|---|---|---|---|---|---|
 | 魔法涂鸦 F-SK | 正交 | `StrokeComp` + `TransformComp` | `std::unlit`（顶点色） | ✅ 核心 | ✖ | ✖ | ✖ |
 | 魔法积木 F-BL | 透视（orbit） | `MeshRef(图元)` + `MaterialRef` + `Transform` + `GizmoTarget` | `std\pbr` / `std_unlit` | ✖ | ✅ 平移/旋转/缩放 | ✅ AABB/三角形 | ✅ 虚线框 + 0,0,0 网格 |
-| 魔法叠叠乐 F-VX | 透视（锁定） | `BlockSetComp`（L4 系统持有一组方块实例，见 R-2 修正） | `std_unlit` + `color_table` | ✅ 方块笔刷 | ✖ | ✅ 方块扫掠求交 | ✅ 网格指示 |
+| 魔法叠叠乐 F-VX | 透视（锁定） | `BlockSetComp`（方块实例列表 `Block{cell[3] int32, color, stroke_id}`，见 §6A 与 R-2 修正） | `std_unlit` + `color_table` | ✅ 方块笔刷（格点吸附） | ✖ | ✅ 方块扫掠求交 | ✅ 网格指示 |
 | 印章 F-ST | 俯视正交/透视 | `MeshRef(FromOutline)` + `MaterialRef(金属)` | `std_pbr`（metallic=0.9, rough=0.2） | ✖ | ✖ | ✅ 平面/三角形 | ✖ |
 
 > **R-2 裁定（2026-11-04 修正）**：总 spec 原 P7 的 `IVoxelGrid`（稠密 chunk + 可替换面生成器）
@@ -726,7 +821,9 @@ L2 门控与既有 198 个 deps 测试**完全不受影响**。
 >
 > 修正后：
 > - 叠叠乐运行时数据 = **`IBlockSet` 方块实例列表**（总 spec §4 P7a），不是体素网格；
-> - 落笔 = **`IBlockBrush` 扫掠求交**（P7b）：路径采样点 + 笔刷半径/层高 → 与已有方块去重 → 批量 emit；
+>   **方块坐标是 `int32 cell[3]` 整格索引**（Q1 裁定 A：必须贴齐 0,0,0 网格，见 §6A）；
+> - 落笔 = **`IBlockBrush` 扫掠求交**（P7b，详见 §6A.2）：射线 → 落笔层平面 → **格点吸附**
+>   → 3D 超覆盖 DDA 扫掠 → 与已有方块去重 → 批量 emit；
 > - 渲染 = **一次实例化 draw call**（同一 `MeshRef(图元)` + 每实例变换/颜色），
 >   "只画朝相机 3 个内侧面"靠 `DepthState{depthTest=false, depthWrite+const}` 实现，**与存储无关**；
 > - 体素化（`IVoxelizer`）只用于 **OBJ 精模 → 方块** 的**一次性**预处理，输出同样是 `IBlockSet`。
@@ -745,8 +842,9 @@ L2 门控与既有 198 个 deps 测试**完全不受影响**。
 | D-L3-4 | L3 合批器独立（`IBatchBuilder`），仍喂 `ISubmitQueue` 供断言 | 直接改 L2 | 不改 L2，门控与既有测试不受影响 |
 | D-L3-5 | L3 额外状态独立编码，不改 L2 二进制格式 | 升 L2 版本 | 避免破坏 198 个依赖测试与 l2 golden |
 | D-L3-6 | **叠叠乐用方块实例集合（`IBlockSet`），不用体素网格** | 稠密体素 chunk | 体素丢失方块身份、无法整笔撤销、不支持非轴对齐；10k 方块 ≈ 480 KB vs 体素 16 MB+（2026-11-04 修正原"体素归 L4"） |
-| D-L3-7 | 对象池暴露 `acquire/release`，不暴露 `new/delete` | 直接 `new` | 强制 0 分配热路径 |
-| D-L3-8 | `IWorld` 用 ECS 存储，`IScene` 是命令流权威快照 | 二者合一 | 单一真源进命令流 |
+| D-L3-7 | **叠叠乐方块坐标用 `int32 cell[3]` 格点索引**（Q1 = A 方案） | `float position[3]` 自由放置 | 用户定"必须贴齐 0,0,0 网格"；整数抗浮点漂移、命令流哈希稳定、省内存（2026-11-04 定） |
+| D-L3-8 | 对象池暴露 `acquire/release`，不暴露 `new/delete` | 直接 `new` | 强制 0 分配热路径 |
+| D-L3-9 | `IWorld` 用 ECS 存储，`IScene` 是命令流权威快照 | 二者合一 | 单一真源进命令流 |
 
 ---
 
