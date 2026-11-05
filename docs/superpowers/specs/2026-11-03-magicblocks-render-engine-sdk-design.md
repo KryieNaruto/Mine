@@ -1,7 +1,7 @@
 # 魔法功能预览 —— 渲染引擎 SDK 设计（MagicBlocks）
 
-日期：2026-11-03
-状态：设计定稿（第 4 轮，已就用户四条硬约束修订）
+日期：2026-11-03（2026-11-05 第 5 轮：追加 UI 绘制路线裁定）
+状态：设计定稿（第 5 轮，已就用户硬约束 + UI 合成方案一裁定修订）
 
 ## 1. 背景与目标
 
@@ -31,12 +31,32 @@
 | C5 | **以 SDK 出接口的方式布局**，不做专门专用，要通用覆盖 | §2、§4 |
 | C6 | **预留离屏与命令模式**，之后要能命令复现操作 | §5 |
 | C7 | **内存分配现在就设计**：VMA、大块分配 + 偏移小内存、避免频繁创建销毁 | §6 |
+| C8 | **UI 不自研，用现成框架**（Compose）；SDK 只做 3D 场景渲染 | §2.3、§9 |
+| C9 | **UI 合成采用方案一**（2026-11-05 用户最终裁定）：引擎输出 1、UI 输出 2，两者独立、由系统合成器合并 | §2.3、§5.5 |
+
+### 1.2 UI 与 3D 的分工（2026-11-05 追加）
+
+用户原话：「UI 必须用现成的，不然 UI 全都得自研」，随后最终裁定合成方案为**方案一**。
+
+> **一句话**：**SDK 画 3D，Compose 画控件，系统合成器合并。SDK 不参与 UI 绘制，也不参与最终合成。**
+
+这条裁定推翻了早期草案里「场景 + UI 同帧、同一 command list、单次 submit」的想法。
+调研依据见 [UI 绘制路线调研](2026-11-05-magicblocks-ui-rendering-route-research.md)。
 
 ## 2. 分层与接口布局（SDK 出接口方式）
 
 ```
 ┌────────────────────────────────────────────────────────────┐
-│ 应用层（魔法涂鸦 / 积木 / 叠叠乐 / 印章 —— SDK 的客户）        │
+│ 应用壳层（平台原生，SDK 之外）                                 │
+│   Android: FrameLayout                                       │
+│     ├─ [0] SurfaceView   ← SDK 渲染 3D 场景（输出 1）         │
+│     └─ [1] ComposeView   ← Compose 渲染控件（输出 2）         │
+│   iOS: root UIView                                           │
+│     ├─ [0] 原生 3D 视图 / CAMetalLayer（输出 1）               │
+│     └─ [1] ComposeUIViewController（输出 2）                  │
+│   ⟶ 两路输出由 SurfaceFlinger / CoreAnimation 独立合成上屏     │
+├────────────────────────────────────────────────────────────┤
+│ 玩法业务层（魔法涂鸦 / 积木 / 叠叠乐 / 印章 —— SDK 的客户）      │
 │   只 #include <magicblocks/...> 公共头，不碰任何后端类型        │
 ├────────────────────────────────────────────────────────────┤
 │ L4 features/    玩法组合层（每个功能 = L0–L3 通用调用的组合）    │
@@ -56,6 +76,9 @@
 │ backend/vulkan  唯一后端实现（Vk 类型只允许出现在这一层）        │
 │                 内部使用 VMA v3.5.0 做分页+偏移子分配           │
 └────────────────────────────────────────────────────────────┘
+
+※ SDK 的边界止于「把 3D 画面画进一个 Surface」。
+  UI 不在 SDK 内，合成也不在 SDK 内（方案一）。
 ```
 
 ### 2.1 依赖方向（单向）
@@ -79,6 +102,64 @@
 
 **结论**：玩法之间共享的每一条需求都有对应通用接口；没有一条需求需要新增"玩法专用渲染分支"。
 
+### 2.3 UI 合成方案一裁定（2026-11-05）
+
+#### 2.3.1 两个方案的差别
+
+| | **方案一（采纳）** | 方案二（否决） |
+|---|---|---|
+| 引擎输出 | 结果 1（3D 场景 → 一张 Surface） | 3D 场景 |
+| UI 输出 | 结果 2（Compose → 另一张 Surface） | UI 纹理（需导出为纹理） |
+| 合成者 | **系统合成器**（Android SurfaceFlinger / iOS CoreAnimation） | **引擎**（UI 纹理作为一次 draw 进引擎 pass） |
+| 每帧额外带宽 | **0**（系统合成器本就每帧合成所有 layer，且有专用硬件 DPU） | **+2 次全屏读写**（UI 写一次纹理 + 引擎采样一次） |
+| 3D/UI 帧率 | **完全解耦** | 强绑定，UI 静止时引擎仍要等/浪费一次合成 |
+| 复杂度 | 几十行（两个兄弟 view） | 数百行：`AHardwareBuffer` 导入 + `VK_EXT_external_memory_android_hardware_buffer` + 同步 + 色彩空间 |
+| iOS 可行性 | ✅ CMP 的 `UIKitView` 本身就是这个模型 | ❌ CMP 无公开 API 导出 `MTLTexture` |
+| 唯一优势 | — | 可对 UI+3D 做统一后处理 / UI 可被 3D 遮挡 / UI 可作为 3D 纹理 |
+
+#### 2.3.2 为什么选方案一
+
+1. **四个玩法的 UI 全是环绕式控件**（顶栏 / 底栏 / 调色板 / 工具面板），
+   **没有任何一个需要"被 3D 物体遮挡"**。
+2. **UI 必须永远可点** —— 若 3D 能盖住 UI，用户就点不到按钮，方案二反而引入 Z 序管理负担。
+3. **带宽与功耗更优**：现代 SoC 的显示控制器（DPU）合成多图层几乎不占 GPU；
+   方案二把便宜的事（硬件合成）交给 GPU 去做，是负优化。
+4. **延迟更低**：点按钮后 Compose 立即刷新自己的 Surface，不必等引擎下一帧。
+5. **符合 R1 裁定**：SDK 本就把上屏移交壳层，方案一是它的自然延伸。
+
+#### 2.3.3 架构落位
+
+```
+Android:  FrameLayout
+   ├─ [0] SurfaceView    ← SDK 渲染 3D（独立 Surface，独立 layer）
+   └─ [1] ComposeView    ← Compose 渲染控件（独立 Surface，透明背景）
+   触摸 → FrameLayout.dispatchTouchEvent
+          ├─ 命中 Compose 交互区 → 给 Compose
+          └─ 否则 → SurfaceView → JNI → SDK InputRouter
+
+iOS:  root UIView
+   ├─ [0] 原生 3D 视图（MoltenVK → CAMetalLayer）
+   └─ [1] ComposeUIViewController 的视图
+   注意 CMP 的 UIKitView 模型是「原生 view 插到 Compose 渲染之后 + DstAtop 挖洞」，
+   即原生 3D 层永远在 Compose 之下；Info.plist 必须带 CADisableMinimumFrameDurationOnPhone
+```
+
+#### 2.3.4 门控（新增）
+
+| 编号 | 门控 | 检查方式 |
+|---|---|---|
+| **UIG1** | **SDK 零 CPU 回读** | 静态扫描 `src/` 无 `vkCmdCopyImageToBuffer` 到 CPU / `vkMapMemory` 用于读像素；运行时计数必须为 0 |
+| **UIG2** | **SDK 不参与 UI 合成** | `include/magicblocks/**` 不得出现 `UI`/`Compose`/`Canvas`/`widget` 概念的接口；SDK 每帧只有**一次 submit**（自己的 3D 场景） |
+| **UIG3** | **3D 层不得进 Compose 渲染树** | 壳层代码评审：3D view 必须是 Compose 的**兄弟节点**，不得被 `AndroidView { SurfaceView }` 包进 Compose 树 |
+| **UIG4** | **禁止 TextureView** | 壳层静态扫描 `TextureView` 出现即失败（会多一次 GPU→GPU 拷贝） |
+
+#### 2.3.5 预留：未来若要方案二
+
+若将来真需要「UI 与 3D 统一后处理」，只需把 Compose 的输出换成一张纹理，
+SDK 侧增加一次 `draw`（`ICompositeSource` 抽象位），**架构不用改**。
+本轮**不实现**，只保留这个回滚点。
+
+
 ## 3. 硬性技术门控
 
 | 编号 | 门控 | 检查方式 |
@@ -88,6 +169,10 @@
 | G3 | 分层纯度 | L2+ 无 `Vk` 类型；backend 无玩法名；features 不直接构造 GPU 命令 |
 | G4 | 内存路径唯一 | `backend/` 外禁止 `vkAllocateMemory/vkFreeMemory`；`backend/` 内除 VMA 注入点外禁止裸分配 |
 | G5 | 单队列 | 不做多队列/异步计算/多线程录制 |
+| **UIG1** | **SDK 零 CPU 回读** | 静态扫描 + 运行时计数（上屏路径读回像素 = 0 次） |
+| **UIG2** | **SDK 不参与 UI 合成** | 公共头无 UI/Compose/Canvas 概念；每帧一次 submit |
+| **UIG3** | **3D 层不进 Compose 渲染树** | 壳层评审：必须是兄弟节点 |
+| **UIG4** | **禁止 TextureView** | 壳层静态扫描 |
 
 ## 4. 基础功能点清单（按层）
 
@@ -227,6 +312,35 @@ IRecorder::BeginFrame(frame_index, 输入事件) ──► CommandStream（可�
 - CLI：`magicblocks-cli --scene sketch|blocks|voxel|stamp --frame N --output out.png`；
   `--record cap.bin`、`--replay cap.bin --output out.png --verify`。
 
+### 5.5 上屏路径（方案一：两路独立输出）
+
+**上屏 = 把 3D 场景画进 Surface，然后交给系统合成器。UI 完全不在这个链路上。**
+
+```
+每帧（SDK 内部）：
+  acquire Surface image
+    → 场景 pass（L2 render graph）
+    → present
+  结束。没有 UI pass，没有 UI 纹理采样，没有 CPU 回读。
+
+系统合成器（SDK 之外）：
+  layer[0] = SDK 的 SurfaceView（3D）
+  layer[1] = Compose 的 Surface（控件，透明背景）
+  → SurfaceFlinger / CoreAnimation 合成上屏
+```
+
+| 项 | 值 |
+|---|---|
+| SDk 每帧 submit 次数 | **1** |
+| CPU 回读像素次数 | **0** |
+| 依赖 UI 纹理 | **否** |
+| 3D 与 UI 帧率 | **独立** |
+| 离屏入口 | 仅 CLI / golden / 录制回放使用（§5.4），与上屏互不影响 |
+
+> **与早期草案的区别**：早期写过「场景 pass + UI pass 都渲染到同一张 swapchain image，单次 submit」。
+> **该条已作废** —— UI 归 Compose，SDK 不画 UI。
+> SDK 的「单次 submit」含义变为：**SDK 自己那一帧（3D 场景）只提交一次**。
+
 ## 6. 内存分配设计（第 7 条约束的落地）
 
 ### 6.1 分层
@@ -278,14 +392,26 @@ IMemoryAllocator            ← L1 公共接口（SDK 不暴露 vkAllocateMemory
 | 帧时间 | 60 fps 目标；**叠叠乐方块改色/撤销笔迹只改实例列表，不重编任何几何**（方块实例 10k 级 ≈ 480 KB） |
 | 排序 | 统一在 L2 排序，透明按距离，tie-break 稳定 |
 | 同步 | 单队列单线程录制 |
+| **UI 合成** | **方案一**：3D 与 UI 两路独立输出，系统合成器合并；SDK 不算 UI 带宽 |
+| **UI 控件预算** | Compose `graphicsLayer` 调用点 ≤ 20；禁止 `Modifier.blur`；禁止每帧改文本 |
 
 ## 9. 平台策略
 
 | 平台 | 本轮 | 后续 |
 |---|---|---|
-| Android | Vulkan 后端 + `ANativeWindow` + 生命周期 | Gradle 工程（`type: as` 模板） |
+| Android | Vulkan 后端 + `ANativeWindow` + 生命周期；**壳层用 `FrameLayout` + `SurfaceView`(3D) + `ComposeView`(UI) 兄弟节点** | Gradle 工程（`type: as` 模板） |
 | 桌面（Windows/Linux） | Vulkan + GLFW（CI、CLI、golden） | — |
-| iOS | **只做设计考虑**：surface 抽象不依赖 Android 专属概念；`BackendType::Vulkan` 走 MoltenVK 时`IRenderTarget`/`ISwapchain` 不出现平台宏 | 搭 iOS 工程、验证 MoltenVK |
+| iOS | **只做设计考虑**：surface 抽象不依赖 Android 专属概念；`BackendType::Vulkan` 走 MoltenVK 时`IRenderTarget`/`ISwapchain` 不出现平台宏。**UI 用 CMP，3D 层必须落在 Compose 之下**（CMP 的 `UIKitView` 模型），`Info.plist` 需 `CADisableMinimumFrameDurationOnPhone` | 搭 iOS 工程、验证 MoltenVK |
+
+### 9.1 UI 框架选型（方案一的配套）
+
+| 项 | 决定 |
+|---|---|
+| UI 框架 | **Compose**（Android 原生）/ **Compose Multiplatform**（iOS）。不自研 UI |
+| UI 的内容 | 顶栏、底栏、调色板、工具面板、层数控制 —— **一律是环绕式控件** |
+| 3D 之上的浮层 | 由 **SDK 的 `IOverlay2D`** 在 3D 层内画（虚线框、网格、gizmo），**不经过 Compose** |
+| 为什么浮层走 SDK | (1) 必须跟手实时更新，不能等 Compose 重组；(2) **iOS 上 3D 层在 Compose 之下**，浮层必须由 3D 层自己画，否则 Z 序无解 |
+| 状态更新 | 滑块/选色等高频状态必须用 `derivedStateOf` 收窄失效范围，禁止整树重组 |
 
 ## 10. 边界情况与明确不做
 
@@ -300,6 +426,9 @@ IMemoryAllocator            ← L1 公共接口（SDK 不暴露 vkAllocateMemory
 | 每帧新建资源 | 允许但计入分配计数门槛（稳态帧必须 0） |
 | 纹理图集 / bindless | 本轮不做（后续在 `IMaterial` 层扩展） |
 | 动态分辨率 | 不做 |
+| **UI 绘制 / UI 合成** | **不做**（方案一）—— UI 归 Compose；合成归系统合成器（SurfaceFlinger / CoreAnimation） |
+| **UI 纹理导出** | **不做** —— 那是方案二的做法，已否决（§2.3） |
+| **整体后处理（对 UI+3D 统一）** | **不做** —— 方案一无法对 UI 层做后处理；如将来需要，走 §2.3.5 的回滚点 |
 
 ## 11. 验收门（实现阶段，对齐 build-pipeline SKILL）
 
@@ -309,6 +438,10 @@ IMemoryAllocator            ← L1 公共接口（SDK 不暴露 vkAllocateMemory
 4. **命令模式**：录制 → 回放 → 复现，命令哈希与 PNG 一致（golden 固定）；序列化往返一致。
 5. **单元测试**：图元生成、轮廓挤出（含孔）、OBJ 解析、DDA 拾取、**方块扫掠求交（含撤销整笔）**、`IShapeTemplate` 实例化、gizmo 屏幕恒定尺寸、命令序列化往返、内存分页分配。
 6. **单一 golden**：Linux（lavapipe）+ Windows（SwiftShader）逐像素一致，不建分平台基线。
+7. **UI 合成门控（方案一）**：UIG1–UIG4 四条零违规；SDK 每帧 submit 次数 = 1；CPU 回读 = 0；
+   壳层 3D view 与 Compose view 为兄弟节点；无 `TextureView`。
+8. **UI 性能门**：Compose `graphicsLayer` 调用点 ≤ 20；拖动滑块时不重组整棵控件树；
+   iOS `Info.plist` 含 `CADisableMinimumFrameDurationOnPhone`。
 
 ## 12. 本次改动清单（本轮已落地的部分）
 
@@ -339,11 +472,18 @@ IMemoryAllocator            ← L1 公共接口（SDK 不暴露 vkAllocateMemory
 | # | 问题 | 状态 |
 |---|---|---|
 | Q1 | 叠叠乐方块"与网格对齐"的确切含义 | ✅ **已裁定 2026-11-04：选 A** —— 必须贴齐 0,0,0 轴对齐网格，`Block.cell` 为 `int32[3]`，详见 §4.1 与 L3 设计 §6A |
+| Q2 | UI 绘制路线 | ✅ **已裁定 2026-11-05：用现成框架（Compose），不自研** —— 见 §1.2、C8 |
+| Q3 | UI 与 3D 的合成方式 | ✅ **已裁定 2026-11-05：方案一** —— 引擎输出结果 1、UI 输出结果 2，两者独立、由系统合成器合并；见 §2.3 |
+| Q4 | 是否需要「UI 被 3D 遮挡」「UI 作为 3D 纹理」 | ⏸ **已按"不需要"设计**（四个玩法均为环绕式控件）。若将来需要，走 §2.3.5 回滚点 |
 
-> **Q1 裁定（2026-11-04，用户选定方案 A）**：**两者都支持，策略注入** —— `IBlockBrush` 不内置落点规则，
-> 而是持有 `IPlacementPolicy`：`SnapToGrid`（贴齐 `grid_size` 整数倍，有格子感）与 `FreeFloat`
-> （`position/rotation` 全浮点，支持描边/旋转笔）两种实现，玩法在创建笔刷时选一个。
-> `IOverlay2D` 的网格指示因此也由同一个 policy 提供 `grid_size`，保证"看到的格子"与"落的格子"一致。
+> **Q1 裁定（2026-11-04，用户最终定：方案 A = 格点吸附）**：叠叠乐方块**必须贴齐 0,0,0 轴对齐网格**，
+> 尺寸统一，位置只能落在整格点上。`Block.cell` 用 **`std::int32_t[3]` 整格坐标**（不是 float）：
+> 既省内存，又天然抗浮点漂移（同一次点击永远落到同一格），并且命令流里是整数 → 哈希稳定。
+> 换算 `world = origin + cell * cell_size`，`origin`/`cell_size` 是场景常量、进快照。
+> **不做** `FreeFloat`（自由浮点放置）与 `IPlacementPolicy` 策略注入 —— 那是多策略抽象，
+> 本次按 A 收敛，保持接口最小。`IOverlay2D` 的网格指示直接用 `cell_size`，
+> 保证"看到的格子"= "落的格子"。实现细节见
+> [L3 primitives 设计](2026-11-04-magicblocks-l3-primitives-design.md) §6A。
 >
 > 注:`IBlockSet` / `IBlockBrush` / `IShapeTemplate` 属 **L4 玩法层**（主 spec §4 P7a/P7b/P7c），
 > 不在 L3 primitives 范围内（用户 2026-11-04 明确：严格按 L3 需求，未列入 L3 的不做）。
