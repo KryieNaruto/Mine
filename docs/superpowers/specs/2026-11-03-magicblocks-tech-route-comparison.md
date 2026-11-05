@@ -31,8 +31,8 @@
 | 图形后端 | 自研 RHI 抽象 + **Vulkan** 单后端（GLES/Metal 不做，留接口） |
 | 内存 | **VMA v3.5.0**，大页 + 偏移子分配 |
 | 几何着色器 | **硬禁**，用实例化 + VS 参数表替代 |
-| 上屏 | **场景 + UI 直接渲染进 swapchain image**，零 CPU 回读 |
-| UI | 即时模式自绘进 Vulkan |
+| 上屏 | **3D 场景直接渲染进 swapchain image**，零 CPU 回读；present 给系统合成器 |
+| UI | **Compose（现成框架，不自研）**；UI 与 3D **两路独立输出，由系统合成器合并**（方案一，2026-11-05 裁定） |
 | 命令模式 | 录制 / 回放 / 复现，命令流可序列化 |
 
 ## 2. 路线维度与候选方案总览
@@ -40,7 +40,7 @@
 | 维度 | 路线 A（现选） | 路线 B | 路线 C | 路线 D | 路线 E（**本次新增：安卓侧现成方案**） |
 |---|---|---|---|---|---|
 | 渲染引擎 | 自研 RHI + Vulkan | 现成引擎（Filament / Ogre-Next / Diligent） | 跨后端封装（bgfx / sokol） | 引擎内嵌材质层（无） | **安卓现成 3D 库/框架（SceneView、AnKi、kool、korender、Magnum…）** |
-| UI 绘制 | 即时模式自绘进 Vulkan | 平台原生控件 | Dear ImGui / Nuklear / NanoVG | Qt/Cocos 等引擎内 UI | **Jetpack Compose / 原生 View + Filament** |
+| UI 绘制 | Compose（Android）/ CMP（iOS）—— **2026-11-05 裁定：不自研 UI** | 平台原生控件 | Dear ImGui / Nuklear / NanoVG | Qt/Cocos 等引擎内 UI | **Jetpack Compose / 原生 View + Filament** |
 | 上屏 | 直接渲 swapchain（C 方案） | 离屏再 blit | 平台合成层叠加 | — | **由第三方库/系统 SurfaceFlinger 接管** |
 | 内存 | VMA 分页偏移 | 每资源独立分配 | 引擎自带池 | 无显式管理 | **库自带分配策略（不可控）** |
 | iOS | 设计考虑，本轮不做 | MoltenVK 直接支持 | 切 Metal 后端 | OpenGL ES | **SceneView 已支持 SwiftUI + RealityKit（苹果官方路线）** |
@@ -128,43 +128,50 @@
    但"上层 UI 用现成方案（SceneView/Compose）"和"底层 SDK 自研"可以拆开，
    上一版把二者捆在一起是错的。
 3. **官方 Android Vulkan 样例已归档**，说明"NDK + `ANativeWindow` + 自建 surface"这条路
-   不是安卓主流——主流是 **SurfaceView/Compose 里嵌 Filament**。所以我们的 Android 壳层
+   不是安卓主流——主流是 **SurfaceView/Compose 里嵌 3D 渲染器**。所以我们的 Android 壳层
    （NativeActivity vs SurfaceView + JNI）必须重新权衡，不能默认 NativeActivity。
+   > **2026-11-05 已据此裁定**：Android 壳层 = `Activity` + `FrameLayout` +
+   > `SurfaceView`(3D) + `ComposeView`(UI)，见 §9.4 与
+   > [SDK 设计大纲 §2.3](2026-11-03-magicblocks-render-engine-sdk-design.md)。
 
 ## 4. UI 绘制路线（重点对比：上屏代价）
 
 > 用户明确：**SDK 不是瓶颈，瓶颈在上屏，一旦拷贝到 CPU 帧率断崖**。所以 UI 路线必须按"上屏代价"排序。
+>
+> **⚠️ 2026-11-05 重大修订**：用户裁定 **UI 必须用现成框架（Compose），不自研**，
+> 且合成采用**方案一**（两路独立输出由系统合成器合并）。
+> 本节原先的「A. 即时模式自绘进 Vulkan」**已作废**。
+> 详细论证见 [UI 绘制路线调研](2026-11-05-magicblocks-ui-rendering-route-research.md)。
 
-| 路线 | 上屏路径 | 额外合成次数 | CPU 往返 | CPU 修改为 Vulkan | 结论 |
-|---|---|---|---|---|---|
-| **A. 即时模式自绘进 Vulkan**（现选） | 场景 + UI → 同一 swapchain image | **0** | **无** | 是 | ✅ 主路径 |
-| B. 平台原生控件（Android View / iOS UIView） | 原生视图层叠加在 SurfaceView 上 → 系统 SurfaceFlinger/合成器**再合成一次** | **1 次系统合成** | 无 | 否 | ⚠️ 省开发但要吃合成开销，且两套 |
-| C1. **Dear ImGui** | 第三方 Vulkan backend，每帧写顶点/索引到 GPU buffer，画进当前 render pass | 0 | 无（除字体图集一次性的上传） | 是 | ✅ **最接近现选的现成方案**，见 §9.1 |
-| C2. Nuklear | 纯 CPU 几何生成 + 自定义后端绘制（需自己写 Vulkan 后端） | 0 | 无 | 需要自己接线 | ⚠️ 后端要自写，收益不如 ImGui |
-| C3. NanoVG | 矢量 2D 渲染器（GL/GLES 后端为主；无官方 Vulkan 后端） | 0 | 需要移植 | 需大量移植 | ❌ 移动 Vulkan 不友好 |
-| D. Qt / Cocos 等引擎内 UI | 随引擎走 | 0~1 | 视引擎 | 否 | ❌ 平台/引擎绑定过重 |
+| 路线 | 上屏路径 | 额外合成次数 | CPU 往返 | 结论 |
+|---|---|---|---|---|
+| ~~A. 即时模式自绘进 Vulkan~~ | 场景 + UI → 同一 swapchain image | 0 | 无 | ❌ **作废**（用户要求不自研 UI） |
+| **B. Compose + SurfaceView 兄弟节点**（**现选，方案一**） | 3D → SurfaceView；UI → ComposeView；两路独立，SurfaceFlinger 合成 | **0 次 app 内合成**（系统 DPU 硬件合成，几乎不占 GPU） | 无 | ✅ **主路径** |
+| ~~B'. 自研控件进 Vulkan~~（原 A 的对立面） | — | — | — | ❌ 已否决 |
+| C1. Dear ImGui | 第三方 Vulkan backend，画进当前 render pass | 0 | 无 | ⚠️ **降级为桌面调试/CLI 可选**，不上移动端 |
+| C2. Nuklear | 纯 CPU 几何 + 自写 Vulkan 后端 | 0 | 无 | ❌ 移动端不适用 |
+| C3. NanoVG | 矢量 2D 渲染器（无官方 Vulkan 后端） | 0 | 需移植 | ❌ 移动 Vulkan 不友好 |
+| D. Qt / Cocos 等引擎内 UI | 随引擎走 | 0~1 | 视引擎 | ❌ 绑定过重 |
 
-**ImGui 的额外价值（对本项目）**
+**对原「B. 平台原生控件吃合成开销」结论的更正**：
 
-- 工作区 `EasyPainter` **已 vendor 了 ImGui**（`vendor/imgui` + `imgui_impl_glfw` + `imgui_impl_vulkan`），已有先例；
-- 有成熟的 `imgui_impl_vulkan` 后端（含动态顶点缓冲、按帧 fence）；
-- 调参面板/性能统计这类"开发者 UI"用它几乎零成本；
-- **风险**：默认实现会**每帧重建/扩容顶点缓冲**（与"稳态帧 VMA 分配 = 0"门槛冲突），
-  需改成预分配固定大小、按帧环形复用，并接管字体图集（一次上传）。
-  这块工作量不大但**必须显式改造**，否则性能门槛过不去。
+上一版把"系统合成一次"记作**代价**。这个判断**是错的**：
 
-**结论**：主路径保持"自绘最小即时模式控件"；**把 Dear ImGui 作为可选 UI 后端**（`IOverlay2D`
-的上层实现之一，允许 demo 期先用它把 UI 搭出来，再按性能门槛替换/裁剪），
-并在实现计划里明确"ImGui 顶点缓冲必须预分配复用"。
+1. 现代 SoC 的显示控制器（DPU）合成多图层**几乎不占 GPU**，是专门的硬件通路；
+2. 如果不走系统合成，就得把 UI 纹理采样进引擎 pass —— 那反而**每帧多 2 次全屏读写**；
+3. 系统合成让 3D 与 UI 的**帧率完全解耦**，互不拖累。
+
+**更正后结论**：**B（Compose + SurfaceView）是上屏代价最低的路线**，不是"省开发但吃开销"。
 
 ## 5. 上屏路线对比（核心瓶颈）
 
 | 方案 | 链路 | 额外 copy | CPU 往返 | 延迟 | 结论 |
 |---|---|---|---|---|---|
-| **A. 直接渲 swapchain**（现选） | 场景 pass → UI pass → present | 0 | 无 | 1 submit | ✅ |
+| **A. 3D 直接渲 swapchain**（现选） | 场景 pass → present（**不含 UI**） | 0 | 无 | 1 submit | ✅ |
 | B. 离屏 → blit → swapchain | 场景 pass → 离屏 image → vkCmdBlitImage → swapchain | **1 次全屏 copy** | 无 | 1 submit | ⚠️ 仅离屏测试/录制 |
 | C. CPU 回读再贴 | 回读 → map → CPU 合成 → 上传 | 0 | **有（致命）** | +1~2 帧 | ❌ 硬禁 |
-| D. 平台合成层（SurfaceView 上层放原生控件） | GPU 渲染 → 系统合成器叠加原生 View | 0（在系统合成器里） | 无 | +1 合成轮 | ⚠️ 见 §4 B |
+| **D. 两路独立输出，系统合成**（**现选，方案一**） | 3D → SurfaceView；UI → ComposeView；SurfaceFlinger 合成 | **0** | 无 | 各 1 帧，互不等待 | ✅ **主路径** |
+| E. UI 纹理进引擎 pass（方案二） | Compose → AHardwareBuffer → 引擎采样混合 | **+2 次全屏读写** | 无 | UI 需等引擎帧 | ❌ 已否决 |
 
 **补充对比：present mode**（`IRenderTarget`/Presenter 的参数）
 
@@ -247,18 +254,20 @@
 
 ## 9. 关键分歧点与建议
 
-### 9.1 UI：自绘 vs Dear ImGui
+### 9.1 UI：Compose vs 自绘 vs Dear ImGui（**2026-11-05 重写**）
 
-| | 自绘最小控件 | Dear ImGui |
-|---|---|---|
-| 开发量 | 大（命中测试、布局、动画全自写） | 极小（HUD 半天出雏形） |
-| 上屏代价 | 0 额外合成 | 0 额外合成 |
-| 与"稳态帧 0 分配"门槛 | 天然满足 | **必须改造**：顶点缓冲预分配 + 环形复用、字体图集一次性上传 |
-| 与命令复现 | 需自建 UI 命令记录 | ImGui 每帧产出顶点/索引 → 可当作一条命令录制，**反而更容易复现** |
-| 长线 | 完全可控 | 控件风格/布局受限，但 demo 够用 |
+| | **Compose**（现选） | 自绘最小控件 | Dear ImGui |
+|---|---|---|---|
+| 用户裁定 | ✅ **必须用现成框架** | ❌ 已否决 | ❌ 不上移动端 |
+| 开发量 | 小（布局/命中/动画/无障碍全自带） | 大（全自写） | 极小 |
+| 上屏代价 | **0 次 app 内合成**（系统 DPU 硬件合成） | 0 | 0 |
+| 与 SDK 的关系 | **完全解耦**：两路独立输出 | 需 SDK 内画 UI | 需 SDK 内画 UI |
+| 帧率耦合 | **无** | 强耦合（同帧同 image） | 强耦合 |
+| 与"稳态帧 0 分配"门槛 | **不影响 SDK**（各自独立） | 需自建 UI 零分配 | **必须改造**顶点缓冲 |
+| 长线 | 平台官方，生态最优 | 完全可控但成本高 | 适合开发者面板 |
+| 适用 | **移动端主路径** | — | **桌面调试 / CLI 性能面板** |
 
-**建议**：**demo 期直接用 ImGui 出 UI**，同时把"顶点缓冲预分配复用 + 字体图集静态"作为
-硬性改造项写进实现计划；如果后续 UI 复杂度超出 ImGui 舒适区，再在其上层收敛接口。
+**建议**：移动端 **Compose**；桌面调试面板可用 Dear ImGui（不影响移动端架构）。
 
 ### 9.2 引擎底座：自研 vs Filament
 
@@ -271,21 +280,23 @@
 
 ### 9.3 上屏：直接 swapchain vs 离屏
 
-上屏必须是直接渲染进 swapchain（A 方案）。离屏只保留给 CLI/golden/录制回放。
+上屏必须是直接渲染进 swapchain（A 方案，**只画 3D**）。离屏只保留给 CLI/golden/录制回放。
 **需要回写到 SDK 设计 §5.4**：`IRenderTarget` 区分 `TargetMode::Swapchain / Offscreen`。
 
-### 9.4 安卓壳层：NativeActivity vs SurfaceView + JNI（**§3.4 新增**）
+### 9.4 安卓壳层：NativeActivity vs SurfaceView + Compose（**2026-11-05 更新**）
 
-| | NativeActivity + `ANativeWindow` | SurfaceView/Compose + JNI |
+| | NativeActivity + `ANativeWindow` | **SurfaceView + Compose（现选）** |
 |---|---|---|
 | 参考实现 | `googlesamples/android-vulkan-tutorials`（**已归档**） | SceneView（主流）、Filament 官方 Android 集成 |
 | 主流程度 | 低（官方样例已归档） | **高**（安卓生态实际做法） |
-| UI 集成 | 需自绘全部控件 | 可混用原生控件/Compose（但见 §4：多一次系统合成） |
-| 性能 | 最直接、延迟最低 | 多一层 View 体系，但 SurfaceView 走独立合成层，通常可控 |
-| 本项目（自绘 UI 进 Vulkan） | ✅ 最匹配 | ⚠️ 只在需要原生控件时才需要 |
+| UI 集成 | 需自绘全部控件（**已否决**） | **Compose 原生控件** |
+| 性能 | 最直接 | SurfaceView 是独立 layer，**系统合成零 app 内开销**；Compose 独立刷新 |
+| 帧率解耦 | 无 UI，谈不上解耦 | **3D 与 UI 两条独立管线** |
+| 本项目结论 | ❌ | ✅ **采纳（方案一）** |
 
-**建议**：保持 NativeActivity + `ANativeWindow`（与自绘 UI 一致、延迟最低），**但把壳层代码
-与引擎解耦**（`IRenderTarget` 已抽象），以便后续若要混入原生控件可切 SurfaceView。
+**建议**：**`Activity` + `FrameLayout` + `SurfaceView`(3D) + `ComposeView`(UI) 兄弟节点**。
+3D 视图**不得**被 `AndroidView` 包进 Compose 树（UIG3）。
+壳层与引擎通过 `IRenderTarget` 已抽象，SDK 不感知平台。
 
 ## 10. 风险与验证清单
 
@@ -307,7 +318,8 @@
 1. **池内无 tag 库**：是否允许在 `deps.yaml` 增加 `commit` 字段（给 bgfx/sokol/stb 这类库用）？
 2. **iOS 路线（§3.4.6 发现）**：iOS 阶段走 **MoltenVK（复用 Vulkan 后端）** 还是 **原生 Metal/RealityKit
    （跟随 SceneView 的主流组合）**？这决定 RHI 是否必须提前预留 Metal 后端。
-3. **安卓壳层具体形态**：Jetpack Compose 组合（推荐）还是 View 体系（§12）。
+3. ~~**安卓壳层具体形态**：Jetpack Compose 组合（推荐）还是 View 体系（§12）。~~
+   → ✅ **2026-11-05 已裁定**：`FrameLayout` + `SurfaceView`(3D) + `ComposeView`(UI) 兄弟节点，见 §9.4。
 
 ## 12. 安卓消费层：必须使用现成方案（已拍板）
 
@@ -324,7 +336,7 @@ UI 消费层（Router / HUD / 输入仲裁 / 性能面板 / 状态存储）**不
 |---|---|---|---|---|
 | **SceneView** `sceneview/sceneview` | ⭐1,356 · Apache-2.0 · Kotlin · `v4.65.0` · 2026-11-02 | **Jetpack Compose + SwiftUI** 声明式 | Android = **Filament + ARCore**；Apple = RealityKit + ARKit | ✅ **首选**：唯一同时覆盖 Android/iOS/Desktop 的 Compose 声明式 3D SDK |
 | Sceneform Maintained | ⭐673 · **archived** | View 体系 | Filament | ❌ 归档 |
-| 直接 Compose + SurfaceView + 自研桥 | — | Compose | 自研 Vulkan | ⚠️ UI 现成，但**场景侧要自己接 Surface** |
+| 直接 Compose + SurfaceView + 自研桥 | — | Compose | 自研 Vulkan | ✅ **2026-11-05 采纳为方案一** —— UI 现成（Compose），3D 自研 Vulkan 接 SurfaceView，两路独立由系统合成器合并 |
 | kool-engine | ⭐594 · Apache-2.0 · Kotlin | 引擎内嵌 UI | Vulkan/WebGPU/GL | ⚠️ 技术栈可参考，非 Compose 原生 |
 
 ### 12.3 对已定稿设计的影响（**这是本版最重要的结论**）

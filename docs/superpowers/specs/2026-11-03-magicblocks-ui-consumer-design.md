@@ -1,77 +1,119 @@
 # 魔法功能预览 —— UI 消费层设计（MagicBlocks UI Consumer）
 
-日期：2026-11-03
-状态：设计第 1 版（用户已确认方向：UI 消费层是后续所有功能模块的**唯一入口**；demo 但**性能优先**）
+日期：2026-11-03（2026-11-05 第 2 版：全面对齐**方案一**）
+状态：设计第 2 版（用户已确认：UI 用现成框架不自研；合成采用方案一）
+
+> **第 2 版改动摘要**：第 1 版的「自绘即时模式 UI 画进 Vulkan、场景与 UI 同帧同 swapchain image」
+> **整条作废**。现版本：**SDK 只渲染 3D，Compose 渲染控件，两路独立输出由系统合成器合成**。
+> 依据：[SDK 设计大纲 §2.3](2026-11-03-magicblocks-render-engine-sdk-design.md) §2.3、
+> [UI 绘制路线调研](2026-11-05-magicblocks-ui-rendering-route-research.md)。
 
 ## 1. 背景与定位
 
 上一轮已定稿 SDK 渲染核心：[渲染引擎 SDK 设计](2026-11-03-magicblocks-render-engine-sdk-design.md)。
 
-本轮设计 **UI 消费层（UI Consumer Layer）**。定位明确：
+本轮设计 **UI 消费层（UI Consumer Layer）**。定位：
 
 > UI 消费层是**之后的几个功能模块（涂鸦 / 积木 / 叠叠乐 / 印章）的唯一入口**。
-> 它是 SDK 的**第一个使用者**，展示"SDK 该怎么被消费"，本身不实现任何玩法渲染，
-> 只做：布局、输入、功能路由、性能治理。
+> 它是 SDK 的**第一个使用者**，展示"SDK 该怎么被消费"，本身不实现任何玩法渲染。
+> 它做四件事：**壳层组装、功能路由、输入仲裁、性能治理**。
+> 它**不做** UI 控件绘制（归 Compose），**不做**最终合成（归系统合成器）。
 
 ### 1.1 用户已确认的约束
 
 | # | 约束 | 本文档落地章节 |
 |---|---|---|
-| U1 | UI 消费层是后续几个功能模块的**统一入口** | §2、§4 |
-| U2 | demo 但**性能优先**，SDK 不是瓶颈，**瓶颈在于"上屏"** | §3、§5、§6 |
+| U1 | UI 消费层是后续几个功能模块的**统一入口** | §4 |
+| U2 | demo 但**性能优先**，SDK 不是瓶颈，**瓶颈在于"上屏"** | §3、§6 |
 | U3 | **一旦拷贝到 CPU 就会大大降低帧率** → 上屏链路必须零 CPU 回读 | §5 |
-| U4 | 沿用已有平台/后端约束：Android + iOS（本轮 Android）、RHI + Vulkan、无 GS | §7 |
+| U4 | 沿用已有平台/后端约束：Android + iOS（本轮 Android）、RHI + Vulkan、无 GS | §8 |
+| **U5** | **UI 不自研，必须用现成框架**（Compose） | §3.2、§8 |
+| **U6** | **合成采用方案一**：引擎输出结果 1、UI 输出结果 2，两者独立由系统合成器合并 | §3.2、§5 |
 
-## 2. 分层与职责
+## 2. 分层与职责（第 2 版）
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  App Shell（平台薄壳：Activity / NativeActivity / 桌面 GLFW）    │
-│  职责：窗口创建、surface 生命周期、系统返回键、低内存回调          │
+│  App Shell（平台原生薄壳）                                     │
+│   Android: Activity + FrameLayout                            │
+│     ├─ [0] SurfaceView   ← SDK 渲染 3D（输出 1）              │
+│     └─ [1] ComposeView   ← Compose 渲染控件（输出 2）          │
+│   iOS:     UIViewController + root UIView（本轮不实现）         │
+│   职责：窗口创建、surface 生命周期、系统返回键、低内存回调        │
 ├─────────────────────────────────────────────────────────────┤
 │  UI Consumer Layer（本文档）                                   │
-│   ├─ Router        功能路由：当前玩法、进入/退出、状态保存          │
-│   ├─ HUD           界面控件（按钮/面板/调色/层数/工具切换）          │
-│   ├─ InputRouter   触摸事件 → 相机 / 工具 / UI 命中，优先级仲裁      │
-│   ├─ Presenter     上屏链路（本文档核心，§5）                     │
-│   └─ PerfGovernor  帧预算、降级、统计（§6）                       │
+│   ├─ Router        功能路由：当前玩法、进入/退出、状态保存        │
+│   ├─ InputArbiter  触摸事件仲裁：Compose 命中 还是 3D 场景       │
+│   ├─ FeatureBridge SDK 桥接：Surface 生命周期、帧驱动、JNI 输入   │
+│   └─ PerfGovernor  帧预算、统计、降级（§6）                     │
+│   ※ 没有 HUD 层：控件归 Compose                               │
+│   ※ 没有 Presenter 合成层：合成归系统合成器                     │
 ├─────────────────────────────────────────────────────────────┤
-│  MagicBlocks SDK（渲染核心，上一轮定稿）                          │
+│  MagicBlocks SDK（渲染核心，上一轮定稿）                        │
 │   L4 features · L3 primitives · L2 scene · L1 resources · L0 device │
-│   backend/vulkan + VMA 分页分配                                 │
+│   backend/vulkan + VMA 分页分配                                │
+│   边界：把 3D 场景画进一个 Surface，然后 present               │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**铁律**：UI 消费层只调用 SDK **公共头**（`include/magicblocks/...`），与 SDK 内部共享
-"同一帧、同一 CommandList、同一次 submit"，**绝不另开第二条上屏路径**。
+**铁律（第 2 版）**：
+
+1. UI 控件**只由 Compose 绘制**，SDK 与 UI 消费层都不画控件。
+2. 3D 视图与 Compose 视图是**兄弟节点**，3D 视图**不得**被 `AndroidView` 包进 Compose 树（UIG3）。
+3. **合成发生在 SDK 之外**（SurfaceFlinger），SDK 每帧只提交自己的 3D 场景（UIG2）。
+4. UI 消费层只调用 SDK **公共头**（`include/magicblocks/...`），不碰后端类型。
 
 ## 3. 上屏瓶颈分析（为什么性能点在这里）
 
-"上屏"= 一帧图像从 GPU 合成完成 → 呈现到屏幕。移动端链路：
+### 3.1 移动端上屏链路（方案一）
 
 ```
-[场景渲染] ─► [UI 合成] ─► [上屏 present]
-   场景 pass     HUD 绘制      swapchain image
+App（app 进程）
+  ├─ [3D 线程] SDK: acquire Surface → 场景 pass → present ─┐
+  └─ [UI 线程] Compose: 测量/布局/绘制 → RenderNode → 自绘 ─┤
+                                                            ▼
+系统合成器（SurfaceFlinger / CoreAnimation）              ← 合成点
+  layer[0] = 3D Surface
+  layer[1] = Compose Surface（透明背景）
+       │
+       ▼
+    屏幕
 ```
 
-三种可能的实现方式与代价：
+**关键的认知转变**：第 1 版认为"性能瓶颈在 app 内的合成（场景 pass + UI pass 同一张 image）"。
+方案一下，**app 内根本没有合成这一步**——合成在 SurfaceFlinger，由**显示控制器硬件（DPU）**完成，
+几乎不占 GPU。所以：
 
-| 方案 | 链路 | 代价 | 结论 |
+> **方案一把"合成"这个瓶颈从 GPU 上拿走了。** 剩下的瓶颈只有两个：
+> ① SDK 的 3D 渲染本身；② Compose 的重组与 GPU 层数。
+
+### 3.2 各条"错误路径"的代价（第 2 版重写）
+
+| 路径 | 链路 | 代价 | 结论 |
 |---|---|---|---|
-| **A. CPU 回读再贴**（典型错误做法） | RenderTarget → `vkCmdCopyImageToBuffer` → map → CPU 修改像素 / CPU 画 UI → 再上传 / 再画 | **每帧一次 GPU→CPU 同步 + 带宽 + 迟滞一到两帧**，帧率断崖 | ❌ 禁止 |
-| **B. 离屏 target + blit 上屏** | 场景 → 离屏 image → blit/copy → swapchain image | 一次全屏 copy，无 CPU 往返；带宽可控 | ⚠️ 仅在需要"离屏语义"（golden/录制）时使用 |
-| **C. 直接渲染进 swapchain image**（推荐） | 场景 pass + UI pass 都渲染到同一张 swapchain image | 零 copy、零 CPU 往返、延迟最低 | ✅ 主路径 |
+| **A. CPU 回读** | RenderTarget → `vkCmdCopyImageToBuffer` → map → CPU 处理 → 再上传 | 每帧 GPU→CPU 同步 + 带宽 + 迟滞 1–2 帧 | ❌ **硬禁止**（U3） |
+| **B. 离屏 + blit 上屏** | 场景 → 离屏 image → copy → swapchain | 一次全屏 copy | ⚠️ 仅 CLI/golden/录制回放使用 |
+| **C. 场景直接渲进 swapchain** | 一次 submit，present 给 SurfaceFlinger | 零 copy、零回读 | ✅ **SDK 主路径**（注意：**只有 3D，没有 UI pass**） |
+| **D. UI 纹理进引擎 pass**（方案二） | Compose → `AHardwareBuffer` → 引擎采样混合 | 每帧多 2 次全屏带宽 + 帧率强耦合 + 数百行导入代码 | ❌ **已否决**（§2.3） |
+| **E. `TextureView`** | 3D 渲染 → 纹理回传 → View 系统绘制 | 多一次 GPU→GPU 拷贝 + 延迟 | ❌ **禁止**（UIG4） |
 
-**关键结论**：主路径必须是 **C —— 场景与 UI 同帧直接渲染进 swapchain image**。
-离屏（方案 B）只用于 CI/golden/命令录制回放这类"不需要上屏"的场景。
+**关键结论**：SDK 主路径是 **C**，但 **C 的范围缩小了——只画 3D 场景**。
+UI 完全不在这张 image 上，也不在 SDK 的任何 pass 上。
 
-> 这直接推翻"先离屏、再贴图"作为运行时主路径的思路：那个范式在桌面 CI 里是正确的，
-> 但作为**上屏主路径**会多一次全屏 copy 和一次额外同步。运行时要区分
-> `TargetMode::Swapchain`（上屏）与 `TargetMode::Offscreen`（测试/录制）。
+### 3.3 延迟账（方案一）
+
+| 操作 | 路径 | 延迟 |
+|---|---|---|
+| 拖动模型 / 画笔 | 触摸 → SDK InputRouter → 下一帧 3D present | **1 帧**（不受 Compose 影响） |
+| 点按钮 | 触摸 → Compose 重组 → Compose present | **1 帧**（不受 SDK 影响） |
+| 3D 与 UI 互相等待 | — | **无**（两条独立管线） |
+
+> 这是方案一相对第 1 版设计最大的收益：**两条管线彻底解耦**，
+> 任意一方慢都不会拖累另一方。
 
 ## 4. 功能模块入口（Router）
 
-UI 消费层提供**唯一入口**——功能切换只经过 Router，功能模块不互相感知。
+功能切换只经过 Router，功能模块不互相感知。
 
 ```
 HomeScreen ──(选择玩法)──► FeatureHost(Sketch | Blocks | Voxel | Stamp)
@@ -85,128 +127,194 @@ HomeScreen ──(选择玩法)──► FeatureHost(Sketch | Blocks | Voxel | S
 | `IFeatureHost` | 特性生命周期：`OnEnter / OnExit / OnUpdate(dt) / OnInput(InputEvent)`；只依赖 SDK 的 `IScene`、`IInputEvent`、`IRenderFeature` |
 | `IStateStore` | 退出时保存场景状态（节点树、工具参数、相机位姿），重进恢复；**存内存为主，落盘异步** |
 
-本轮只建立 **HomeScreen 入口 + 空 FeatureHost 骨架**（四个玩法仍是 SDK 层之后的组合阶段），
-但**入口结构、输入路由、上屏链路必须先定型**，否则后面每个玩法都要各自复制一套上屏逻辑。
+**UI 与 Router 的关系（第 2 版）**：Router 的状态（当前玩法、是否可撤销、工具参数）
+通过 **Compose 的状态对象**暴露给控件层。这意味着一份 `FeatureUiState`：
 
-## 5. Presenter —— 上屏链路设计（本文档核心）
+- `FeatureHost` 写入（场景侧）；
+- Compose 读取并渲染控件；
+- **跨线程边界只传不可变快照**，不允许把 SDK 对象直接塞进 Compose 状态。
 
-### 5.1 目标
+## 5. 输入仲裁（InputArbiter，取代第 1 版的 InputRouter）
 
-| # | 目标 |
+### 5.1 仲裁模型
+
+触摸事件必须**在平台层就分流**，因为 Compose 和 SurfaceView 是两个独立窗口。
+
+```
+MotionEvent 到 FrameLayout.dispatchTouchEvent
+   │
+   ├─ ① 命中 Compose 交互区？（按钮 / 滑块 / 色板 / 面板）
+   │      是 ──► 交给 ComposeView，事件结束
+   │
+   └─ ② 否则 ──► 交给 SurfaceView
+                  └─ 触摸坐标（减去 SurfaceView 偏移）→ JNI → SDK InputEvent
+```
+
+**为什么必须在这里分流**：Compose 有自己完整的命中测试与手势系统（触控 slop、嵌套滚动、长按）。
+如果让 SDK 抢在前面处理，Compose 的按钮就点不动；如果让 Compose 处理全部，
+SDK 就拿不到绘制手势。**两个系统各有各的手势语义，只能在边界上做一个明确的裁决。**
+
+### 5.2 分流规则
+
+| 规则 | 说明 |
 |---|---|
-| P1 | **零 CPU 回读**：每帧不得出现任何 `vkCmdCopyImageToBuffer` / `map` 读回 swapchain 或离屏图像 |
-| P2 | **零额外全屏 copy**：主路径场景 + UI 直接渲染进 swapchain image |
-| P3 | **单次 submit**：场景 pass、UI pass、上屏都在同一 CommandBuffer 内 |
-| P4 | **低延迟**：present mode 可切 MAILBOX（无垂直同步等待），默认 FIFO 保稳 |
-| P5 | **不卡 UI**：UI 线程不做 GPU 同步等待，帧栅栏最多滞后 N=2 帧 |
+| **R-1 显式区域优先** | Compose 侧控件的**实际布局矩形**是唯一的判定依据，不用"猜" |
+| **R-2 默认归 3D** | 空白区域一律归 3D 场景，保证"所见即所画" |
+| **R-3 一次手势不跨界** | `DOWN` 落在哪边，整个手势就归哪边直到 `UP`（避免画到一半被面板抢走） |
+| **R-4 手势识别留在 SDK** | 单指拖 / 双指缩 / 长按拾取由 SDK 的 `InputEvent` 统一识别，**不在每个玩法里重复** |
+| **R-5 事件双写命令流** | 原始事件同时喂 `InputEvent` 队列，供命令复现（SDK §5）回放 |
 
-### 5.2 帧结构（主路径）
-
-```
-Frame n:
- 1. Wait Fence(n)               ← 复用两帧前资源，不阻塞当前
- 2. Acquire swapchain image
- 3. Record into cmd(n):
-      [Pass 1  Scene]  渲染各玩法内容（深度测试开，清深度）
-      [Pass 2  UI]     HUD + 覆盖层，深度测试关，加载/清除后叠加
-      （End rendering → image layout PRESENT）
- 4. Submit(cmd) + signal semaphore
- 5. Present(image, semaphore)
- 6. Advance 帧索引（N=2 ring）
-```
-
-**UI 与场景同帧同 image** 意味着：UI 不会因为"离屏再合成"而额外滞后一帧，
-点击 → 反馈的延迟 = 1 次 submit + 1 次 present。
-
-### 5.3 渲染图融合
-
-SDK 的 `IRenderGraph` 支持把 **UI pass 作为图的最后一个 pass**，附件 = swapchain image（`LoadOp::Load`），
-这样：
-
-- 图裁剪可自动去掉被遮挡的 pass；
-- 命令录制（§上一轮的 `CommandStream`）天然把"场景 + UI"一起录进同一帧，复现时 UI 也在；
-- 不新增 SDK 层的东西，UI pass 只是 `IRenderFeature` 的又一个注册项。
-
-### 5.4 禁止事项（渲染层硬约束）
+### 5.3 禁止事项（交互层硬约束）
 
 | 禁止 | 原因 |
 |---|---|
-| CPU 读回任何渲染结果用于 UI | 用户明确指出的帧率杀手 |
-| `vkQueueWaitIdle` / `vkDeviceWaitIdle` 每帧调用 | 直接串行化 GPU/CPU |
-| `map()` 非 coherent 内存每帧读写 | 带宽与同步开销 |
-| staging buffer 参与上屏路径 | 只在资源上传时使用 |
-| 每帧创建/销毁 swapchain 或 render pass | 走缓存，旋转时才重建 |
-| UI 单独一次 submit | 额外同步点 |
+| 让 SDK 处理本该 Compose 消费的事件 | 按钮点不动 |
+| 用"屏幕上半屏归 UI"这类区域猜测 | 面板布局会变，必然错位 |
+| 让 Compose 的长按/双击跨到 3D 区 | 手势语义冲突 |
+| 每帧轮询 UI 状态决定事件归属 | 状态滞后一帧 |
 
-### 5.5 离屏路径（测试/录制专用）
-
-`TargetMode::Offscreen`：场景 + UI 渲染到离屏 image → `save_png`。
-仅用于 CLI/CI/golden/命令回放，**上屏路径不经过它**。
-两者共用同一 `IRenderTarget` 抽象，只是目标不同；`Presenter` 内部按 mode 分流。
+> **注意**：`R-1` 的"实际布局矩形"由 Compose 通过回调上报（`onGloballyPositioned`）
+> 或由壳层直接 `View.getGlobalVisibleRect` 取，**不缓存跨帧**。
 
 ## 6. 性能治理（PerfGovernor）
 
+方案一下，性能治理分成**两条互不干扰的轨道**：
+
+### 6.1 3D 轨道（SDK 侧）
+
 | # | 机制 | 说明 |
 |---|---|---|
-| G1 | **帧预算** | 每帧预算 16.6ms（60fps），分桶：场景渲染 / UI / present；超预算记录 |
-| G2 | **降级策略**（明确档位，不静默） | L0 全质量 → L1 关 MSAA → L2 UI 简化（去阴影/去动画）→ L3 降低场景分辨率（仅离屏路径可做） |
-| G3 | **UI 合批** | HUD 图元按纹理/管线合批；每帧 UI drawcall 上限（如 ≤ 50）与顶点上限 |
-| G4 | **字体/图集** | 字体图集一次上传、静态；不每帧重传 |
-| G5 | **立即模式 UI 的零分配** | 每帧 UI 顶点/索引写入预分配的大 buffer（VMA 分页偏移），**稳态帧 VMA alloc/free = 0**（与 SDK §6 M5 门槛一致） |
-| G6 | **输入到显示延迟** | 统计并暴露 `input→present` 帧数（目标 ≤ 2 帧） |
-| G7 | **切后台** | surface 销毁时暂停 present，保留 CPU 侧状态，避免唤醒时黑屏 |
-| G8 | **统计面板** | 帧时间、GPU 时间（能力支持时）、drawcall、VMA 分配计数、present 队列长度 |
+| G1 | **帧预算** | 3D 帧预算独立计算；超预算记录并触发降级 |
+| G2 | **降级档位**（明确，不静默） | L0 全质量 → L1 关 MSAA → L2 降低特效 → L3 降低离屏分辨率 |
+| G3 | **drawcall 上限** | 单场景 ≤ 300 drawcall（对齐 SDK §8） |
+| G4 | **稳态零分配** | 稳态帧 VMA alloc/free = 0（SDK M5 门槛） |
+| G5 | **切后台** | surface 销毁时暂停 present，保留 CPU 侧状态，避免唤醒时黑屏 |
+| G6 | **3D 浮层走 SDK** | 虚线选框 / 网格 / gizmo 由 `IOverlay2D` 在 3D 层内画，**不经过 Compose**（§8.2） |
 
-## 7. 输入路由（InputRouter）
+### 6.2 UI 轨道（Compose 侧）
 
-同一批触摸事件要分给三处，必须显式仲裁顺序：
-
-```
-TouchEvent
-   │
-   ├─ ① HUD 命中？（按钮/面板）── 是 ─► 消费，不再下发
-   ├─ ② 工具激活？（笔刷画/盖章）── 是 ─► 交给当前特性
-   └─ ③ 相机/场景交互（旋转/缩放/拾取）── 交给 ICamera / IPicker
-```
-
-- 手势识别（单指拖 / 双指缩 / 长按拾取）在 UI 层统一做，**不在每个玩法里重复**；
-- 所有事件同时喂给 `InputEvent` 队列，供命令复现（上一轮 §5）回放；
-- **输入到命令的一致性**：记录的是"已解析的手势结果 + 原始事件"，复现时优先用手势结果。
-
-## 8. 平台与 UI 框架选型
-
-| 项 | 决策 | 理由 |
+| # | 机制 | 说明 |
 |---|---|---|
-| UI 绘制方式 | **即时模式 UI 直接画进 Vulkan**（不走平台原生控件） | 原生控件会引入一次系统合成层，等于额外一次上屏合成；且 Android/iOS 两套 |
-| UI 框架 | 自绘最小控件集（按钮/面板/滑条/色板/文字）或引入轻量即时模式库 | demo 范围小，先自绘最小集；渲染接口统一为 `IOverlay2D` + 文本渲染，未来可替换 |
-| 文字 | 字体图集（SDF 或位图），一次上传 | 避免每帧字形上传 |
-| Android 壳 | NativeActivity 或自定义 SurfaceView + JNI | 桌面 GLFW 壳复用同一 UI 层 |
-| iOS | 只做设计考虑：UI 层不依赖平台控件，surface 抽象预留 | 后续 |
+| U1 | **状态收窄** | 高频状态（笔刷粗细、选色、层数）必须用 `derivedStateOf` 收窄失效范围，**禁止整树重组** |
+| U2 | **GPU 层数上限** | `graphicsLayer` 调用点 **≤ 20**（`RenderNode` 过多会打断 GPU 合批） |
+| U3 | **禁止 `Modifier.blur`** | 移动端开销极高 |
+| U4 | **禁止每帧改文本** | 帧率显示等高频数字必须限频到 1Hz |
+| U5 | **图标用位图** | `ImageVector` 每帧重放路径，改用 `painterResource` |
+| U6 | **不做大面积阴影** | `Modifier.shadow` 产生额外层 + 模糊 |
+
+### 6.3 统计面板（调试用）
+
+帧时间、GPU 时间（能力支持时）、drawcall、VMA 分配计数、present 队列长度、
+**以及 Compose 侧的重组次数与层数**。两条轨道的数据**分开显示**，便于定位是哪边慢。
+
+## 7. 帧驱动模型（第 2 版新增，第 1 版没有）
+
+方案一下有**两条独立的帧循环**，必须说清楚谁驱动谁：
+
+```
+[3D 帧循环]  SurfaceView 的回调 / Choreographer 驱动
+   onFrame → SDK::RenderFrame() → present
+   ※ 自由运行，不受 Compose 影响
+
+[Compose 帧循环]  Compose 自己的 recomposer + Choreographer
+   state 变 → 重组 → 测量布局 → 绘制
+   ※ 自由运行，不受 SDK 影响
+
+二者仅通过 FeatureUiState（不可变快照）通信，单向：
+   FeatureHost --写--> FeatureUiState --读--> Compose
+```
+
+| 问题 | 答案 |
+|---|---|
+| 3D 帧率由谁决定？ | SDK 自己（配合 `Choreographer` 或 surface 帧回调） |
+| Compose 帧率由谁决定？ | Compose 的 recomposer，**只在状态变时重绘** |
+| 二者需要同帧吗？ | **不需要**。这正是方案一的意义 |
+| 3D 需要读 Compose 状态吗？ | 需要（如当前工具），但**只读不可变快照**，且不阻塞 3D 帧 |
+| 会不会撕裂？ | 不会。两个独立 Surface 由系统合成器同步到同一个 vsync |
+
+> **第 1 版的做法是"UI 与场景同帧同 image"**（§5.2 的帧结构里显式列了 `[Pass 2 UI]`）。
+> 方案一下这段**整段删除**：帧结构只剩 `[Pass 1 Scene]` → `Present`。
+
+## 8. 平台与 UI 框架选型（第 2 版重写）
+
+### 8.1 选型表
+
+| 项 | 第 1 版（作废） | **第 2 版（采纳）** | 理由 |
+|---|---|---|---|
+| UI 绘制方式 | 自绘即时模式 UI 画进 Vulkan | **Compose 原生控件** | 用户明确：不自研 UI |
+| UI 框架 | 自绘最小控件集 | **Jetpack Compose**（Android）/ **CMP**（iOS） | 平台官方、生态成熟 |
+| 3D 承载 | UI pass 渲进 swapchain image | **SurfaceView**（独立 Surface） | 系统合成器直接合成，零额外拷贝 |
+| 图片文字 | 字体图集 SDF | **Compose 自带的文本/图标系统** | 不用自己管字形 |
+| 合成 | app 内合成 | **SurfaceFlinger / CoreAnimation** | 硬件合成，几乎不占 GPU |
+| Android 壳 | NativeActivity / 自定义 SurfaceView + JNI | **Activity + FrameLayout + SurfaceView + ComposeView** | 两个兄弟节点 |
+| iOS | UI 层不依赖平台控件 | **CMP + 原生 3D 视图**（3D 在 Compose 之下） | 见 §8.2 |
+
+### 8.2 3D 之上的浮层必须由 SDK 画（关键设计结论）
+
+| 浮层 | 归属 | 为什么 |
+|---|---|---|
+| 选中包围盒虚线 / gizmo | **SDK `IOverlay2D`** | 跟手实时更新，不能等 Compose 重组 |
+| 叠叠乐网格指示 | **SDK `IOverlay2D`** | 必须与方块落点严格对齐，同一坐标系 |
+| 顶栏 / 底栏 / 调色板 / 面板 | **Compose** | 静态控件，不需要跟手 |
+| 弹窗 / 提示 / Toast | **Compose** | 平台原生交互 |
+
+**iOS 的特殊约束**：CMP 的 `UIKitView` 把原生视图**插到 Compose 渲染视图之下**
+（`root.insertSubview(container, 0)` + `BlendMode.DstAtop` 挖洞）。所以 **iOS 上 3D 层永远在 Compose 之下**。
+如果虚线选框用 Compose 画，它会被自己的 3D 场景盖住——**必须由 3D 层自己画**。
+这也是 §8.2 表格中浮层归属在双端统一的原因。
+
+`Info.plist` 必须包含 `CADisableMinimumFrameDurationOnPhone`，否则 CMP 在 iOS 上**运行时会崩溃**。
 
 ## 9. 边界与明确不做（UI 层）
 
 | 项 | 决策 |
 |---|---|
-| 动画/转场 | 不做（demo） |
+| **UI 控件绘制** | **不做** —— 归 Compose |
+| **UI 最终合成** | **不做** —— 归系统合成器 |
+| **UI 纹理导出 / 进引擎 pass** | **不做** —— 方案二，已否决 |
+| 动画/转场 | 用 Compose 内置动画（不自己写） |
 | 多窗口/多 surface | 不做 |
 | 系统键盘输入 | 不做（只做触摸） |
-| 无障碍 | 不做（demo），但控件命中区域保留 |
+| 无障碍 | 用 Compose 自带无障碍（不自建） |
 | UI 主题/换肤 | 不做 |
-| CPU 回读 | **硬禁止**，见 §5.4 |
+| CPU 回读 | **硬禁止**，见 §3.2 |
 
 ## 10. 验收门（实现阶段）
 
-1. **上屏零回读**：门控脚本扫描 UI 层与 Presenter，出现 `CopyImageToBuffer` / `map()` 于呈递路径 → 失败。
-2. **单 submit 每帧**：统计断言每帧 submit 次数 = 1（主路径）。
-3. **延迟**：`input→present` ≤ 2 帧（统计桩断言）。
-4. **稳态帧零分配**：UI 顶点缓冲复用，VMA alloc/free = 0（与 SDK M5 一致）。
-5. **离屏 golden**：HomeScreen + 空 FeatureHost 的离屏截图进 golden；命令录制 → 回放 → 复现哈希一致。
-6. 既有 SDK 门控（无 GS、分层纯度、内存路径）继续全绿。
+| # | 验收项 | 判据 |
+|---|---|---|
+| 1 | **上屏零回读** | `check_ui_no_readback.py` 通过，运行时计数 = 0 |
+| 2 | **SDK 单 submit** | `check_ui_single_submit.py` 通过；SDK 每帧 submit = 1 |
+| 3 | **3D 视图不在 Compose 树内** | 壳层评审 + 布局 dump：`SurfaceView` 是 `ComposeView` 的兄弟 |
+| 4 | **无 `TextureView`** | 壳层静态扫描为 0 |
+| 5 | **Compose 层数** | `graphicsLayer` 调用点 ≤ 20 |
+| 6 | **重组收窄** | 拖动滑块时不重组整棵控件树（Layout Inspector 验证） |
+| 7 | **延迟** | 3D 交互 `input→present` ≤ 2 帧；UI 点击 ≤ 2 帧（两条轨道分别测） |
+| 8 | **输入仲裁** | `DOWN` 落在 Compose 区时 3D 收不到事件；落在 3D 区时 Compose 收不到事件 |
+| 9 | **稳态零分配** | SDK VMA alloc/free = 0 |
+| 10 | **离屏 golden** | HomeScreen + 空 FeatureHost 的 3D 离屏截图进 golden；录制→回放→复现哈希一致 |
+| 11 | **iOS 配置** | `Info.plist` 含 `CADisableMinimumFrameDurationOnPhone` |
+| 12 | **既有门控** | 无 GS、分层纯度、内存路径、R1 全部继续绿 |
 
 ## 11. 后续实现路线（本轮不做）
 
-1. HomeScreen + Router + FeatureHost 骨架（空特性）
-2. HUD 最小控件集 + 文本图集 + `IOverlay2D` 合批
-3. Presenter 主路径（C 方案：直接渲进 swapchain）+ 离屏分流
-4. PerfGovernor 统计与降级档
-5. 再按玩法进入：涂鸦 → 叠叠乐 → 积木 → 印章（各自只填 FeatureHost 内容）
+1. **Android 壳骨架**：`Activity` + `FrameLayout` + `SurfaceView` + `ComposeView` 兄弟节点，
+   验证 SDK 能渲进 Surface、Compose 能叠在上面、触摸仲裁正确
+2. **Router + FeatureHost 骨架**（空特性）+ `FeatureUiState` 单向数据流
+3. **输入仲裁**（InputArbiter）+ JNI 事件桥
+4. **PerfGovernor 双轨统计**（3D / Compose 分开）
+5. 再按玩法进入：涂鸦 → 叠叠乐 → 积木 → 印章（各自只填 FeatureHost 内容 + Compose 控件）
+
+## 12. 与第 1 版的差异清单（便于审阅）
+
+| 第 1 版内容 | 第 2 版处理 |
+|---|---|
+| §2 `HUD` 层 "界面控件（按钮/面板/调色/层数/工具切换）" | ❌ 删除 —— 归 Compose |
+| §2 `Presenter` "上屏链路（本文档核心）" | ❌ 删除 —— 合成归系统合成器；保留 `FeatureBridge` 做 Surface 生命周期 |
+| §2 铁律 "同一帧、同一 CommandList、同一次 submit" | ❌ 作废 —— 改为"3D 与 UI 两条独立管线" |
+| §3 方案 C "场景 pass + UI pass 都渲染到同一张 swapchain image" | ❌ 作废 —— 只剩场景 pass |
+| §5 Presenter 整章（帧结构含 `[Pass 2 UI]`、UI pass 作为 render graph 最后一项） | ❌ 整章删除 —— 见 §7 帧驱动模型 |
+| §6 G3 "UI 合批"、G4 "字体/图集"、G5 "立即模式 UI 零分配" | ❌ 删除 —— 都是自绘 UI 的产物 |
+| §7 InputRouter（HUD 命中 → 工具 → 相机三级） | 🔄 重写为 §5 InputArbiter（Compose 区 / 3D 区二分） |
+| §8 "UI 绘制方式：即时模式画进 Vulkan；自绘最小控件集" | 🔄 重写为 §8（Compose + SurfaceView） |
+| §10 验收门 5 条 | 🔄 扩展为 §10 的 12 条 |
