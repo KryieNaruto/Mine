@@ -27,3 +27,15 @@ __pycache__/
 
 # Claude Code worktrees
 .claude/worktrees/
+
+# ç¼–è¯‘è¯Šæ–­äº§ç‰©(è¯¯ç”Ÿæˆåœ¨ä»“åº“æ ¹,ç”± ./ ç¼–è¯‘æ•£è½çš„ .obj)
+*.obj
+
+
+# ²âÊÔÔËĞĞÊ±²úÉúµÄÖĞ¼äÍ¼(·Ç golden;golden_*.png ÈÔÈë¿â)
+MagicBlocks/tests/data/_out_*.png
+
+# Android / Gradle ¹¹½¨ÖĞ¼ä²úÎï
+MagicBlocks/android/.gradle/
+MagicBlocks/android/app/.cxx/
+MagicBlocks/android/local.properties

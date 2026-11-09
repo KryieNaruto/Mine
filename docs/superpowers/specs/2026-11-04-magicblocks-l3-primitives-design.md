@@ -1,4 +1,4 @@
-﻿# 魔法功能预览 —— L3 primitives 设计（抽象 + 性能 + ECS/材质/Gizmo/命令流）
+# 魔法功能预览 —— L3 primitives 设计（抽象 + 性能 + ECS/材质/Gizmo/命令流）
 
 日期：2026-11-04
 状态：设计定稿（第 1 版，承接 L0~L2 已落地）
@@ -936,6 +936,8 @@ L2 门控与既有 198 个 deps 测试**完全不受影响**。
 | 项 | 决定 |
 |---|---|
 | 运行时体素网格（`IVoxelGrid`） | **不做**（§12 R-2 修正）：叠叠乐用方块实例集合；体素化只作 OBJ→方块的一次性预处理 |
+| `IBlockSet` / `IBlockBrush` / `IShapeTemplate` / `IVoxelizer` | **不做，不在 L3 范围**（2026-11-04 用户明确：严格按 L3 需求，未列入 L3 的不动）。这四个属总 spec §4 P7a/P7b/P7c 的**玩法数据模型**，由 L4 `src/features/**` 实现；§6A 是给 L4 的**设计预说明**（说明 `Block.cell` 用 `int32` 格点、落笔走相机射线+格点吸附+扫掠去重），**不在 L3 落代码**。L3 只提供它要用的通用能力：`IMesh`、`ICamera`、`IMaterial`、`IPicker`、`IOverlay2D`、`IBatchBuilder` |
+| 自由浮点放置（`FreeFloat`）/ `IPlacementPolicy` | **不做**：Q1 已定方案 A（格点吸附），保持接口最小；仅保留扩展点说明（若将来要自由旋转笔，再引入策略注入） |
 | 布尔运算 / 路径合并 | L4 组合（用 Clipper2） |
 | 阴影 / 动画 / 骨骼 | 不做（总 spec §10） |
 | glTF | 不做 |
@@ -955,6 +957,47 @@ L2 门控与既有 198 个 deps 测试**完全不受影响**。
 | Gizmo 事件与玩法逻辑耦合 | 中 | 事件总线 + 只读目标（§10.2 规则 1） |
 | 合批排序稳定性 | 高 | 排序键全为整数 + tie-break 稳定（EntityId），量化浮点（同 L2 手法） |
 | 命令流增量编码未做 | 中 | 第一版全量；规模上来后加差分（§11.3 预留 `state_hash`） |
+
+### 16.1 已修复的既有缺陷：实例 API 版本与 VMA 不一致（L0/L1 遗留）
+
+> 2026-11-04 在 L3 阶段做全量 ctest 时暴露,已修复。
+
+**现象**:`ctest` 单用例跑 `Command.RecordsAllOps` 等 11 个用例全部以
+`0xc0000374`(STATUS_HEAP_CORRUPTION)崩溃;但整进程一次跑完 171 个用例却
+全部通过。
+
+**定位过程**(逐步二分,值得复用的手法):
+
+1. `git stash` 掉全部 L3 改动 → 基线**同样崩** ⇒ 与 L3 无关,是既有缺陷。
+2. 探针:仅 `create_render_device()` + 销毁 → 通过。
+3. 探针:仅 `create_offscreen_target()` → 通过。
+4. 探针:仅 `create_command_list()` → **崩**。
+5. 探针:把命令列表**故意泄漏不销毁**,崩溃依旧发生在 `VkDevice` 销毁时
+   ⇒ 与命令列表对象本身无关,只是它把堆/驱动状态推到了临界点。
+6. `_CrtCheckMemory()` 逐步插桩:`create_command_list()` 返回后堆**完好**,
+   崩溃发生在之后的设备析构。
+7. 开 `VK_LAYER_KHRONOS_validation`:报
+   `UNASSIGNED-API-Version-Violation` —— `vkGetPhysicalDeviceFeatures2()`
+   等的 effective API version 是 1.0,而该 API 要到 1.1 才提升为核心。
+
+**根因**:实例协商的是 **Vulkan 1.0**,
+但 `VulkanPagingAllocator` 建 VMA 时写的是 `vulkanApiVersion = VK_API_VERSION_1_1`,
+且 L1/L2 资源路径大量调用 1.1 才提升为核心的 `vkGetPhysicalDevice*2()`。
+版本声明与实际用法不一致 → 驱动/VMA 内部状态被破坏 →
+延迟到 `vkDestroyDevice` 才以堆损坏形式爆出来。
+`create_instance()` 甚至把 `api_version` 参数直接 `(void)` 丢弃并硬编码 1.0。
+
+**修复**(`src/backend/vulkan/vulkan_instance.cpp`、`vulkan_render_device.cpp`):
+
+- `create_instance()` 真正使用调用方传入的 `api_version`(缺省 `VK_API_VERSION_1_1`)。
+- `create_vulkan_device()` 请求 `VK_API_VERSION_1_1`。
+- 结果:校验层的 API-Version 违规归零;11 个崩溃用例全部通过;
+  `ctest` **193/193 通过**(此前 186/193)。
+
+**教训**:崩溃点(`vkDestroyDevice`)与根因(实例创建时的 API 版本)相隔几十步,
+只看崩溃栈会误判成"命令列表析构有问题"。**实例/设备创建时请求的 API 版本,
+必须与 backend 实际调用的最高核心版本、以及 VMA 的 `vulkanApiVersion` 三方一致**,
+并纳入门控关注清单。
 
 ---
 

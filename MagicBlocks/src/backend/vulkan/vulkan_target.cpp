@@ -5,6 +5,7 @@
 
 #include "backend/vulkan/vulkan_allocator.h"
 #include "backend/vulkan/vulkan_draw.h"
+#include "backend/vulkan/vulkan_resource_common.h"  // to_vk_samples(MSAA 共用唯一一份)
 
 namespace magicblocks::backend {
 
@@ -44,7 +45,8 @@ std::uint32_t find_memory_type(const VulkanContext& ctx, std::uint32_t type_bits
 
 Status create_image(const VulkanContext& ctx, VkFormat fmt, VkImageUsageFlags usage,
                     VkImageLayout initial_layout, std::uint32_t w, std::uint32_t h,
-                    VkImage* out_image, std::uint32_t* out_page) {
+                    VkImage* out_image, std::uint32_t* out_page,
+                    VkSampleCountFlagBits samples) {
   *out_image = VK_NULL_HANDLE;
   *out_page = 0xFFFFFFFFu;
   if (ctx.allocator == nullptr) {
@@ -58,7 +60,7 @@ Status create_image(const VulkanContext& ctx, VkFormat fmt, VkImageUsageFlags us
   ici.extent = {w, h, 1};
   ici.mipLevels = 1;
   ici.arrayLayers = 1;
-  ici.samples = VK_SAMPLE_COUNT_1_BIT;
+  ici.samples = samples;
   ici.tiling = VK_IMAGE_TILING_OPTIMAL;
   ici.usage = usage;
   ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -101,9 +103,11 @@ OffscreenTarget::~OffscreenTarget() {
   // 顺序关键:先销毁 image,再把它占的分配器页退回去(页承载着这块 VkDeviceMemory)。
   if (color_) vkDestroyImage(ctx_.device, color_, nullptr);
   if (depth_) vkDestroyImage(ctx_.device, depth_, nullptr);
+  if (resolve_) vkDestroyImage(ctx_.device, resolve_, nullptr);
   if (ctx_.allocator != nullptr) {
     if (color_page_ != 0xFFFFFFFFu) ctx_.allocator->release_image_page(color_page_);
     if (depth_page_ != 0xFFFFFFFFu) ctx_.allocator->release_image_page(depth_page_);
+    if (resolve_page_ != 0xFFFFFFFFu) ctx_.allocator->release_image_page(resolve_page_);
   }
 }
 
@@ -111,22 +115,63 @@ Status OffscreenTarget::init() {
   if (desc_.extent.width == 0 || desc_.extent.height == 0) {
     return Status::Invalid("OffscreenTarget: extent 必须 > 0");
   }
-  // 采样数必须由设备能力保证;L0 单采样(MSAA 的解析附件留 L1/L2)
-  if (desc_.samples != 1) {
-    return Status::Unsupported("OffscreenTarget: L0 只支持 samples=1(MSAA 留 L1)");
+  // MSAA 的合法入口(替代原"L0 只支持 samples=1"那道墙):
+  //   1) 采样数必须是 2 的幂(samples=0 按 1 处理,与 PipelineDesc 同口径)
+  //   2) 必须在物理设备支持范围内(颜色与深度都要支持,与 collect_msaa 同口径)
+  // 不满足 → 明确 Unsupported,**绝不静默降级成 1**。
+  const std::uint32_t want_samples = desc_.samples == 0 ? 1u : desc_.samples;
+  if (want_samples & (want_samples - 1)) {
+    return Status::Unsupported("OffscreenTarget: samples=" + std::to_string(want_samples) +
+                               " 不是 2 的幂");
   }
-  Status s = create_image(ctx_, to_vk_format(desc_.format),
-                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                              VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                          VK_IMAGE_LAYOUT_UNDEFINED, desc_.extent.width, desc_.extent.height,
-                          &color_, &color_page_);
+  const VkSampleCountFlagBits vk_samples = to_vk_samples(want_samples);
+  // to_vk_samples 对认不出的值会回落到 1 采样(它是给"0/1"这种历史调用兜底的,
+  // 不能反过来用它做合法性判断 —— 否则 samples=64 会变成"1 采样 + 放行")。
+  // 这里直接按 want_samples 的数值反推它该对应的位,认不出就明确拒绝。
+  if (want_samples > 1 && static_cast<std::uint32_t>(vk_samples) != want_samples) {
+    return Status::Unsupported("OffscreenTarget: samples=" + std::to_string(want_samples) +
+                               " 不是合法的 Vulkan 采样数(只支持 2/4/8/16)");
+  }
+  if (want_samples > 1) {
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(ctx_.phys, &props);
+    const VkSampleCountFlags ok = props.limits.framebufferColorSampleCounts &
+                                  props.limits.framebufferDepthSampleCounts;
+    if ((ok & static_cast<VkSampleCountFlags>(vk_samples)) == 0) {
+      return Status::Unsupported("OffscreenTarget: samples=" + std::to_string(want_samples) +
+                                 " 不在设备支持范围内(颜色与深度都要支持)");
+    }
+  }
+
+  const std::uint32_t color_usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                    VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  // 多重采样图像不能做 TransferSrc(Vulkan 硬性规定),所以它的 usage 里不带
+  // TRANSFER_SRC —— usage 必须与实际用法一致,否则校验层会报。
+  const std::uint32_t ms_usage = (want_samples > 1)
+                                     ? (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                        VK_IMAGE_USAGE_TRANSFER_DST_BIT)
+                                     : color_usage;
+
+  Status s = create_image(ctx_, to_vk_format(desc_.format), ms_usage, VK_IMAGE_LAYOUT_UNDEFINED,
+                          desc_.extent.width, desc_.extent.height, &color_, &color_page_,
+                          vk_samples);
   if (!s.ok()) return s;
+
+  // MSAA:另建一张**单采样**颜色图像作为 resolve 目标,读回只读它。
+  // samples == 1 时不建,resolve_image() 回落到 color_,历史路径零变化。
+  if (want_samples > 1) {
+    s = create_image(ctx_, to_vk_format(desc_.format), color_usage, VK_IMAGE_LAYOUT_UNDEFINED,
+                     desc_.extent.width, desc_.extent.height, &resolve_, &resolve_page_,
+                     VK_SAMPLE_COUNT_1_BIT);
+    if (!s.ok()) return s;
+  }
 
   if (desc_.with_depth) {
     s = create_image(ctx_, to_vk_depth_format(DepthFormat::D16_UNORM),
                      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                      VK_IMAGE_LAYOUT_UNDEFINED, desc_.extent.width, desc_.extent.height, &depth_,
-                     &depth_page_);
+                     &depth_page_, vk_samples);
     if (!s.ok()) return s;
   }
   return Status::Ok_();
@@ -161,6 +206,11 @@ Status OffscreenTarget::readback_rgba8(std::uint8_t* out, std::size_t size_bytes
     return Status::Invalid("readback: 缓冲过小,需要 " + std::to_string(need) + " 字节");
   }
   if (!color_) return Status::Unsupported("readback: 无颜色附件");
+
+  // MSAA:读回的是**单采样 resolve 图像**,不是多重采样那张。
+  // 多重采样图像禁止做 vkCmdCopyImageToBuffer;样本数 1 时 resolve_image()
+  // 等价于 color_,这条路径与历史逐字节一致。
+  const VkImage src_image = resolve_image();
 
   const VkDeviceSize bytes = static_cast<VkDeviceSize>(need);
   VkBufferCreateInfo bci{};
@@ -235,7 +285,7 @@ Status OffscreenTarget::readback_rgba8(std::uint8_t* out, std::size_t size_bytes
   to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
   to_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-  to_dst.image = color_;
+  to_dst.image = src_image;
   to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
   to_dst.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
   to_dst.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
@@ -248,7 +298,7 @@ Status OffscreenTarget::readback_rgba8(std::uint8_t* out, std::size_t size_bytes
   region.bufferImageHeight = 0;
   region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
   region.imageExtent = {desc_.extent.width, desc_.extent.height, 1};
-  vkCmdCopyImageToBuffer(cmd, color_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &region);
+  vkCmdCopyImageToBuffer(cmd, src_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &region);
 
   VkImageMemoryBarrier back{};
   back.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -256,7 +306,7 @@ Status OffscreenTarget::readback_rgba8(std::uint8_t* out, std::size_t size_bytes
   back.newLayout = VK_IMAGE_LAYOUT_GENERAL;
   back.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   back.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-  back.image = color_;
+  back.image = src_image;
   back.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
   back.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
   back.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;

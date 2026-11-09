@@ -1,58 +1,108 @@
-// MagicBlocks UI 消费层 —— 帧渲染接口(spec §5 Presenter 上屏链路、§5.5 离屏分流)
+// MagicBlocks UI 消费层 —— 场景帧出口（壳层持有 surface）
 //
-// 为什么 UI 层要自己声明这个接口(而不是直接用 SDK 头):
+// ============================================================================
+// 路线变更说明（必读）
+// ============================================================================
 //
-//   spec §5.2 主路径要求 UI 与场景**同帧、同一 CommandList、同一次 submit** 渲染进
-//   swapchain image。但 SDK 目前的 L0 只到 `IRenderTarget`(附件视图 + 离屏读回),
-//   还没有 L1 `ICommandList` / L2 `IRenderGraph` —— 也就是说,**"渲染一帧并上屏"
-//   这条入口在 SDK 里还不存在**(ISwapchain 只有 `current_target()`,没有 acquire /
-//   submit / present)。
+// 旧设计（docs/superpowers/specs/2026-11-03-magicblocks-ui-consumer-design.md §5）
+// 要求 SDK 把「场景 pass + UI pass」录进**同一个 command list**，每帧**恰好一次**
+// submit 后 present。调研 v2（2026-11-05-magicblocks-ui-rendering-route-research.md）
+// §7 已明确判定这条路线**作废**，原因是物理层面的：
 //
-//   为了让 UI 层的 Presenter 今天就能定型并被测试覆盖,这里声明 `IFrameRenderer`
-//   作为"帧渲染的唯一出口",由 SDK 落地后**用真实现替换**(签名不变):
-//     - `render_into_device_image()` = 在调用方给定的同一 CommandBuffer 内录制
-//       场景 pass + UI pass,并 signal 一个信号量给 present 用;
-//     - `render_to_memory()` = 离屏路径(§5.5),golden/CLI/录制专用。
+//   - Android 上 UI 由 Compose 画在**自己的 RenderNode / Surface** 上，3D 场景是
+//     独立的 SurfaceView。两者由 **SurfaceFlinger 合成**，不需要、也不允许游戏
+//     引擎替系统做合成。
+//   - 若 SDK 硬要在同一张 swapchain image 上做「场景 pass + UI pass 叠加」，
+//     就等于自研了一套合成器 —— 既拿不到 Compose 的控件，也和壳层的 Z 序 / 裁剪
+//     规则直接冲突。
 //
-// **两条路径不共用函数**:主路径上没有任何 CPU 回读,回读只可能出现在
-// `render_to_memory()` 里(spec §10 验收门 1 由静态门控脚本兜底)。
+// 所以新边界是：**SDK 只负责「把一帧 3D 场景渲染到壳层给的 surface」，UI 合成
+// 完全交给壳层。**
 //
-// 关键点:这个接口**没有** `readback` / `map` 成员,主路径在类型层面就够不着 CPU。
+// ============================================================================
+// 本接口的职责
+// ============================================================================
+//
+// `ISceneFrameSink` 由**壳层实现**（Android NativeActivity / iOS / 桌面壳），
+// 用来把「一次 submit + present」的能力交给 SDK：
+//
+//   壳层                                          SDK
+//   ─────────────────────────────────────────────────────────────
+//   创建 ANativeWindow / CAMetalLayer
+//   实现 ISceneFrameSink ───────────────────────► set_scene_sink()
+//                                                 渲染一帧场景
+//   ◄───────────────────────────── submit_frame(list)
+//   present_image()                    （壳层负责真正上屏）
+//
+// **两条硬约束**（与旧路线相同，仍然有效）：
+//   1. 主路径上 SDK 侧 **零 CPU 回读**（门控 check_ui_no_readback.py）；
+//   2. 每帧场景 **恰好一次 submit_frame**（门控 check_ui_single_submit.py）。
+//
+// 本接口**没有** readback / map 成员：主路径在类型层面就够不着 CPU 内存。
 #pragma once
 
 #include <cstdint>
 
+#include "magicblocks/device/types.h"
+#include "magicblocks/resources/command.h"
 #include "magicblocks/ui/types.h"
 
 namespace magicblocks::ui {
 
-// 一帧的渲染产物句柄(由实现定义;**不透明**,UI 层不得解释其内部)。
-// Swapchain 模式下它与 swapchain image 绑定;Offscreen 模式下它是离屏附件。
-struct FrameImage {
+// 壳层 surface 的状态。SDK 据此决定「继续渲染 / 重建目标 / 放弃本帧」，
+// 而不是把所有失败都当成同一种错误（fail-loud）。
+enum class SinkStatus : std::uint8_t {
+  Ok = 0,
+  NoSurface,    // 壳层还没有可用的 surface（后台 / 尚未创建）→ 跳过本帧，不是错误
+  NeedRebuild,  // 尺寸变化 / OUT_OF_DATE / SUBOPTIMAL → 调 rebuild()
+  SurfaceLost,  // VK_ERROR_SURFACE_LOST 之类的不可恢复错误
+  SubmitFailed,
+  PresentFailed,
+  InvalidState,
+};
+
+const char* to_string(SinkStatus status);
+
+// 一份已 acquire 的可写图像（由壳层定义内部含义，SDK **不得解释**其 id）。
+struct SinkImage {
   std::uint64_t id = 0;
-  u32 width = 0;
-  u32 height = 0;
+  device::Extent2D extent{};
+  device::Format format = device::Format::RGBA8_UNORM;
   bool valid = false;
 };
 
-// 主路径:把场景 + UI 录进**调用方已有的** command buffer,并返回"present 前需要
-// 等待的信号量"。合约(spec §5.4,实现方必须遵守,门控脚本静态兜底):
-//   - 不得发起任何 submit(整帧只有 Presenter 那一次);
-//   - 不得 readback / map;
-//   - 不得创建/销毁 swapchain 或 render pass(走缓存)。
-class IFrameRenderer {
+// 壳层实现：把「场景渲染进某个外部 surface」的能力交给 SDK。
+//
+// 实现方注意：
+//   - `submit_frame()` 必须是**每帧场景恰好一次**；壳层内部负责 fence / 信号量；
+//   - 不得在 `submit_frame()` 里做 CPU 回读；
+//   - `acquire_image()` 失败时要通过 `last_status()` 给出**明确原因**，
+//     让 SDK 能区分「没 surface」与「surface 丢了」。
+class ISceneFrameSink {
  public:
-  virtual ~IFrameRenderer() = default;
+  virtual ~ISceneFrameSink() = default;
 
-  // 主路径:场景 pass → UI pass → image layout 转 PRESENT。
-  // `cmd` 是 SDK 侧不透明的命令缓冲句柄(0 = 由实现自建)。返回 false = 录制失败。
-  virtual bool render_into_device_image(std::uint64_t cmd, FrameImage* out_image,
-                                        std::uint64_t* out_present_semaphore) = 0;
+  // 当前 surface 的尺寸（0×0 = 尚无 surface）。
+  virtual device::Extent2D extent() const = 0;
 
-  // 离屏路径(spec §5.5):场景 + UI 渲染到离屏 image,再交回主机内存。
-  // **只有这条路径允许 CPU 回读**,且只用于 CLI / CI / golden / 命令回放。
-  virtual bool render_to_memory(u32 width, u32 height, std::uint8_t* out_rgba8,
-                                u32 row_bytes) = 0;
+  // 当前 surface 的颜色格式。
+  virtual device::Format format() const = 0;
+
+  // 是否具备渲染条件（surface 存在且未暂停）。false 时 run_frame 会跳过。
+  virtual bool ready() const = 0;
+
+  // 取下一张可写图像。失败时**不修改** out_image，并把原因写进 last_status()。
+  virtual bool acquire_image(SinkImage* out_image) = 0;
+
+  // 提交**这一帧场景**的命令流（SDK 已录制完成，壳层负责真正执行）。
+  // 每帧只允许调用一次 —— 这是验收口径 UI-P8。
+  virtual bool submit_frame(resources::ICommandList& list) = 0;
+
+  // 呈现刚提交的那张图像。返回 false 时原因见 last_status()。
+  virtual bool present_image(const SinkImage& image) = 0;
+
+  // 上一次失败的明确原因（acquire / submit / present 失败时由实现给出）。
+  virtual SinkStatus last_status() const = 0;
 };
 
 }  // namespace magicblocks::ui

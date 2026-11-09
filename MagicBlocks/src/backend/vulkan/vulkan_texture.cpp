@@ -524,6 +524,12 @@ Status VulkanTexture::readback_device(std::uint8_t* out, std::size_t size_bytes)
   const u32 h = desc_.extent.height;
   const resources::ResourceId rb_id = rb.id;
 
+  // 页级临时 VkBuffer 必须活到 submit 执行完毕之后:vkCmdCopyImageToBuffer 只把
+  // 命令记进命令缓冲区,真正执行在 submit 时。若在录制 lambda 内销毁,GPU 会读到
+  // 已释放的 buffer(SwiftShader 上表现为偶发 0xC0000409 / 0xC0000005)。
+  // 因此把 handle 提到外面,由 submit 返回后再销毁。
+  VkBuffer page_buf = VK_NULL_HANDLE;
+
   Status s = submit_once_sync(ctx_, "VulkanTexture::readback", [&](VkCommandBuffer cmd) {
     VkImageMemoryBarrier to_src{};
     to_src.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -552,7 +558,6 @@ Status VulkanTexture::readback_device(std::uint8_t* out, std::size_t size_bytes)
     bci.size = pd.page_size;
     bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    VkBuffer page_buf = VK_NULL_HANDLE;
     VkResult vr = vkCreateBuffer(ctx_.device, &bci, nullptr, &page_buf);
     if (vr != VK_SUCCESS) return Status::OOM(fmt_err("vkCreateBuffer(读回页)", vr));
     PageBinding pb{};
@@ -564,10 +569,7 @@ Status VulkanTexture::readback_device(std::uint8_t* out, std::size_t size_bytes)
                               pb.offset + static_cast<VkDeviceSize>(rb_id.offset));
       if (vr != VK_SUCCESS) bs = Status::InitFailed(fmt_err("vkBindBufferMemory(读回页)", vr));
     }
-    if (!bs.ok()) {
-      vkDestroyBuffer(ctx_.device, page_buf, nullptr);
-      return bs;
-    }
+    if (!bs.ok()) return bs;  // buffer 由 submit 之后统一销毁
 
     VkBufferImageCopy region{};
     region.bufferOffset = 0;
@@ -577,7 +579,6 @@ Status VulkanTexture::readback_device(std::uint8_t* out, std::size_t size_bytes)
     region.imageExtent = {w, h, 1};
     vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, page_buf, 1,
                            &region);
-    vkDestroyBuffer(ctx_.device, page_buf, nullptr);
 
     VkImageMemoryBarrier back{};
     back.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -609,6 +610,11 @@ Status VulkanTexture::readback_device(std::uint8_t* out, std::size_t size_bytes)
         out[i + 3] = src[i + 3];
       }
     }
+  }
+  // submit_once_sync 已 fence 等待,GPU 不再引用 page_buf,此时销毁才安全。
+  if (page_buf != VK_NULL_HANDLE) {
+    vkDestroyBuffer(ctx_.device, page_buf, nullptr);
+    page_buf = VK_NULL_HANDLE;
   }
   (void)allocator_->free(rb.id);
   return s;

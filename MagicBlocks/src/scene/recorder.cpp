@@ -421,6 +421,13 @@ class RecorderImpl final : public IRecorder {
       }
       Status set_viewport(const resources::Viewport&) override { return Status::Ok_(); }
       Status set_scissor(const resources::ScissorRect&) override { return Status::Ok_(); }
+      // 回放路径的空实现:这里只负责"把命令重新录进新流",
+      // 不需要真的绑纹理 —— bind_sampled_texture 会被重新录制进 recorded_,
+      // 由真正的 VulkanCommandList 在提交时执行。
+      Status bind_sampled_texture(const resources::ResourceId&, const resources::ResourceId&,
+                                  resources::u32) override {
+        return Status::Ok_();
+      }
       Status begin_pass(const resources::RenderPassDesc&) override { return Status::Ok_(); }
       Status end_pass() override { return Status::Ok_(); }
       bool recording() const override { return true; }

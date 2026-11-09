@@ -65,12 +65,19 @@ class IBuffer {
   virtual Status write(const void* data, u64 offset, u64 size) = 0;
   virtual Status read(void* out, u64 offset, u64 size) const = 0;
 
-  // R5:上传请求。数据进入 staging 批处理,由帧边界统一提交到 GPU 副本。
-  // 本轮语义 = 立即完成本次请求的入队并返回;真 GPU 拷贝在命令提交时发生。
+  // R5:上传请求。数据只进入 staging 批处理,**不会**立刻出现在 GPU 侧副本里。
+  // 真正的 GPU 拷贝发生在 flush_pending()。
+  //
+  // 踩过的坑(务必看清):`upload()` 返回 Ok **不代表数据已经可用**。漏掉
+  // flush_pending() 时不会报任何错,GPU 读到的仍是全 0 内存 —— 顶点缓冲全零
+  // 会让所有三角形退化到原点,最终"画面上一个像素都没有,但清屏色正常",
+  // 极难定位。凡是建完缓冲立刻要拿它画的代码,都必须紧跟一次 flush_pending()。
   virtual Status upload(const void* data, u64 size, u64 dst_offset = 0) = 0;
-  // 丢弃尚未提交的上传批(例如整帧被取消)。
+  // 把 upload() 入队的全部字节**提交**到 GPU 侧副本(staging → vkCmdCopyBuffer)。
+  // 帧边界调用一次即可;析构时也会兜底调用。返回值语义见 commit 结果查询。
   virtual void flush_pending() = 0;
-  // 尚未提交的上传字节数。
+  // 尚未提交的上传字节数。**建完缓冲、画之前应当断言它为 0**,
+  // 这是"忘了 flush"唯一可靠的观测点。
   virtual u64 pending_upload_bytes() const = 0;
 
  protected:

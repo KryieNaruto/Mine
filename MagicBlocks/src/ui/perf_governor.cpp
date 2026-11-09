@@ -80,8 +80,13 @@ bool PerfGovernor::report_frame(const FrameSample& s) {
     d.over_streak = 0;
   }
 
-  // 验收门 2:主路径每帧恰好 1 次 submit。==0 也算违规(该上屏没上屏)。
-  if (s.submit_count != 1) {
+  // 验收门 2：每帧**最多**一次 submit。
+  //
+  // 旧口径是"恰好 1 次（==0 也算违规，该上屏没上屏）"。调研 v2 §7 改路线后
+  // 这个口径不再成立：UI 合成归壳层，SDK 只提交场景帧；而离屏/无 surface/
+  // 后台场景下本就**没有**场景提交（G7 跳过）。真正要守的不变量是
+  // "不能一帧提交多次"—— 那才是把 UI pass 塞进同一帧的旧路线特征。
+  if (s.submit_count > 1) {
     ++st.submit_violations;
     healthy = false;
   }

@@ -194,9 +194,17 @@ struct PipelineDesc {
   u32 samples = 1;                          // MSAA 采样数,须在 DeviceCaps 支持下
   PrimitiveType primitive = PrimitiveType::TriangleList;
   bool compute = false;                     // true → 走计算管线(stages 只允许 Compute)
-  // 资源布局:(kind, 字节数)。本轮只做 push constant 与 UBO 页,
-  // 不建描述符集(R4),因此这里只声明需要多少 push constant 空间。
+  // 资源布局:(kind, 字节数)。默认只做 push constant 与 UBO 页,不建描述符集(R4):
+  // sampled_texture_slots == 0 时这里只声明需要多少 push constant 空间。
   u32 push_constant_bytes = 0;              // 必须 <= DeviceCaps.max_push_constant_size
+  // P0 纹理采样(X1 裁定):声明多少个可采样 2D 纹理槽。
+  //   0(默认)→ **不建描述符集**,descriptor_set_count() 返回 0,既有管线与
+  //             5 张 golden 逐字节不变(这是 P0-1 的验收口径)。
+  //   >0     → 建**恰好 1 个** descriptor set layout(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+  //             descriptorCount = sampled_texture_slots),descriptor_set_count() 返回 1。
+  //             固定 set=0, binding=0..slots-1。**不做** bindless / 纹理数组 / 多集。
+  // 绑定入口是 ICommandList::bind_sampled_texture(texture, sampler, slot)。
+  u32 sampled_texture_slots = 0;
 };
 
 // 校验规则(由 backend 实现,创建时调用):
@@ -219,9 +227,14 @@ class IPipeline {
   virtual const PipelineDesc& desc() const = 0;
   virtual bool is_compute() const = 0;
 
-  // R4:本轮描述符策略为 push constant 优先,**不建描述符集** →
-  // 恒返回 0,这是 Pipeline.UsesPushConstantsOnly 的断言点。
+  // R4 默认策略是 push constant 优先,**默认不建描述符集**;
+  // 只有 PipelineDesc::sampled_texture_slots > 0(P0 纹理采样)时建 1 个。
+  //   返回 0  ⇔ sampled_texture_slots == 0(既有行为,Pipeline.UsesPushConstantsOnly)
+  //   返回 1  ⇔ sampled_texture_slots > 0
+  // 恒不超过 1:本轮不做多集/bindless(裁定 X1)。
   virtual u32 descriptor_set_count() const = 0;
+  // 该管线声明了多少个可采样纹理槽(0 = 未声明,任何 bind_sampled_texture 都会被拒)。
+  virtual u32 sampled_texture_slots() const = 0;
   // 实际生效的 push constant 字节数(<= desc().push_constant_bytes)。
   virtual u32 push_constant_bytes() const = 0;
 

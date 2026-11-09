@@ -1,0 +1,104 @@
+// MagicBlocks —— Android 场景渲染器（JNI 层的 C++ 实现）
+//
+// 职责：把一个立方体渲染进**壳层给的 Surface**，全程零 CPU 回读。
+//
+// 与 cube_demo 的关键区别：
+//   cube_demo：离屏目标 + readback_rgba8  → 有回读（那是 CI/golden 专用）
+//   本文件  ：swapchain image + vkQueuePresentKHR → 无回读
+//
+// 生命周期由 Kotlin 侧驱动：
+//   nativeCreate()             → 建设备/管线/缓冲
+//   nativeSurfaceCreated(w)    → 建 swapchain（拿到 ANativeWindow*）
+//   nativeRenderFrame(yaw,pitch,scale) → 取图 → 录制 → 提交 → 呈现
+//   nativeSurfaceDestroyed()   → 拆 swapchain
+//   nativeDestroy()            → 拆设备
+#pragma once
+
+#include <atomic>
+#include <memory>
+#include <mutex>
+#include <string>
+
+#include "magicblocks/device/render_device.h"
+#include "magicblocks/device/swapchain.h"
+#include "magicblocks/primitives/types.h"
+#include "magicblocks/resources/buffer.h"
+#include "magicblocks/resources/command.h"
+#include "magicblocks/resources/pipeline.h"
+
+namespace magicblocks::android {
+
+namespace dev = magicblocks::device;
+namespace res = magicblocks::resources;
+namespace prim = magicblocks::primitives;
+
+// 与 shaders/cube.vert 的 push_constant 块一一对应（128 字节 = 两个 mat4）。
+struct PushConstants {
+  float view_proj[16];  // offset 0
+  float world[16];      // offset 64
+};
+
+// 一个面 4 个顶点，6 面共 24 个；每面独立颜色/法线 → 六面明暗不同。
+struct Vertex {
+  float px, py, pz;
+  float nx, ny, nz;
+  float r, g, b;
+};
+
+class SceneRenderer {
+ public:
+  SceneRenderer() = default;
+  ~SceneRenderer();
+
+  SceneRenderer(const SceneRenderer&) = delete;
+  SceneRenderer& operator=(const SceneRenderer&) = delete;
+
+  // 建设备与资源。device 用 SwiftShader 之外的**真实 GPU**（pad 上的 Mali）。
+  bool init(std::string* err);
+
+  // 壳层 Surface 就绪：建 swapchain。window 是 ANativeWindow*。
+  bool attach_surface(void* window, int width, int height, std::string* err);
+  void detach_surface();
+
+  // 渲染一帧并直接呈现到 Surface。全程无 CPU 回读。
+  //
+  // yaw/pitch : 单位弧度，绕 Y / X 轴的旋转。
+  // scale     : 缩放（双指捏合），本质是相机拉近拉远。
+  // pan_x/y   : 平移（双指拖动），单位是**世界空间**的偏移量 ——
+  //             由 Kotlin 侧按"屏幕像素 / 当前可视宽度"换算好再传进来，
+  //             这样平移速度与缩放级别无关（贴着手指走）。
+  bool render_frame(float yaw, float pitch, float scale, float pan_x, float pan_y,
+                    std::string* err);
+
+  bool surface_ready() const { return swapchain_ != nullptr; }
+
+  // 调试信息（Kotlin 侧打日志用）
+  std::string status_text() const;
+
+ private:
+  bool create_resources(std::string* err);
+  void release_window();
+  bool rebuild_pipeline_for_swapchain(std::string* err);
+  bool record_into(dev::IRenderTarget* target, float yaw, float pitch, float scale, float pan_x,
+                   float pan_y, std::string* err);
+
+  std::unique_ptr<dev::IRenderDevice> device_;
+  std::unique_ptr<dev::ISwapchain> swapchain_;
+  std::unique_ptr<res::IBuffer> vertex_buffer_;
+  std::unique_ptr<res::IBuffer> index_buffer_;
+  std::unique_ptr<res::IPipeline> pipeline_;
+  std::uint64_t pipeline_hash_ = 0;
+  std::uint32_t index_count_ = 0;
+
+  // ANativeWindow 引用：attach 时持有，detach 时释放（引用由 JNI 层的
+  // ANativeWindow_fromSurface 产生，见 jni_bridge.cpp）。
+  void* native_window_ = nullptr;
+
+  int width_ = 0;
+  int height_ = 0;
+  std::uint64_t frame_count_ = 0;
+  std::string last_error_;
+  std::mutex mutex_;  // Kotlin 的 UI 线程只有一条，加锁是为了防 life-cycle 竞态
+};
+
+}  // namespace magicblocks::android

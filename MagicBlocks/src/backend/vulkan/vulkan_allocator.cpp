@@ -36,6 +36,18 @@
 #pragma warning(disable : 4324)  // 结构因对齐说明符被填充
 #endif
 #define VMA_IMPLEMENTATION
+// Android 的 libvulkan.so 只导出 Vulkan **1.0** 符号：vkGetBufferMemoryRequirements2 /
+// vkBindBufferMemory2 / vkGetPhysicalDeviceProperties2 等 1.1 核心函数在链接期直接
+// undefined symbol。
+//
+// VMA 3.5.0 在「未定义 VMA_STATIC_VULKAN_FUNCTIONS 且未定义 VK_NO_PROTOTYPES」时
+// **默认把 VMA_STATIC_VULKAN_FUNCTIONS 设为 1**，于是走 ImportVulkanFunctions_Static()，
+// 在 1.1 分支里把这些函数当链接符号取地址 —— 这就是 undefined symbol 的来源。
+// 所以 Android 上必须显式把 STATIC 压成 0，逼 VMA 走 DYNAMIC 分支
+// （通过我们填的 pVulkanFunctions 用 vkGetInstanceProcAddr/vkGetDeviceProcAddr 解析）。
+#if defined(__ANDROID__)
+#define VMA_STATIC_VULKAN_FUNCTIONS 0
+#endif
 // 注意三点:
 //   1. __has_include 的探测形式必须和实际 #include 的形式**完全一致**
 //      (<...> 与 "..." 的搜索起点不同,探到的未必是真正被包含的那个)。
@@ -663,13 +675,36 @@ struct VulkanPagingAllocator::Impl {
     // bufferDeviceAddress 不在 VkPhysicalDeviceFeatures(Vulkan 1.0 结构)里,
     // 它是 Vulkan 1.2 核心能力位 / VK_KHR_buffer_device_address 扩展位 →
     // 必须用 VkPhysicalDeviceFeatures2 链式查询。
-    if (aci.physicalDevice != VK_NULL_HANDLE) {
+    // Android 的 libvulkan.so 只导出 Vulkan **1.0** 符号：vkGetPhysicalDeviceFeatures2、
+    // vkGetBufferMemoryRequirements2、vkBindBufferMemory2 等 1.1 核心函数在链接期是
+    // undefined symbol。VMA 3.5.0 的 VMA_DYNAMIC_VULKAN_FUNCTIONS 默认为 1，但它要求
+    // 调用方**显式填 pVulkanFunctions**——不填就不会走函数指针，仍是直连链接符号。
+    // 所以这里用 loader 的 vkGetInstanceProcAddr / vkGetDeviceProcAddr 把 1.1 那几项
+    // 从函数表里解析出来。Windows 上不需要（loader 直接导出 1.1 符号）。
+    VmaVulkanFunctions vma_funcs{};
+#if defined(__ANDROID__)
+    vma_funcs.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
+    vma_funcs.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
+    aci.pVulkanFunctions = &vma_funcs;
+    using PFN_GetFeatures2 = PFN_vkGetPhysicalDeviceFeatures2;
+    PFN_GetFeatures2 get_features2 = reinterpret_cast<PFN_GetFeatures2>(
+        vkGetInstanceProcAddr(reinterpret_cast<VkInstance>(handles.instance),
+                              "vkGetPhysicalDeviceFeatures2KHR"));
+    if (!get_features2) {
+      get_features2 = reinterpret_cast<PFN_GetFeatures2>(
+          vkGetInstanceProcAddr(reinterpret_cast<VkInstance>(handles.instance),
+                                "vkGetPhysicalDeviceFeatures2"));
+    }
+#else
+    auto get_features2 = &vkGetPhysicalDeviceFeatures2;
+#endif
+    if (aci.physicalDevice != VK_NULL_HANDLE && get_features2 != nullptr) {
       VkPhysicalDeviceBufferDeviceAddressFeatures bda{};
       bda.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
       VkPhysicalDeviceFeatures2 feats2{};
       feats2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
       feats2.pNext = &bda;
-      vkGetPhysicalDeviceFeatures2(aci.physicalDevice, &feats2);
+      get_features2(aci.physicalDevice, &feats2);
       if (bda.bufferDeviceAddress == VK_TRUE) {
         aci.flags |= VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
       }

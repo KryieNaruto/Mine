@@ -683,4 +683,75 @@ Scene 6 + SubmitQueue 5 + RenderGraph 4 + Stream 10 + Recorder **9** + FeatureRe
 | **R11** | 侦察建议 `scene_stub.h` 改逐名 `using` 转发（成本≈1 行） | §5.3.1 **维持不转发**：转发要求 `ui::stub::IScene` 与 `scene::IScene` 同型 → `ui_test.cpp:121` 的 `FakeScene` 只实现 4/12 方法必 C2259；叠加 `record()` 签名、`DisplayInfo` 反向依赖、`IOverlay2D` 三处冲突 → 属独立 UI 集成任务，非 L2 改动 |
 | **R12** | 侦察提示 UIG2 门控扫整个 `tests/`，禁 `submit\s*[<(]`；M5"零 VMA"在 UI 侧是假绿 | §6.1 `SteadyStateZeroVmaCalls` 自己用 `AllocatorStats` 差分（不信 `FrameSample`）；L2 测试**不写** `.submit(`/`->submit(`，只用 `submit_and_wait()` |
 
+---
 
+## 15. 落地结果（第 3 版计划的执行记录）
+
+计划到此已执行完毕。本节记录**实际交付**与**计划 → 现实**的差额，供后续 L3 参考。
+
+### 15.1 测试门（全绿）
+
+| 项目 | 计划 | 实际 |
+| --- | --- | --- |
+| `magicblocks_test.exe` | 38 条 L2 用例 | **38 条全过**（总计 123 条，0 跳过） |
+| `ctest` | 145 项（§6.2/§11.5） | **145/145 通过**，0 失败 0 跳过 |
+| G1 / G3 / G4 / G5 | rc=0 | **全部 rc=0**（G5 `ran=198 failed=0 skipped=0`） |
+| L2 时钟门控 | rc=0 | **rc=0**（新增 `tools/check_scene_no_clock.py`） |
+| 编译告警 | 0 | **0** |
+
+`test_*.py` 数量保持 **12**（时钟门控自测是往 `test_check_scripts.py` 里**加类**，
+不是新增文件），因此 G5 的硬断言不受影响。
+
+### 15.2 执行中发现并修复的 4 个真实 L2 缺陷
+
+这四条都是**实现缺陷，不是测试写错**，全部由测试用例逼出来：
+
+1. **JSON 写入 u64 精度丢失**（`src/scene/command_stream.cpp`）
+   `ByteReader::u64` / `i64` 走 `double`（53 位尾数）解析，`pipeline_hash` 这类
+   大于 2^53 的值被静默截断（`1234605616436508552` 变成 `...672`）。
+   二进制与 JSON 的哈希因此对不上。
+   **修法**：改成精确十进制文本解析 + 溢出检查，并为 `1e3` / `64.0` 这类
+   合法浮点写法加 `has_float_tail()` / `number_generic_u64()` 回退。
+
+2. **`backend` 没进命令流哈希**（`src/scene/command_stream.cpp` + `command_stream.h`）
+   二进制头把 backend 硬编码成 `put_u8(0)`，body 里也没有它，
+   于是 `"vulkan"` 与 `"vulkan2"` 哈希完全相同——改名不被察觉。
+   **修法**：在 `write_stream_body` 开头 `put_string(s.backend)`，解码时读回并与
+   头部枚举交叉校验。布局变了，`kBinaryFormatVersion` 升到 **2**。
+
+3. **`Mat4::transform_point` 用列主序读了行主序矩阵**（`src/scene/scene_impl.cpp`）
+   `from_trs` 和 `mul` 按行主序存（`m[row*4+col]`），但 `transform_point` 按
+   `m[0*4+col]*in[0] + m[1*4+col]*in[1] + ...` 读，等于把基向量转置并且丢了平移。
+   表现为父节点平移 10 后世界包围盒还是 `-2..2` 而不是 `13..17`。
+   **修法**：改成行主序。
+
+4. **`replay()` 返回前把命令列表 reset 了**（`src/scene/recorder.cpp`）
+   回放把整帧重录进调用方传进来的 `ICommandList`，却在返回前 `target.reset()`，
+   导致 `command_count()` 恒为 0，"回放后命令数一致"这类断言永远失败。
+   **修法**：删掉那次 reset，命令列表交给调用方。
+
+另外修了一个**测试自身的生命周期错误**：`Recorder.StateMachineEnforcesOrder` 里
+recorder 比 device 先声明，析构顺序反了，device 先死导致
+`vkDestroyPipeline: Invalid device` 访问违例。测试改为先声明 device。
+
+### 15.3 计划 → 现实的调整
+
+- **CLI 出图另起渲染目标**：recorder 的 `begin_pass` 会开真实 render pass，
+  而 `draw_selftest` 用 `initialLayout=UNDEFINED`，同一目标复用会撞布局不匹配。
+  CLI 因此建**两个**目标——一个录制用，一个出图用。计划 §4.8 没写到这一层。
+- **golden 像素来自 `draw_selftest`，不来自 `replay()`**：L1 的 `draw*` 只
+  `append(cmd)`，真正的 `vkCmdDraw` 在提交阶段。所以录制出来的命令在回放时
+  **不产生像素**。L2 的 golden 走的是自检绘制那条真实通路。
+  这一点在计划 §4.7 里只写了"不是复用"，落地时明确了是"两条不同通路"。
+- **`MB_TEST_DATA_DIR` 新增**：golden 测试需要读 `tests/data/`，为此给
+  `magicblocks_test` 加了这条编译定义（`MB_GOLDEN_DIR` 原本就有，但指向别处）。
+- **`PassRecord::area` 保留原始值**：L1 的 `begin_pass` 会把 `area_width==0`
+  解析成 extent，L2 存**原样**的 0。这条已写进 `BinaryRoundTripPreservesHash`
+  的断言里，防止后来者"顺手归一化"。
+
+### 15.4 已知遗留（不是缺陷）
+
+- `MagicBlocks/` 目录在 git 中处于未跟踪状态（本仓库既有状态，非本轮引入）。
+- README / ARCHITECTURE 原本是 GBK 编码，本轮已统一重写为 **UTF-8**。
+- 玩法预设（`--scene voxel` 等）属于 L4，L2 明确拒绝并返回退出码 2，
+  **没有**留兜底降级路径。

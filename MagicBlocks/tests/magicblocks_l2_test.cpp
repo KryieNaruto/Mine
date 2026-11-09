@@ -1076,7 +1076,7 @@ TEST(Recorder, RecordsAllElevenCommandTypes) {
   EXPECT_GT(l1_count, 0u);
 
   auto stream_r = r->capture();
-  ASSERT_TRUE(stream_r.ok()) << stream_r.message;
+  ASSERT_TRUE(stream_r.ok()) << stream_r.message();
   const sc::CommandStream& st = stream_r.value();
 
   ASSERT_EQ(st.commands.size(), static_cast<std::size_t>(l1_count))

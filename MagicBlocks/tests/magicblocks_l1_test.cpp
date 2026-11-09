@@ -692,3 +692,178 @@ TEST(Allocator, DeviceTeardownLeavesConsistentState) {
 
   EXPECT_TRUE(a->validate().ok()) << a->validate().message;
 }
+
+// ================================================================ P0 纹理采样(X1)
+//
+// 裁定: ICommandList 加第 12 个方法 bind_sampled_texture(texture, sampler, slot);
+// PipelineDesc 加 u32 sampled_texture_slots = 0;默认 0 时既有行为与 golden 逐字节不变。
+
+namespace {
+
+// 一条声明了 n 个采样纹理槽的图形管线。
+res::PipelineDesc textured_desc(res::u32 slots) {
+  res::PipelineDesc p = graphics_desc();
+  p.sampled_texture_slots = slots;
+  return p;
+}
+
+// 一张 4×4 RGBA8 的可采样纹理描述(P0 用例共用)。
+res::TextureDesc unit_tex() {
+  res::TextureDesc td;
+  td.extent = {4, 4};
+  td.format = dev::Format::RGBA8_UNORM;
+  td.usage = res::TextureUsage::Sampled;
+  return td;
+}
+
+}  // namespace
+
+// P0-1:默认 sampled_texture_slots == 0 → 不建描述符集,既有行为不变。
+TEST(PipelineSampledTexture, DefaultSlotCountKeepsZeroDescriptorSets) {
+  auto d = require_sw_device();
+  if (!d) return;
+
+  res::PipelineDesc def = graphics_desc();  // 不给 sampled_texture_slots(默认 0)
+  EXPECT_EQ(def.sampled_texture_slots, 0u) << "默认值必须是 0";
+
+  auto p = d->create_pipeline(def);
+  ASSERT_TRUE(p.ok()) << p.message();
+  EXPECT_EQ(p.value()->descriptor_set_count(), 0u)
+      << "P0-1:slots=0 必须仍返回 0 个描述符集(既有管线逐字节不变的结构性保证)";
+  EXPECT_EQ(p.value()->sampled_texture_slots(), 0u);
+
+  // 设备态也不应偷偷建出描述符集对象。
+  auto* vp = dynamic_cast<magicblocks::backend::VulkanPipeline*>(p.value().get());
+  if (vp != nullptr) {
+    EXPECT_FALSE(vp->has_descriptor_set()) << "slots=0 时不得建 VkDescriptorSet";
+    EXPECT_EQ(vp->vk_set_layout(), VK_NULL_HANDLE) << "slots=0 时不得建 VkDescriptorSetLayout";
+    EXPECT_EQ(vp->vk_descriptor_pool(), VK_NULL_HANDLE) << "slots=0 时不得建 VkDescriptorPool";
+  }
+}
+
+// P0-1:声明 1 个槽 → 恰好 1 个描述符集。
+TEST(PipelineSampledTexture, OneSlotCreatesExactlyOneDescriptorSet) {
+  auto d = require_sw_device();
+  if (!d) return;
+
+  auto p = d->create_pipeline(textured_desc(1));
+  ASSERT_TRUE(p.ok()) << p.message();
+  EXPECT_EQ(p.value()->descriptor_set_count(), 1u) << "slots>0 必须建恰好 1 个描述符集";
+  EXPECT_EQ(p.value()->sampled_texture_slots(), 1u);
+
+  auto* vp = dynamic_cast<magicblocks::backend::VulkanPipeline*>(p.value().get());
+  ASSERT_NE(vp, nullptr);
+  EXPECT_TRUE(vp->has_descriptor_set()) << "设备态必须真正分配出 VkDescriptorSet";
+  EXPECT_NE(vp->vk_set_layout(), VK_NULL_HANDLE);
+  EXPECT_NE(vp->vk_descriptor_pool(), VK_NULL_HANDLE);
+
+  // 声明多个槽也仍是 1 个 set(本轮不做多集)。
+  auto p4 = d->create_pipeline(textured_desc(4));
+  ASSERT_TRUE(p4.ok()) << p4.message();
+  EXPECT_EQ(p4.value()->descriptor_set_count(), 1u)
+      << "多 slot 仍是 1 个 set(array),不是多个 set";
+  EXPECT_EQ(p4.value()->sampled_texture_slots(), 4u);
+}
+
+// P0:slot 越界 → 返回错误 Status,不崩、不静默丢弃。
+TEST(PipelineSampledTexture, RejectsOutOfRangeSlot) {
+  auto d = require_sw_device();
+  if (!d) return;
+  res::IMemoryAllocator* a = d->memory_allocator();
+  ASSERT_NE(a, nullptr);
+  ASSERT_TRUE(a->reserve_pages(res::MemoryKind::Texture, 1).ok());
+  ASSERT_TRUE(a->reserve_pages(res::MemoryKind::Staging, 1).ok());
+
+  // 管线只声明 1 个槽。
+  auto p = d->create_pipeline(textured_desc(1));
+  ASSERT_TRUE(p.ok()) << p.message();
+
+  auto tr = d->create_texture(unit_tex());
+  ASSERT_TRUE(tr.ok()) << tr.message();
+  auto sm = d->create_sampler(res::SamplerDesc{});
+  ASSERT_TRUE(sm.ok()) << sm.message();
+
+  auto tgt = d->create_offscreen_target({8, 8, dev::Format::RGBA8_UNORM});
+  ASSERT_TRUE(tgt.ok()) << tgt.message();
+  auto cl = d->create_command_list();
+  ASSERT_TRUE(cl.ok()) << cl.message();
+  auto* vcl = dynamic_cast<magicblocks::backend::VulkanCommandList*>(cl.value().get());
+  ASSERT_NE(vcl, nullptr);
+  ASSERT_TRUE(vcl->init().ok());
+  ASSERT_TRUE(vcl->remember_texture_sampler(tr.value()->id(), tr.value().get(),
+                                            sm.value()->id(), sm.value().get())
+                  .ok());
+
+  res::RenderPassDesc rp;
+  rp.target = tgt.value().get();
+  ASSERT_TRUE(cl.value()->begin_pass(rp).ok());
+  ASSERT_TRUE(cl.value()->bind_pipeline(p.value().get(), p.value()->hash()).ok());
+
+  const res::u32 before = cl.value()->command_count();
+  const dev::Status bad = cl.value()->bind_sampled_texture(tr.value()->id(), sm.value()->id(), 1);
+  EXPECT_FALSE(bad.ok()) << "slot 越界必须失败";
+  EXPECT_EQ(bad.code, dev::StatusCode::InvalidArgument);
+  EXPECT_EQ(cl.value()->command_count(), before) << "失败的绑定不得计入命令数";
+
+  // slot 0 在声明了 1 个槽的管线上是合法的(证明失败原因是越界而非其他)。
+  const dev::Status good =
+      cl.value()->bind_sampled_texture(tr.value()->id(), sm.value()->id(), 0);
+  EXPECT_TRUE(good.ok()) << good.message;
+  EXPECT_EQ(cl.value()->command_count(), before + 1)
+      << "成功的绑定必须计入命令数(与 bind_pipeline 同口径)";
+  ASSERT_TRUE(cl.value()->end_pass().ok());
+}
+
+// P0:命令录制 —— bind_sampled_texture 进入命令流,句柄按偏移打包(M3)。
+TEST(PipelineSampledTexture, RecordsIntoCommandStream) {
+  auto d = require_sw_device();
+  if (!d) return;
+  res::IMemoryAllocator* a = d->memory_allocator();
+  ASSERT_NE(a, nullptr);
+  ASSERT_TRUE(a->reserve_pages(res::MemoryKind::Texture, 1).ok());
+
+  auto p = d->create_pipeline(textured_desc(2));
+  ASSERT_TRUE(p.ok()) << p.message();
+  auto tr = d->create_texture(unit_tex());
+  ASSERT_TRUE(tr.ok()) << tr.message();
+  auto sm = d->create_sampler(res::SamplerDesc{});
+  ASSERT_TRUE(sm.ok()) << sm.message();
+  auto tgt = d->create_offscreen_target({8, 8, dev::Format::RGBA8_UNORM});
+  ASSERT_TRUE(tgt.ok()) << tgt.message();
+  auto cl = d->create_command_list();
+  ASSERT_TRUE(cl.ok()) << cl.message();
+  auto* vcl = dynamic_cast<magicblocks::backend::VulkanCommandList*>(cl.value().get());
+  ASSERT_NE(vcl, nullptr);
+  ASSERT_TRUE(vcl->init().ok());
+
+  res::RenderPassDesc rp;
+  rp.target = tgt.value().get();
+  ASSERT_TRUE(cl.value()->begin_pass(rp).ok());
+  ASSERT_TRUE(cl.value()->bind_pipeline(p.value().get(), p.value()->hash()).ok());
+  ASSERT_TRUE(cl.value()->bind_sampled_texture(tr.value()->id(), sm.value()->id(), 0).ok());
+  ASSERT_TRUE(cl.value()->bind_sampled_texture(tr.value()->id(), sm.value()->id(), 1).ok());
+  ASSERT_TRUE(cl.value()->end_pass().ok());
+
+  // op 计数:两次纹理绑定都应落进命令流。
+  EXPECT_EQ(vcl->op_count(magicblocks::backend::CommandOp::BindSampledTexture), 2u)
+      << "每次 bind_sampled_texture 都必须录制进命令流";
+  EXPECT_EQ(vcl->command_count(), 5u) << "begin_pass + bind_pipeline + 2×bind + end_pass";
+
+  // M3:句柄按 page_id/offset 打包,不是指针。
+  const auto& rec = vcl->recorded();
+  bool saw_slot0 = false;
+  bool saw_slot1 = false;
+  for (const auto& c : rec) {
+    if (c.op != magicblocks::backend::CommandOp::BindSampledTexture) continue;
+    EXPECT_TRUE(c.packed_ok) << "纹理句柄必须能 pack 进命令流(M3)";
+    magicblocks::resources::u64 expect = 0;
+    ASSERT_TRUE(c.resource.pack(&expect)) << "纹理句柄必须可打包";
+    EXPECT_EQ(c.packed_resource, expect) << "命令流存的是偏移不是指针";
+    EXPECT_NE(c.packed_sampler, 0u) << "采样器句柄也必须打包";
+    EXPECT_EQ(c.resource.page_id, tr.value()->id().page_id);
+    if (c.a == 0) saw_slot0 = true;
+    if (c.a == 1) saw_slot1 = true;
+  }
+  EXPECT_TRUE(saw_slot0);
+  EXPECT_TRUE(saw_slot1);
+}

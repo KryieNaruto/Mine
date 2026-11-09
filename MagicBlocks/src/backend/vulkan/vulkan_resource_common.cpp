@@ -135,6 +135,23 @@ Status bind_image_memory(VkDevice device, VkImage image, const resources::Resour
 
 VkFormat vk_format_of(device::Format f) { return to_vk_format(f); }
 
+VkSampleCountFlagBits to_vk_samples(std::uint32_t n) {
+  // 取值集合与 collect_msaa()(vulkan_device.cpp)对齐:1/2/4/8/16。
+  // 16 也列上是因为桌面 GPU 普遍支持;移动端通常只到 4。
+  switch (n) {
+    case 2:
+      return VK_SAMPLE_COUNT_2_BIT;
+    case 4:
+      return VK_SAMPLE_COUNT_4_BIT;
+    case 8:
+      return VK_SAMPLE_COUNT_8_BIT;
+    case 16:
+      return VK_SAMPLE_COUNT_16_BIT;
+    default:
+      return VK_SAMPLE_COUNT_1_BIT;
+  }
+}
+
 std::uint32_t format_pixel_bytes(device::Format f) {
   switch (f) {
     case device::Format::RGBA8_UNORM:

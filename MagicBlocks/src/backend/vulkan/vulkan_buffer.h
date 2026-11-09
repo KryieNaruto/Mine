@@ -116,6 +116,10 @@ class VulkanBuffer final : public IBuffer {
   device::Status allocate_block();
   // 把一条待提交上传真正落到目标缓冲:设备态走 vkCmdCopyBuffer,软件态走 memcpy。
   device::Status commit_upload(const PendingUpload& up);
+  // 设备页目标的实际上传通道:物化一张临时 HOST_VISIBLE 的 staging VkBuffer,
+  // 把 pending_ 里的全部数据一次性拷进 vk_buffer_,提交并等待完成。
+  // 只在 flush_pending() 里、且目标不可映射时调用。失败返回明确错误(**不静默丢弃**)。
+  device::Status flush_pending_device_pages();
 
   VulkanContext ctx_{};
   bool has_ctx_ = false;

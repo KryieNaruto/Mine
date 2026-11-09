@@ -15,6 +15,9 @@ namespace {
 
 constexpr u32 kDefaultMaxPushConstants = 128;  // 移动端下限(spec R4:实测 >= 128)
 constexpr u32 kDefaultMaxPushConstantStages = 2;  // Vertex + Fragment
+// P0(X1):本轮"1 个 descriptor set + array slot"模型的上限。不做 bindless,
+// 所以不放宽到几百;颜色贴图 + 深度贴图这类用法个位数就够。
+constexpr u32 kMaxSampledTextureSlots = 16;
 
 bool is_power_of_two(u32 v) { return v != 0 && (v & (v - 1)) == 0; }
 
@@ -124,20 +127,8 @@ VkFormat to_vk_vertex_format(resources::VertexFormat f) {
   return VK_FORMAT_UNDEFINED;
 }
 
-VkSampleCountFlagBits to_vk_samples(u32 n) {
-  switch (n) {
-    case 2:
-      return VK_SAMPLE_COUNT_2_BIT;
-    case 4:
-      return VK_SAMPLE_COUNT_4_BIT;
-    case 8:
-      return VK_SAMPLE_COUNT_8_BIT;
-    case 16:
-      return VK_SAMPLE_COUNT_16_BIT;
-    default:
-      return VK_SAMPLE_COUNT_1_BIT;
-  }
-}
+// MSAA:采样数 → VkSampleCountFlagBits 已提到 vulkan_resource_common.h，
+// 由本文件、vulkan_draw.cpp、vulkan_device_frame.cpp 共用一份(不复制第二份)。
 
 std::uint32_t stage_bit(ShaderStage s) {
   switch (s) {
@@ -245,6 +236,25 @@ u64 hash_pipeline_desc(const PipelineDesc& desc) {
   hash_raw(&h, desc.primitive);
   hash_mix(&h, desc.compute ? 1u : 0u);
   hash_raw(&h, desc.push_constant_bytes);
+  // P0(X1):sampled_texture_slots **只在非 0 时**参与哈希。
+  // 这样 slots == 0 的既有管线哈希逐位不变(P0-1 的验收口径:既有 5 张 golden
+  // 逐字节不变),而声明了纹理槽的新管线与未声明的是不同管线(去重表不会错合并)。
+  if (desc.sampled_texture_slots != 0) {
+    hash_raw(&h, desc.sampled_texture_slots);
+  }
+  return h;
+}
+
+u64 hash_pipeline_desc_with_shape(const PipelineDesc& desc, const AttachmentShape& shape) {
+  // 形状为默认值时返回基础哈希 → 与历史命令流/既有单测逐位一致。
+  const bool is_default_shape = shape.color_format == device::Format::RGBA8_UNORM &&
+                                !shape.has_depth && shape.samples == 1;
+  u64 h = hash_pipeline_desc(desc);
+  if (is_default_shape) return h;
+  hash_raw(&h, shape.color_format);
+  hash_mix(&h, shape.has_depth ? 1u : 0u);
+  if (shape.has_depth) hash_raw(&h, shape.depth_format);
+  hash_raw(&h, shape.samples);
   return h;
 }
 
@@ -365,6 +375,14 @@ Status VulkanPipeline::validate(const PipelineDesc& desc, u32 max_push_constant_
     return Status::Invalid("PipelineDesc: push_constant_bytes 必须是 4 的倍数");
   }
 
+  // 8.5) P0(X1) sampled_texture_slots:本轮只做"1 个 set + 若干 array slot",
+  // 所以限制在 [0, kMaxSampledTextureSlots]。0 是默认值(不建描述符集)。
+  if (desc.sampled_texture_slots > kMaxSampledTextureSlots) {
+    return Status::Unsupported("PipelineDesc: sampled_texture_slots=" +
+                               std::to_string(desc.sampled_texture_slots) + " 超过本轮上限 " +
+                               std::to_string(kMaxSampledTextureSlots));
+  }
+
   // 9) samples 不支持 → Unsupported
   if (desc.samples == 0 || !is_power_of_two(desc.samples)) {
     return Status::Unsupported("PipelineDesc: samples=" + std::to_string(desc.samples) +
@@ -398,12 +416,112 @@ VulkanPipeline::~VulkanPipeline() {
     if (vk_render_pass_ != VK_NULL_HANDLE) {
       vkDestroyRenderPass(ctx_.device, vk_render_pass_, nullptr);
     }
+    // P0(X1):描述符集随 pool 一起释放,layout 最后销毁(与创建顺序相反)。
+    if (desc_pool_ != VK_NULL_HANDLE) {
+      vkDestroyDescriptorPool(ctx_.device, desc_pool_, nullptr);
+    }
+    if (set_layouts_ != VK_NULL_HANDLE) {
+      vkDestroyDescriptorSetLayout(ctx_.device, set_layouts_, nullptr);
+    }
     for (VkShaderModule m : vk_modules_) vkDestroyShaderModule(ctx_.device, m, nullptr);
   }
   vk_pipeline_ = VK_NULL_HANDLE;
   vk_layout_ = VK_NULL_HANDLE;
   vk_render_pass_ = VK_NULL_HANDLE;
+  set_layouts_ = VK_NULL_HANDLE;
+  desc_pool_ = VK_NULL_HANDLE;
+  desc_set_ = VK_NULL_HANDLE;
   vk_modules_.clear();
+}
+
+// ---------------------------------------------------------------- P0 描述符集(X1)
+
+Status VulkanPipeline::create_descriptor_objects() {
+  if (!has_ctx_ || ctx_.device == VK_NULL_HANDLE) {
+    return Status::Invalid("VulkanPipeline::create_descriptor_objects: 需要设备态");
+  }
+  if (desc_.sampled_texture_slots == 0) return Status::Ok_();  // 幂等:无事可做
+  if (set_layouts_ != VK_NULL_HANDLE) return Status::Ok_();     // 已建过
+
+  // 1) layout:单个 combined image sampler,descriptorCount = slots。
+  //    固定 set=0,binding=0..slots-1。可见阶段取顶点+片元(采样可在两者发生);
+  //    计算管线由 build_compute 走同一条路径,shader 自己只用得到的阶段。
+  VkDescriptorSetLayoutBinding b{};
+  b.binding = 0;
+  b.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  b.descriptorCount = desc_.sampled_texture_slots;
+  b.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT |
+                 VK_SHADER_STAGE_COMPUTE_BIT;
+  b.pImmutableSamplers = nullptr;  // 采样器运行期通过 bind_sampled_texture 写
+
+  VkDescriptorSetLayoutCreateInfo slci{};
+  slci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+  slci.bindingCount = 1;
+  slci.pBindings = &b;
+  VkResult r = vkCreateDescriptorSetLayout(ctx_.device, &slci, nullptr, &set_layouts_);
+  if (r != VK_SUCCESS) {
+    set_layouts_ = VK_NULL_HANDLE;
+    return Status::InitFailed(fmt_err("vkCreateDescriptorSetLayout", r));
+  }
+
+  // 2) pool:一个 layout、一个 set、slots 个 combined image sampler。
+  VkDescriptorPoolSize ps{};
+  ps.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  ps.descriptorCount = desc_.sampled_texture_slots;
+  VkDescriptorPoolCreateInfo dpci{};
+  dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+  dpci.maxSets = 1;
+  dpci.poolSizeCount = 1;
+  dpci.pPoolSizes = &ps;
+  r = vkCreateDescriptorPool(ctx_.device, &dpci, nullptr, &desc_pool_);
+  if (r != VK_SUCCESS) {
+    desc_pool_ = VK_NULL_HANDLE;
+    return Status::InitFailed(fmt_err("vkCreateDescriptorPool", r));
+  }
+
+  // 3) set:分配一个。
+  VkDescriptorSetAllocateInfo dsai{};
+  dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+  dsai.descriptorPool = desc_pool_;
+  dsai.descriptorSetCount = 1;
+  dsai.pSetLayouts = &set_layouts_;
+  r = vkAllocateDescriptorSets(ctx_.device, &dsai, &desc_set_);
+  if (r != VK_SUCCESS) {
+    desc_set_ = VK_NULL_HANDLE;
+    return Status::InitFailed(fmt_err("vkAllocateDescriptorSets", r));
+  }
+  return Status::Ok_();
+}
+
+Status VulkanPipeline::write_sampled_texture(u32 slot, VkImageView view, VkSampler sampler) {
+  if (set_layouts_ == VK_NULL_HANDLE || desc_set_ == VK_NULL_HANDLE) {
+    return Status::Invalid("VulkanPipeline::write_sampled_texture: 该管线未声明 "
+                           "sampled_texture_slots(PipelineDesc::sampled_texture_slots == 0)");
+  }
+  if (slot >= desc_.sampled_texture_slots) {
+    return Status::Invalid("VulkanPipeline::write_sampled_texture: slot " +
+                           std::to_string(slot) + " 越界(声明了 " +
+                           std::to_string(desc_.sampled_texture_slots) + " 个)");
+  }
+  if (view == VK_NULL_HANDLE || sampler == VK_NULL_HANDLE) {
+    return Status::Invalid("VulkanPipeline::write_sampled_texture: view/sampler 为空");
+  }
+
+  VkDescriptorImageInfo ii{};
+  ii.sampler = sampler;
+  ii.imageView = view;
+  ii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+  VkWriteDescriptorSet w{};
+  w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  w.dstSet = desc_set_;
+  w.dstBinding = 0;              // 单 binding,array 内按 slot 定位
+  w.dstArrayElement = slot;      // ← slot 即 array 下标
+  w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  w.descriptorCount = 1;
+  w.pImageInfo = &ii;
+  vkUpdateDescriptorSets(ctx_.device, 1, &w, 0, nullptr);
+  return Status::Ok_();
 }
 
 // ---------------------------------------------------------------- init
@@ -424,7 +542,10 @@ Status VulkanPipeline::init() {
   // R4:push constant 优先。stage 位固定为 Vertex|Fragment(计算管线只用 Compute)。
   push_stage_mask_ = desc_.compute ? stage_bit(ShaderStage::Compute)
                                    : (stage_bit(ShaderStage::Vertex) | stage_bit(ShaderStage::Fragment));
-  hash_ = hash_pipeline_desc(desc_);
+  // 哈希必须覆盖附件形状:同一 desc 在"有深度"与"无深度"的 pass 里是两条不同的
+  // VkPipeline;若哈希相同,设备层的管线缓存会串用,命令流也会把两条管线混为一谈。
+  // 默认形状时 hash_pipeline_desc_with_shape 退化为 hash_pipeline_desc(向后一致)。
+  hash_ = hash_pipeline_desc_with_shape(desc_, shape_);
 
   if (!has_ctx_ || ctx_.device == VK_NULL_HANDLE) {
     soft_ready_ = true;
@@ -436,7 +557,11 @@ Status VulkanPipeline::init() {
 // ---------------------------------------------------------------- 图形管线
 
 Status VulkanPipeline::create_render_pass() {
-  VkAttachmentDescription atts[2] = {};
+  // 附件排布与 vulkan_device_frame.cpp 的 create_pass() **必须逐项一致**:
+  //   [0]=color, [1]=depth(若有), 最后=color resolve(MSAA 时追加)
+  // 设备帧提交会优先复用本函数建的 pass(pass_compatible),两条路径排布不同
+  // 会得到两种行为,极难排查。
+  VkAttachmentDescription atts[3] = {};
   std::uint32_t att_count = 0;
   atts[0].format = vk_format_of(shape_.color_format);
   atts[0].samples = to_vk_samples(shape_.samples);
@@ -458,13 +583,53 @@ Status VulkanPipeline::create_render_pass() {
     atts[1].finalLayout = VK_IMAGE_LAYOUT_GENERAL;
     att_count = 2;
   }
+
+  // MSAA resolve 附件(断点 B)。没有 pResolveAttachments 时,多重采样颜色
+  // 不会降采样成单采样图像,读回拿到的是未定义内容。位置固定在最后,
+  // 末态与单采样时的颜色附件一致(finalLayout=GENERAL),读回路径不用分支。
+  const bool resolve = shape_.samples > 1;
+  std::uint32_t resolve_index = 0;
+  if (resolve) {
+    resolve_index = att_count;
+    atts[resolve_index].format = vk_format_of(shape_.color_format);
+    atts[resolve_index].samples = VK_SAMPLE_COUNT_1_BIT;
+    atts[resolve_index].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;  // resolve 会整体覆盖
+    atts[resolve_index].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    atts[resolve_index].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    atts[resolve_index].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    atts[resolve_index].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    atts[resolve_index].finalLayout = VK_IMAGE_LAYOUT_GENERAL;
+    ++att_count;
+  }
+
   VkAttachmentReference color_ref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
   VkAttachmentReference depth_ref{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+  VkAttachmentReference resolve_ref{resolve_index, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
   VkSubpassDescription sub{};
   sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
   sub.colorAttachmentCount = 1;
   sub.pColorAttachments = &color_ref;
   sub.pDepthStencilAttachment = shape_.has_depth ? &depth_ref : nullptr;
+  sub.pResolveAttachments = resolve ? &resolve_ref : nullptr;
+
+  // subpass 依赖：**不能省**。
+  //
+  // loadOp=CLEAR/LOAD 与随后着色器的颜色写入之间,如果没有一条 EXTERNAL→subpass 的
+  // 执行/内存依赖,规范上看就是"未定义顺序"。SwiftShader 对此的实际表现是
+  // **整片区域保持清屏色、一像素都不写**,并且完全不报错 —— 上层只会拿到一张
+  // 干净的空图,极易误判为"几何没进管线/剔除过激/着色器坐标错了"。
+  //
+  // create_pass()(vulkan_device_frame.cpp)与这里必须保持一致:
+  // 设备帧提交会优先复用**管线自带的 render pass**(见 BeginPass 回放分支),
+  // 所以两条路径的依赖缺失会得到两种不同行为,更难排查。
+  VkSubpassDependency dep{};
+  dep.srcSubpass = VK_SUBPASS_EXTERNAL;
+  dep.dstSubpass = 0;
+  dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+  dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+  dep.srcAccessMask = 0;
+  dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+  dep.dependencyFlags = 0;
 
   VkRenderPassCreateInfo rpci{};
   rpci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
@@ -472,6 +637,8 @@ Status VulkanPipeline::create_render_pass() {
   rpci.pAttachments = atts;
   rpci.subpassCount = 1;
   rpci.pSubpasses = &sub;
+  rpci.dependencyCount = 1;
+  rpci.pDependencies = &dep;
   const VkResult r = vkCreateRenderPass(ctx_.device, &rpci, nullptr, &vk_render_pass_);
   if (r != VK_SUCCESS) return Status::InitFailed(fmt_err("vkCreateRenderPass(管线)", r));
   return Status::Ok_();
@@ -605,15 +772,26 @@ Status VulkanPipeline::build_graphics() {
   cb.attachmentCount = 1;
   cb.pAttachments = &cba;
 
-  // ---- 管线布局(R4:只建 push constant range,setLayoutCount 恒 0) ----
+  // ---- 管线布局(R4 默认只建 push constant range;P0 起按需带 1 个描述符集) ----
   VkPushConstantRange pcr{};
   pcr.stageFlags = static_cast<VkShaderStageFlags>(push_stage_mask_);
   pcr.offset = 0;
   pcr.size = push_constant_bytes_;
+  // P0(X1):sampled_texture_slots > 0 才建描述符集布局;== 0 时下面三行保持
+  // 历史行为(setLayoutCount=0/pSetLayouts=nullptr),既有管线与 golden 不变。
+  //
+  // 变量名必须叫 desc_status 而不是 ds:本函数上面已经有一个
+  // `VkPipelineDepthStencilStateCreateInfo ds`(P12 的深度/模板状态),
+  // 两者同名会整体编译失败(C2371 重定义)。改的是名字,不是语义。
+  Status desc_status = Status::Ok_();
+  if (desc_.sampled_texture_slots > 0) {
+    desc_status = create_descriptor_objects();
+    if (!desc_status.ok()) return desc_status;
+  }
   VkPipelineLayoutCreateInfo plci{};
   plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-  plci.setLayoutCount = 0;        // ← R4:不建描述符集
-  plci.pSetLayouts = nullptr;     // ← Pipeline.UsesPushConstantsOnly 的结构性证据
+  plci.setLayoutCount = (set_layouts_ != VK_NULL_HANDLE) ? 1u : 0u;
+  plci.pSetLayouts = (set_layouts_ != VK_NULL_HANDLE) ? &set_layouts_ : nullptr;
   plci.pushConstantRangeCount = push_constant_bytes_ > 0 ? 1 : 0;
   plci.pPushConstantRanges = push_constant_bytes_ > 0 ? &pcr : nullptr;
   VkResult r = vkCreatePipelineLayout(ctx_.device, &plci, nullptr, &vk_layout_);
@@ -658,9 +836,16 @@ Status VulkanPipeline::build_compute() {
   pcr.stageFlags = static_cast<VkShaderStageFlags>(push_stage_mask_);
   pcr.offset = 0;
   pcr.size = push_constant_bytes_;
+  // P0(X1):计算管线同样能声明采样纹理槽(== 0 时保持 R4 的历史行为)。
+  Status ds = Status::Ok_();
+  if (desc_.sampled_texture_slots > 0) {
+    ds = create_descriptor_objects();
+    if (!ds.ok()) return ds;
+  }
   VkPipelineLayoutCreateInfo plci{};
   plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-  plci.setLayoutCount = 0;  // R4
+  plci.setLayoutCount = (set_layouts_ != VK_NULL_HANDLE) ? 1u : 0u;
+  plci.pSetLayouts = (set_layouts_ != VK_NULL_HANDLE) ? &set_layouts_ : nullptr;
   plci.pushConstantRangeCount = push_constant_bytes_ > 0 ? 1 : 0;
   plci.pPushConstantRanges = push_constant_bytes_ > 0 ? &pcr : nullptr;
   r = vkCreatePipelineLayout(ctx_.device, &plci, nullptr, &vk_layout_);

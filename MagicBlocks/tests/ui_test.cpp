@@ -27,7 +27,7 @@
 #include "magicblocks/ui/hud.h"
 #include "magicblocks/ui/input.h"
 #include "magicblocks/ui/perf.h"
-#include "magicblocks/ui/presenter.h"
+#include "magicblocks/ui/scene_frame.h"
 #include "magicblocks/ui/router.h"
 #include "magicblocks/ui/ui_app.h"
 #include "ui/offscreen_target.h"
@@ -65,57 +65,90 @@ class RecordingCamera final : public ui::ICameraSink {
   }
 };
 
-// 可控的 IPresentSurface:记录 acquire/submit/present 次数,并注入失败。
-class FakeSurface final : public ui::IPresentSurface {
+// 可控的 ISceneFrameSink:记录 acquire/submit/present 次数,并注入失败。
+class FakeSink final : public ui::ISceneFrameSink {
  public:
   int acquires = 0;
-  int /**/ submits = 0;
+  int submits = 0;
   int presents = 0;
   bool is_ready = true;
   bool fail_acquire = false;
   bool fail_submit = false;
   bool fail_present = false;
-  ui::PresenterStatus failure = ui::PresenterStatus::NeedRebuild;
+  int submit_passes = 0;
+  ui::SinkStatus status = ui::SinkStatus::NeedRebuild;
 
-  bool acquire(ui::FrameImage* out) override {
+  dev::Extent2D extent() const override { return dev::Extent2D{320, 240}; }
+  dev::Format format() const override { return dev::Format::RGBA8_UNORM; }
+  bool ready() const override { return is_ready; }
+
+  bool acquire_image(ui::SinkImage* out) override {
     ++acquires;
     if (fail_acquire) return false;
     out->id = static_cast<std::uint64_t>(acquires);
-    out->width = 320;
-    out->height = 240;
+    out->extent = extent();
+    out->format = format();
     out->valid = true;
     return true;
   }
-  bool submit(std::uint64_t, std::uint64_t) override {
+  bool submit_frame(mb::resources::ICommandList&) override {
     ++submits;
     return !fail_submit;
   }
-  bool present(const ui::FrameImage&, std::uint64_t) override {
+  bool present_image(const ui::SinkImage&) override {
     ++presents;
     return !fail_present;
   }
-  bool ready() const override { return is_ready; }
-  ui::PresenterStatus last_failure() const override { return failure; }
+  ui::SinkStatus last_status() const override { return status; }
 };
 
-// 可控的 IFrameRenderer:记录录制次数。
-class FakeRenderer final : public ui::IFrameRenderer {
+// 最小命令列表桩:只记录"有没有被提交过",不真的编码任何命令。
+// 真实的 VulkanCommandList 需要设备,单测里用不上。
+class FakeCommandList final : public mb::resources::ICommandList {
  public:
-  int records = 0;
-  bool fail = false;
-  bool render_into_device_image(std::uint64_t, ui::FrameImage* out,
-                                std::uint64_t* sem) override {
-    ++records;
-    if (fail) return false;
-    out->id = 7;
-    out->width = 320;
-    out->height = 240;
-    out->valid = true;
-    *sem = 42;
-    return true;
+  int submits = 0;
+  ui::u32 command_count() const override { return static_cast<ui::u32>(commands); }
+  int commands = 0;
+  bool recording() const override { return true; }
+  bool in_pass() const override { return false; }
+  void reset() override { commands = 0; }
+  mb::resources::Status submit_and_wait() override { ++submits; return {}; }
+
+  mb::resources::Status bind_pipeline(mb::resources::IPipeline*, ui::u64) override { return {}; }
+  mb::resources::Status bind_vertex_buffer(const mb::resources::ResourceId&, ui::u32,
+                                           ui::u64) override {
+    return {};
   }
-  bool render_to_memory(ui::u32, ui::u32, std::uint8_t*, ui::u32) override { return !fail; }
+  mb::resources::Status bind_index_buffer(const mb::resources::ResourceId&,
+                                          mb::resources::IndexFormat, ui::u64) override {
+    return {};
+  }
+  mb::resources::Status draw(const mb::resources::DrawArgs&) override { return {}; }
+  mb::resources::Status draw_indexed(const mb::resources::DrawArgs&) override { return {}; }
+  mb::resources::Status draw_instanced(const mb::resources::DrawArgs&) override { return {}; }
+  mb::resources::Status push_constants(ui::u32, ui::u32, ui::u32, const void*) override {
+    return {};
+  }
+  mb::resources::Status set_viewport(const mb::resources::Viewport&) override { return {}; }
+  mb::resources::Status set_scissor(const mb::resources::ScissorRect&) override { return {}; }
+  // P0 命令 12 的测试替身:记下 (texture, sampler, slot),便于用例断言"确实绑了"。
+  struct SampledBind {
+    mb::resources::ResourceId texture;
+    mb::resources::ResourceId sampler;
+    ui::u32 slot = 0;
+  };
+  std::vector<SampledBind> sampled_binds;
+  mb::resources::Status bind_sampled_texture(const mb::resources::ResourceId& texture,
+                                             const mb::resources::ResourceId& sampler,
+                                             ui::u32 slot) override {
+    sampled_binds.push_back({texture, sampler, slot});
+    ++commands;
+    return {};
+  }
+  mb::resources::Status begin_pass(const mb::resources::RenderPassDesc&) override { return {}; }
+  mb::resources::Status end_pass() override { return {}; }
 };
+
 
 // 假场景(S1 桩),只记快照往返。
 class FakeScene final : public ui::stub::IScene {
@@ -645,170 +678,202 @@ TEST(ui_Perf, PanelTextIsStableAscii) {
   EXPECT_NE(text.find("submit_viol="), std::string::npos);
 }
 
-// ================================================================ Presenter(spec §5)
+// ================================================================ SceneFrame(调研 v2 §7 新路线)
+//
+// 路线变更:旧 Presenter 把「场景 pass + UI pass」录进同一 command list 再上屏,
+// 该路线作废。新 `SceneFrameDriver` 只把**场景**交给壳层的 `ISceneFrameSink`,
+// UI 合成归壳层。下面这些用例验证驱动侧那部分不变量:
+// 每帧恰一次 submit、阶段顺序、失败不重试、后台不消耗帧号、输入延迟可测。
 
-TEST(ui_Presenter, OneFrameOneSubmitOnePresent) {
-  FakeSurface surface;
-  FakeRenderer renderer;
-  ui::Presenter p;
-  p.set_surface(nullptr, &surface);
-  p.set_renderer(&renderer);
+TEST(ui_SceneFrame, OneFrameOneSubmitOnePresent) {
+  FakeSink sink;
+  ui::SceneFrameDriver d;
+  FakeCommandList cmds_d;
+  d.set_command_list(&cmds_d);
+  d.set_sink(&sink);
 
-  const auto r = p.run_frame();
-  EXPECT_EQ(r.status, ui::PresenterStatus::Ok);
+  const auto r = d.run_frame();
+  EXPECT_EQ(r.status, ui::FrameStatus::Ok);
   EXPECT_EQ(r.phase, ui::FramePhase::Presented);
-  EXPECT_EQ(r.submits_this_frame, 1u) << "spec §10 验收门 2:主路径每帧恰一次 submit";
-  EXPECT_EQ(surface.submits, 1);
-  EXPECT_EQ(surface.presents, 1);
-  EXPECT_EQ(surface.acquires, 1);
-  EXPECT_EQ(renderer.records, 1);
+  EXPECT_EQ(r.submits_this_frame, 1u) << "spec 10 验收门 2:每帧恰一次 submit";
+  EXPECT_EQ(sink.acquires, 1);
+  EXPECT_EQ(sink.presents, 1);
 }
 
-TEST(ui_Presenter, RunsSixtyFramesWithoutDebt) {
-  FakeSurface surface;
-  FakeRenderer renderer;
-  ui::Presenter p;
-  p.set_surface(nullptr, &surface);
-  p.set_renderer(&renderer);
+TEST(ui_SceneFrame, RunsSixtyFramesWithoutDebt) {
+  FakeSink sink;
+  ui::SceneFrameDriver d;
+  FakeCommandList cmds_d;
+  d.set_command_list(&cmds_d);
+  d.set_sink(&sink);
   for (int i = 0; i < 60; ++i) {
-    const auto r = p.run_frame();
-    ASSERT_EQ(r.status, ui::PresenterStatus::Ok) << "第 " << i << " 帧失败";
+    const auto r = d.run_frame();
+    ASSERT_EQ(r.status, ui::FrameStatus::Ok) << "第 " << i << " 帧失败";
     ASSERT_EQ(r.submits_this_frame, 1u) << "第 " << i << " 帧 submit 数不为 1";
-    EXPECT_LE(p.frames_in_flight(), 2u) << "spec §5.1 P5:帧栅栏最多滞后 N=2 帧";
+    EXPECT_LE(d.frames_in_flight(), 2u) << "spec 5.1 P5:帧栅栏最多滞后 N=2 帧";
   }
-  EXPECT_EQ(surface.submits, 60);
-  EXPECT_EQ(surface.presents, 60);
+  EXPECT_EQ(sink.acquires, 60);
+  EXPECT_EQ(sink.presents, 60);
 }
 
-TEST(ui_Presenter, InactiveSurfaceSkipsWithoutConsumingFrame) {
-  FakeSurface surface;
-  FakeRenderer renderer;
-  ui::Presenter p;
-  p.set_surface(nullptr, &surface);
-  p.set_renderer(&renderer);
-  p.set_active(false);  // G7:后台
-  const auto r = p.run_frame();
-  EXPECT_EQ(r.status, ui::PresenterStatus::NoSurface);
+TEST(ui_SceneFrame, InactiveSkipsWithoutConsumingFrame) {
+  FakeSink sink;
+  ui::SceneFrameDriver d;
+  FakeCommandList cmds_d;
+  d.set_command_list(&cmds_d);
+  d.set_sink(&sink);
+  d.set_active(false);  // G7:后台
+  const auto r = d.run_frame();
+  EXPECT_EQ(r.status, ui::FrameStatus::NoSurface);
   EXPECT_EQ(r.phase, ui::FramePhase::Skipped);
-  EXPECT_EQ(surface.acquires, 0) << "后台不得 acquire";
-  EXPECT_EQ(p.frames_in_flight(), 0u) << "后台不得推进帧栅栏";
+  EXPECT_EQ(sink.acquires, 0) << "后台不得 acquire";
+  EXPECT_EQ(d.frames_in_flight(), 0u) << "后台不得推进帧栅栏";
 
-  p.set_active(true);
-  const auto r2 = p.run_frame();
-  EXPECT_EQ(r2.status, ui::PresenterStatus::Ok);
+  d.set_active(true);
+  const auto r2 = d.run_frame();
+  EXPECT_EQ(r2.status, ui::FrameStatus::Ok);
   EXPECT_EQ(r2.frame_index, 0u) << "后台期间不消耗帧号";
 }
 
-TEST(ui_Presenter, AcquireFailureIsReportedNotRetried) {
-  FakeSurface surface;
-  FakeRenderer renderer;
-  surface.fail_acquire = true;
-  surface.failure = ui::PresenterStatus::NeedRebuild;
-  ui::Presenter p;
-  p.set_surface(nullptr, &surface);
-  p.set_renderer(&renderer);
-  const auto r = p.run_frame();
-  EXPECT_EQ(r.status, ui::PresenterStatus::NeedRebuild) << "OUT_OF_DATE 必须映射成 NeedRebuild";
-  EXPECT_EQ(surface.acquires, 1) << "失败后不得内部重试(重试混淆问题归属)";
-  EXPECT_EQ(surface.submits, 0);
+TEST(ui_SceneFrame, AcquireFailureIsReportedNotRetried) {
+  FakeSink sink;
+  sink.fail_acquire = true;
+  sink.status = ui::SinkStatus::NeedRebuild;
+  ui::SceneFrameDriver d;
+  FakeCommandList cmds_d;
+  d.set_command_list(&cmds_d);
+  d.set_sink(&sink);
+  const auto r = d.run_frame();
+  EXPECT_EQ(r.status, ui::FrameStatus::NeedRebuild) << "OUT_OF_DATE 必须映射成 NeedRebuild";
+  EXPECT_EQ(sink.acquires, 1) << "失败后不得内部重试(重试混淆问题归属)";
+  EXPECT_EQ(sink.submits, 0);
 }
 
-TEST(ui_Presenter, StageOrderIsExact) {
-  // spec §5.2 的顺序:1 WaitFence → 2 Acquire → 3 Record → 4 Submit → 5 Present
-  const ui::FramePhase expected[] = {ui::FramePhase::WaitFence, ui::FramePhase::Acquire,
-                                     ui::FramePhase::Record, ui::FramePhase::Submit,
-                                     ui::FramePhase::Presented};
-  for (auto stop : expected) {
-    FakeSurface surface;
-    FakeRenderer renderer;
-    ui::Presenter p;
-    p.set_surface(nullptr, &surface);
-    p.set_renderer(&renderer);
-    p.set_stop_after(stop);
-    const auto r = p.run_frame();
-    EXPECT_EQ(r.phase, stop);
-    EXPECT_EQ(r.status, ui::PresenterStatus::Ok);
-  }
+TEST(ui_SceneFrame, FailureStopsBeforeSubmitAndPresent) {
+  // 新路线没有 WaitFence 阶段(GPU 同步归壳层),失败必须停在出问题的阶段上。
+  FakeSink sink;
+  sink.fail_acquire = true;
+  sink.status = ui::SinkStatus::SurfaceLost;
+  ui::SceneFrameDriver d;
+  FakeCommandList cmds_d;
+  d.set_command_list(&cmds_d);
+  d.set_sink(&sink);
+  const auto r = d.run_frame();
+  EXPECT_EQ(r.status, ui::FrameStatus::SurfaceLost);
+  EXPECT_EQ(r.phase, ui::FramePhase::Skipped);
+  EXPECT_EQ(sink.submits, 0);
+  EXPECT_EQ(sink.presents, 0);
 
-  // 停在 Submit 之前:一次 submit 都没有
-  FakeSurface s1;
-  FakeRenderer r1;
-  ui::Presenter p1;
-  p1.set_surface(nullptr, &s1);
-  p1.set_renderer(&r1);
-  p1.set_stop_after(ui::FramePhase::Record);
-  p1.run_frame();
-  EXPECT_EQ(s1.submits, 0);
-  EXPECT_EQ(s1.presents, 0);
-
-  // 停在 Submit:有 submit,还没 present
-  FakeSurface s2;
-  FakeRenderer r2;
-  ui::Presenter p2;
-  p2.set_surface(nullptr, &s2);
-  p2.set_renderer(&r2);
-  p2.set_stop_after(ui::FramePhase::Submit);
-  p2.run_frame();
-  EXPECT_EQ(s2.submits, 1);
-  EXPECT_EQ(s2.presents, 0);
+  // 成功路径:阶段停在 Presented
+  FakeSink ok;
+  ui::SceneFrameDriver d2;
+  FakeCommandList cmds_d2;
+  d2.set_command_list(&cmds_d2);
+  d2.set_sink(&ok);
+  const auto r2 = d2.run_frame();
+  EXPECT_EQ(r2.phase, ui::FramePhase::Presented);
+  EXPECT_EQ(ok.acquires, 1);
+  EXPECT_EQ(ok.presents, 1);
 }
 
-TEST(ui_Presenter, InputLatencyTracked) {
-  FakeSurface surface;
-  FakeRenderer renderer;
-  ui::Presenter p;
-  p.set_surface(nullptr, &surface);
-  p.set_renderer(&renderer);
-  p.mark_input(0);  // 第 0 帧时登记输入
-  const auto r0 = p.run_frame();
+TEST(ui_SceneFrame, InputLatencyTracked) {
+  FakeSink sink;
+  ui::SceneFrameDriver d;
+  FakeCommandList cmds_d;
+  d.set_command_list(&cmds_d);
+  d.set_sink(&sink);
+  d.mark_input(0);  // 第 0 帧时登记输入
+  const auto r0 = d.run_frame();
   EXPECT_EQ(r0.input_latency_frames, 0u);
-  const auto r1 = p.run_frame();
-  EXPECT_EQ(r1.input_latency_frames, 1u) << "spec §6 G6:input→present 帧差";
+  const auto r1 = d.run_frame();
+  EXPECT_EQ(r1.input_latency_frames, 1u) << "spec 6 G6:input->present 帧差";
   EXPECT_LE(r1.input_latency_frames, 2u);
 }
 
-TEST(ui_Presenter, SubmitFailureSurfaces) {
-  FakeSurface surface;
-  FakeRenderer renderer;
-  surface.fail_submit = true;
-  ui::Presenter p;
-  p.set_surface(nullptr, &surface);
-  p.set_renderer(&renderer);
-  const auto r = p.run_frame();
-  EXPECT_EQ(r.status, ui::PresenterStatus::SubmitFailed);
-  EXPECT_EQ(surface.presents, 0) << "提交失败不得继续 present";
+TEST(ui_SceneFrame, SubmitFailureSurfaces) {
+  FakeSink sink;
+  sink.fail_submit = true;
+  sink.status = ui::SinkStatus::SubmitFailed;
+  ui::SceneFrameDriver d;
+  FakeCommandList cmds_d;
+  d.set_command_list(&cmds_d);
+  d.set_sink(&sink);
+  const auto r = d.run_frame();
+  EXPECT_EQ(r.status, ui::FrameStatus::SubmitFailed);
+  EXPECT_EQ(sink.presents, 0) << "提交失败不得继续 present";
 }
 
-TEST(ui_Presenter, RecordFailureSurfaces) {
-  FakeSurface surface;
-  FakeRenderer renderer;
-  renderer.fail = true;
-  ui::Presenter p;
-  p.set_surface(nullptr, &surface);
-  p.set_renderer(&renderer);
-  const auto r = p.run_frame();
-  EXPECT_EQ(r.status, ui::PresenterStatus::RecordFailed);
-  EXPECT_EQ(surface.submits, 0);
+TEST(ui_SceneFrame, PresentFailureSurfaces) {
+  FakeSink sink;
+  sink.fail_present = true;
+  sink.status = ui::SinkStatus::SurfaceLost;
+  ui::SceneFrameDriver d;
+  FakeCommandList cmds_d;
+  d.set_command_list(&cmds_d);
+  d.set_sink(&sink);
+  const auto r = d.run_frame();
+  EXPECT_EQ(r.status, ui::FrameStatus::SurfaceLost);
 }
 
-TEST(ui_Presenter, NoSurfaceSkips) {
-  FakeRenderer renderer;
-  ui::Presenter p;
-  p.set_renderer(&renderer);
-  const auto r = p.run_frame();
-  EXPECT_EQ(r.status, ui::PresenterStatus::NoSurface);
-  EXPECT_EQ(renderer.records, 0);
+TEST(ui_SceneFrame, NoSinkSkips) {
+  // 离屏模式(CLI/CI):没有壳层 surface,场景帧跳过是**正常**的,不是错误
+  ui::SceneFrameDriver d;
+  FakeCommandList cmds_d;
+  d.set_command_list(&cmds_d);
+  const auto r = d.run_frame();
+  EXPECT_EQ(r.status, ui::FrameStatus::NoSurface);
+  EXPECT_TRUE(r.ok()) << "跳过不是失败";
+  EXPECT_EQ(r.phase, ui::FramePhase::Skipped);
+}
+
+TEST(ui_SceneFrame, LifecyclePauseAndResume) {
+  FakeSink sink;
+  ui::SceneFrameDriver d;
+  FakeCommandList cmds_d;
+  d.set_command_list(&cmds_d);
+  d.set_sink(&sink);
+
+  dev::AppLifecycleEvent ev{};
+  ev.kind = dev::LifecycleKind::Paused;
+  d.on_lifecycle(ev);
+  EXPECT_FALSE(d.active());
+  EXPECT_EQ(d.run_frame().status, ui::FrameStatus::NoSurface);
+
+  ev.kind = dev::LifecycleKind::Resumed;
+  d.on_lifecycle(ev);
+  EXPECT_TRUE(d.active());
+  EXPECT_EQ(d.run_frame().status, ui::FrameStatus::Ok);
+}
+
+// 命令 12 的契约(command.h 第 138 行):bind_sampled_texture **计入 command_count()**,
+// 与 bind_pipeline 同口径。这条容易漏 —— 漏了的话回放比对"命令条数一致"时
+// 会把纹理绑定算漏,画面只是"没纹理",**不报错**。
+TEST(ui_SceneFrame, BindSampledTextureCountsAsCommand) {
+  FakeCommandList cmds;
+  EXPECT_EQ(cmds.command_count(), 0u);
+
+  mb::resources::ResourceId tex;
+  tex.id = 11;
+  mb::resources::ResourceId smp;
+  smp.id = 22;
+  ASSERT_TRUE(cmds.bind_sampled_texture(tex, smp, 3u).ok());
+
+  EXPECT_EQ(cmds.command_count(), 1u) << "bind_sampled_texture 必须计入 command_count()";
+  ASSERT_EQ(cmds.sampled_binds.size(), 1u);
+  EXPECT_EQ(cmds.sampled_binds[0].slot, 3u);
+  EXPECT_EQ(cmds.sampled_binds[0].texture.id, tex.id);
+  EXPECT_EQ(cmds.sampled_binds[0].sampler.id, smp.id);
 }
 
 // ================================================================ UiApp 装配
 
-TEST(ui_UiApp, InitFailsExplicitlyWithoutRenderer) {
+TEST(ui_UiApp, InitFailsExplicitlyWithoutSink) {
   // 主路径缺件必须明确失败,不能静默退化成离屏(spec §3 方案 A 禁止)
   ui::UiApp app;
   ui::UiAppConfig cfg;
   cfg.mode = ui::TargetMode::Swapchain;
   ui::UiAppDeps deps;
-  deps.present_surface = nullptr;
+  deps.scene_sink = nullptr;
   std::string err;
   EXPECT_FALSE(app.init(cfg, deps, &err));
   EXPECT_FALSE(err.empty()) << "失败必须带原因";
@@ -819,19 +884,17 @@ TEST(ui_UiApp, OffscreenModeRunsFrames) {
   ui::UiAppConfig cfg;
   cfg.display = test_display();
   cfg.mode = ui::TargetMode::Offscreen;
-  cfg.presenter.mode = ui::TargetMode::Offscreen;
-  ui::test::FakeOffscreenTarget offscreen{dev::Extent2D{480, 320}};
+  cfg.scene_frame.mode = ui::TargetMode::Offscreen;
   ui::UiAppDeps deps;
-  FakeRenderer renderer;
-  deps.frame_renderer = &renderer;
-  deps.offscreen_target = &offscreen;
   std::string err;
   ASSERT_TRUE(app.init(cfg, deps, &err)) << err;
 
   for (int i = 0; i < 5; ++i) {
     const auto r = app.run_frame(0.f, 0.f);
-    EXPECT_EQ(r.status, ui::PresenterStatus::Ok);
-    EXPECT_EQ(r.submits_this_frame, 1u);
+    // 离屏模式没有壳层 surface:场景帧按 G7 跳过,不是错误。
+    EXPECT_EQ(r.status, ui::FrameStatus::NoSurface);
+    EXPECT_TRUE(r.ok());
+    EXPECT_EQ(r.submits_this_frame, 0u) << "没有 sink 就没有场景提交";
   }
   EXPECT_EQ(app.governor().stats().submit_violations, 0u);
   EXPECT_EQ(ui::as_internal(&app)->overlay().primitive_count() > 0, true) << "HUD 必须产出图元";
@@ -843,12 +906,8 @@ TEST(ui_UiApp, HudBackButtonRoutesThroughRouter) {
   ui::UiAppConfig cfg;
   cfg.display = test_display();
   cfg.mode = ui::TargetMode::Offscreen;
-  cfg.presenter.mode = ui::TargetMode::Offscreen;
-  ui::test::FakeOffscreenTarget offscreen{dev::Extent2D{480, 320}};
+  cfg.scene_frame.mode = ui::TargetMode::Offscreen;
   ui::UiAppDeps deps;
-  FakeRenderer renderer;
-  deps.frame_renderer = &renderer;
-  deps.offscreen_target = &offscreen;
   std::string err;
   ASSERT_TRUE(app.init(cfg, deps, &err)) << err;
 
@@ -880,27 +939,35 @@ TEST(ui_UiApp, PauseStopsPresentResumeRestores) {
   ui::UiApp app;
   ui::UiAppConfig cfg;
   cfg.display = test_display();
-  cfg.mode = ui::TargetMode::Offscreen;
-  cfg.presenter.mode = ui::TargetMode::Offscreen;
-  ui::test::FakeOffscreenTarget offscreen{dev::Extent2D{480, 320}};
+  // 有壳层 sink 才能验证"暂停 → 不提交、恢复 → 继续提交"这条 G7 语义。
+  cfg.mode = ui::TargetMode::Swapchain;
+  FakeSink sink;
+  FakeCommandList cmds;
   ui::UiAppDeps deps;
-  FakeRenderer renderer;
-  deps.frame_renderer = &renderer;
-  deps.offscreen_target = &offscreen;
+  deps.scene_sink = &sink;
+  deps.scene_command_list = &cmds;
   std::string err;
   ASSERT_TRUE(app.init(cfg, deps, &err)) << err;
 
-  ASSERT_EQ(app.run_frame(0.f, 0.f).status, ui::PresenterStatus::Ok);
+  ASSERT_EQ(app.run_frame(0.f, 0.f).status, ui::FrameStatus::Ok);
+  const int submits_before = sink.submits;
+  const int presents_before = sink.presents;
+  EXPECT_EQ(submits_before, 1) << "前台帧必须提交一次";
+
   dev::AppLifecycleEvent paused;
   paused.kind = dev::LifecycleKind::Paused;
   app.on_lifecycle(paused);
   const auto r = app.run_frame(0.f, 0.f);
-  EXPECT_EQ(r.status, ui::PresenterStatus::NoSurface) << "G7:切后台必须暂停 present";
+  EXPECT_EQ(r.status, ui::FrameStatus::NoSurface) << "G7:切后台必须暂停 present";
+  EXPECT_EQ(sink.submits, submits_before) << "后台不得提交";
+  EXPECT_EQ(sink.presents, presents_before) << "后台不得 present";
+  EXPECT_EQ(sink.acquires, 1) << "后台不得 acquire";
 
   dev::AppLifecycleEvent resumed;
   resumed.kind = dev::LifecycleKind::Resumed;
   app.on_lifecycle(resumed);
-  EXPECT_EQ(app.run_frame(0.f, 0.f).status, ui::PresenterStatus::Ok);
+  EXPECT_EQ(app.run_frame(0.f, 0.f).status, ui::FrameStatus::Ok);
+  EXPECT_EQ(sink.submits, submits_before + 1) << "恢复后要继续提交";
 }
 
 TEST(ui_UiApp, SurfaceChangedRelayoutsHud) {
@@ -908,12 +975,8 @@ TEST(ui_UiApp, SurfaceChangedRelayoutsHud) {
   ui::UiAppConfig cfg;
   cfg.display = test_display();
   cfg.mode = ui::TargetMode::Offscreen;
-  cfg.presenter.mode = ui::TargetMode::Offscreen;
-  ui::test::FakeOffscreenTarget offscreen{dev::Extent2D{480, 320}};
+  cfg.scene_frame.mode = ui::TargetMode::Offscreen;
   ui::UiAppDeps deps;
-  FakeRenderer renderer;
-  deps.frame_renderer = &renderer;
-  deps.offscreen_target = &offscreen;
   std::string err;
   ASSERT_TRUE(app.init(cfg, deps, &err)) << err;
 
@@ -989,10 +1052,10 @@ struct SwEnv {
     ui::UiAppConfig cfg;
     cfg.display = ui::DisplayInfo{w, h, 1.f};
     cfg.mode = ui::TargetMode::Offscreen;
-    cfg.presenter.mode = ui::TargetMode::Offscreen;
+    cfg.scene_frame.mode = ui::TargetMode::Offscreen;
     ui::UiAppDeps deps;
-    deps.offscreen_target = target.get();
-    deps.frame_renderer = renderer.get();
+    // 离屏模式没有壳层 surface:场景帧走 G7 跳过,UI 图元由离屏通道单独出图。
+    deps.scene_sink = nullptr;
     store = std::make_unique<ui::MemoryStateStore>();
     deps.state_store = store.get();
 
@@ -1065,12 +1128,16 @@ TEST(ui_Offscreen, MatchesGolden) {
 }
 
 TEST(ui_Offscreen, OffscreenPathIsTheOnlyReader) {
-  // spec §10 门 1 的运行时旁证:主路径状态机根本不持有读回入口。
-  // 这里断言"离屏出图后主路径的 Presenter 仍未被要求 present"
+  // spec 10 门 1 的运行时旁证:场景驱动根本不持有读回入口。
+  // 离屏模式没有壳层 surface,场景帧按 G7 跳过,像素完全由离屏通道产出。
   SwEnv env;
   ASSERT_TRUE(env.build(160, 120, ""));
   mb::ImageRgba8 img;
   ASSERT_TRUE(env.render(&img));
-  EXPECT_EQ(env.app->presenter().last().status, ui::PresenterStatus::Ok)
-      << "离屏路径也要走 Presenter 的阶段记账(单次 submit)";
+  const auto& frames = env.app->scene_frame().history();
+  ASSERT_FALSE(frames.empty()) << "每帧都要记账";
+  for (const auto& f : frames) {
+    EXPECT_EQ(f.status, ui::FrameStatus::NoSurface) << "离屏模式不应尝试上屏";
+    EXPECT_EQ(f.submits_this_frame, 0u) << "没有 sink 就没有场景提交";
+  }
 }

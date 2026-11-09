@@ -170,11 +170,12 @@ bool build_session(const Args& args, Session* s) {
   ui::UiAppConfig cfg;
   cfg.display = ui::DisplayInfo{args.width, args.height, 1.f};
   cfg.mode = ui::TargetMode::Offscreen;
-  cfg.presenter.mode = ui::TargetMode::Offscreen;
+  cfg.scene_frame.mode = ui::TargetMode::Offscreen;
 
   ui::UiAppDeps deps;
-  deps.offscreen_target = s->target.get();
-  deps.frame_renderer = s->renderer.get();
+  // 离屏模式没有壳层 surface:场景 sink 为空,SceneFrameDriver 会按 G7 跳过场景帧。
+  // CLI 关心的是 UI 图元(由 OffscreenTargetRenderer 单独出图),不是场景上屏。
+  deps.scene_sink = nullptr;
   deps.state_store = &s->store;
 
   s->app = std::make_unique<ui::UiApp>();
@@ -260,17 +261,28 @@ int cmd_present(const Args& args) {
   Session s;
   if (!build_session(args, &s)) return 1;
 
-  // 主路径状态机驱动:离屏模式下 Presenter 不做 acquire/present,但仍按
-  // [WaitFence → Acquire → Record → Submit → Presented] 记账,
-  // 因此"每帧恰一次 submit"与"帧栅栏 ≤ N"可以在这里断言(spec §10 门 2)。
+  // 路线变更后的语义：上屏归壳层。SDK 只负责把一帧场景渲染进
+  // **壳层提供的 surface**（ISceneFrameSink）。CLI 没有壳层，也就没有 sink，
+  // 因此状态是 NoSurface、submits=0 —— 这是**正确行为**，不是错误。
+  //
+  // 真正带 surface 的可运行验证在 magicblocks-sink-verify 里。
   std::printf("[");
   for (ui::u32 i = 0; i < args.frames; ++i) {
     const auto r = s.app->run_frame(0.f, 0.f);
-    std::printf("%s{\"frame\": %llu, \"phase\": \"%s\", \"status\": \"%s\", \"submits\": %u}",
+    std::printf("%s{\"frame\": %llu, \"phase\": \"%s\", \"status\": \"%s\", "
+                "\"submits\": %u, \"latency_frames\": %u}",
                 i ? ", " : "", static_cast<unsigned long long>(r.frame_index),
-                ui::to_string(r.phase), ui::to_string(r.status), r.submits_this_frame);
+                ui::to_string(r.phase), ui::to_string(r.status),
+                static_cast<unsigned>(r.submits_this_frame),
+                static_cast<unsigned>(r.input_latency_frames));
   }
   std::printf("]\n");
+
+  if (s.app->scene_frame().last().status == ui::FrameStatus::NoSurface) {
+    std::fprintf(stderr,
+                 "说明：未提供 ISceneFrameSink，本帧跳过上屏（NoSurface）。\n"
+                 "      上屏由壳层负责；带真实 surface 的验证见 magicblocks-sink-verify。\n");
+  }
 
   const auto& gov = s.app->governor().stats();
   std::fprintf(stderr, "panels:\n%s", s.app->debug_panel().c_str());

@@ -117,6 +117,15 @@ Status submit_once_sync(const VulkanContext& ctx, const char* what, Fn&& fn) {
 // 这里只给 L1 资源用,避免为了一个函数改 L0 头的函数签名)。
 VkFormat vk_format_of(device::Format f);
 
+// 采样数(N) → VkSampleCountFlagBits。
+//
+// 起初它是 vulkan_pipeline.cpp 匿名 namespace 里的私有函数,MSAA 接线时
+// vulkan_draw.cpp 的 VkPipelineMultisampleStateCreateInfo 也要用同一张表,
+// 于是提到这里由多处共用 —— **全仓只此一份**,不要在任何 .cpp 里再复制。
+// 未知/非法取值(0、3、非 2 的幂)返回 VK_SAMPLE_COUNT_1_BIT;需要"拒绝"
+// 语义的调用方必须自己先校验(见 VulkanPipeline::validate)。
+VkSampleCountFlagBits to_vk_samples(std::uint32_t n);
+
 // 单像素字节数(RGBA8/BGRA8 = 4、R8 = 1、D16 = 2、D24S8 = 4、D32 = 4)。
 // 未知格式返回 0(调用方必须当成 InvalidArgument)。
 std::uint32_t format_pixel_bytes(device::Format f);

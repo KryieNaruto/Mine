@@ -1,4 +1,4 @@
-# MagicBlocks L0+L1 —— 设备平台层与资源层
+# MagicBlocks L0+L1+L2 —— 设备平台层、资源层与场景层
 
 MagicBlocks 渲染引擎 SDK 的 **L0（device/）**：设备抽象、能力探测、交换链、渲染目标
 （窗口与离屏**同一种对象**）、帧同步、输入事件流、生命周期与失败即报错。
@@ -89,8 +89,8 @@ magicblocks-l0-cli render --width 320 --height 240 --frame-index 0 --output out.
 ## 测试
 
 ```bash
-MagicBlocks\build\magicblocks_test.exe          # 85 个用例（25 L0 + 20 L1 + 40 UI/其它）
-ctest --test-dir MagicBlocks\build              # 99 项：85 用例 + 4 门控 + 10 CLI + 自测
+MagicBlocks\build\magicblocks_test.exe          # 123 个用例（25 L0 + 20 L1 + 38 L2 + 40 UI/其它）
+ctest --test-dir MagicBlocks\build              # 145 项：123 用例 + 5 门控 + 17 CLI + 自测
 ```
 
 门控（spec §7）：
@@ -99,7 +99,8 @@ ctest --test-dir MagicBlocks\build              # 99 项：85 用例 + 4 门控 
 python tools/check_no_geometry_shader.py --root MagicBlocks   # G1
 python tools/check_layer_purity.py       --root MagicBlocks   # G3
 python tools/check_no_raw_alloc.py       --root MagicBlocks   # G4
-python tools/check_deps_tests.py                              # G5 既有 191 用例回归
+python tools/check_deps_tests.py                              # G5 既有 198 用例回归
+python tools/check_scene_no_clock.py     --root MagicBlocks   # L2 场景层不得读时钟(D13)
 ```
 
 ## L1 资源层要点
@@ -154,7 +155,7 @@ SDK **不做** `devices[0]`，而是强筛软件光栅（`VK_PHYSICAL_DEVICE_TYP
 golden 跨驱动共享同一份基线：lavapipe 与 SwiftShader 都必须比对通过
 （≤1% 像素差 + 上述结构化断言）。无 X11 时窗口用例由平台条件编译排除（GUI 通路由 Windows 覆盖）。
 
-## 与 L2 的衔接
+## 与 L3 的衔接
 
 - 裸分配已全部清零（G4 绿）：L0 的 `// VMA-injection` 标记块已由 L1 分页分配器取代，
   `VkImage` / 读回缓冲走 `allocate_image_page`，资源对象走桶内 64 KiB 子块。
@@ -163,3 +164,89 @@ golden 跨驱动共享同一份基线：lavapipe 与 SwiftShader 都必须比对
 - 帧边界挂点：`IFrameSync::advance_frame_index()` + `IMemoryAllocator::begin_frame()`。
 - L2 需要新资源类型时，在 `resources/` 加接口 + 在 `vulkan_` 后端加实现，
   公共头不出现任何 `Vk*`（门控 G3 强制）。
+
+## L2 场景层(scene/)
+
+L2 把"一帧做了什么"变成**可序列化、可比对、可复现**的数据。核心是"双写":
+`IRecorder` 每发一条命令,先调 L1 的 `ICommandList`,**L1 返回 Ok 之后**才把同一条
+命令追加进 `CommandStream` —— L1 是唯一权威,录制与执行不会漂移。
+
+### 接口(S1-S9)
+
+| 头文件 | 内容 |
+| --- | --- |
+| `scene/types.h` | `Transform`(TRS,四元数不归一化)、`Aabb`、`NodeSnapshot`、`SceneSnapshot` |
+| `scene/scene.h` | `IScene`:节点树、可见性连带子树、世界包围盒、快照/恢复、增量变更 |
+| `scene/submit_queue.h` | `ISubmitQueue`:不透明按(材质,深度)排序、透明按距离**远→近**、全序 tie-break |
+| `scene/render_graph.h` | `IRenderGraph`:附件解析、前向/自引用校验、"先离屏再贴图" |
+| `scene/command_stream.h` | `CommandStream` + 二进制/JSON 序列化 + FNV-1a 64 哈希 |
+| `scene/feature.h` | `IRenderFeatureRegistry`:注册序即录制序,按 `FeatureLayer` 分层调度 |
+| `scene/recorder.h` | `IRecorder`:三态机、11 类命令双写、`replay`/`reproduce` |
+
+### 不变量
+
+- **11 类命令**:`kCommandOpCount == 11`,与 L1 backend 的发号一致(spec R3)。
+- **W4 双写等式**:`CommandStream::commands.size() == target.command_count()`。
+- **帧内任一失败 → 整帧作废**:回 Idle、丢流、禁止再录,不允许半帧。
+- **自包含帧(B7)**:流里带完整 `SceneSnapshot`,`reproduce` 不需要外部场景。
+- **确定性**:同一帧重复录制哈希相同;浮点按**位模式**比较(`-0.0 != 0.0`)。
+
+### 命令流格式(v2)
+
+二进制头 12 字节:`"MBL2"` + `format_version(u16)` + `reserved(u16)` +
+`backend(u8)` + `engine_major(u8)` + `reserved(u16)`;之后是 body
+(以 `backend` 字符串开头),末尾 8 字节是 body 与头的 FNV-1a 64 哈希。
+
+> v1 → v2 的破坏性变更:body 开头加入 `backend` 字符串。v1 只把 backend 编码成
+> 头部 1 字节枚举,导致 `"vulkan"` 与 `"vulkan2"` **哈希相同** —— 改名不被察觉。
+> 布局变了必须升版本,否则旧文件会被当新格式误读(`decode_binary` 会明确拒绝)。
+
+### CLI
+
+```bash
+# 录一帧:同时产出命令流(--record)与离屏 PNG(--output)
+magicblocks-l2-cli record --scene demo --width 320 --height 240 \
+    --frame-index 0 --record s.mbl2 --output s.png
+
+magicblocks-l2-cli replay    --replay s.mbl2 --verify   # 重录并比对哈希
+magicblocks-l2-cli reproduce --replay s.mbl2 --verify   # 重建场景后重录并比对
+magicblocks-l2-cli dump      --replay s.mbl2 --json     # 稳定 JSON 文本
+```
+
+退出码:`0` 成功,`1` 运行期失败(文件打不开/解码失败/验证不符),
+`2` 用法错误(未知参数、L2 不支持的 `--scene` 预设)。
+
+`--scene` 只认 `demo`。玩法预设属 L4,传 `--scene voxel` 会明确报错并给退出码 2,
+**不做兜底降级**。
+
+### 测试
+
+```bash
+MagicBlocks\build\magicblocks_test.exe --gtest_filter="Scene.*:SubmitQueue.*:RenderGraph.*:Stream.*:Recorder.*:FeatureRegistry.*:L2Golden.*"
+```
+
+38 条用例:Scene 6、SubmitQueue 5、RenderGraph 4、Stream 10、Recorder 9、
+FeatureRegistry 3、L2Golden 1。全部走真实软件光栅设备,拿不到就失败(**不跳过**)。
+
+### golden
+
+`tests/data/golden_l2.png` 是 L2 的离屏基线:实例 0 的格子是**纯绿**标定点,
+其余 15 格颜色各不相同,清屏色是深蓝 `(13,20,51)`。
+
+L0 的 `golden.png` 是纯红标定点 + 纯黑清屏。两套基线**不能互相冒充**:
+`L2Golden.MatchesL2Baseline` 除了逐像素比对,还额外断言
+"左上角必须是纯绿 / 右上角必须不是纯绿 / 背景必须偏蓝而不是纯黑",
+把两套 golden 互换会立刻失败。
+
+> 注意:`frame_index` 必须是**偶数**,绿色标定点才落在左上角。
+
+### 为什么 L2 里没有时钟
+
+`tools/check_scene_no_clock.py` 扫描 `include/magicblocks/scene/**` 与
+`src/scene/**` 的**代码行**,禁止 `std::chrono` / `steady_clock` /
+`system_clock` / `high_resolution_clock` / `time(` / `clock(` / `GetTickCount` /
+`QueryPerformanceCounter` / `gettimeofday` / `clock_gettime` / `timespec_get`。
+
+原因:一旦 L2 读时钟,时间戳就会渗进 `EventRecord::timestamp_us` 或流里任何字段,
+哈希随之漂移,回放比对与 golden 全部失效。时间戳只能由**调用方**传入
+(见 `EventRecord::timestamp_us` 的注释)。

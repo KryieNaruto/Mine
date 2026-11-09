@@ -102,19 +102,19 @@ class UiOverlayPass {
   bool ready_ = false;
 };
 
-// IFrameRenderer 的 Vulkan 实现(UI 层 Presenter 持有的那一个)。
-class VulkanFrameRenderer final : public ui::IFrameRenderer {
+// 离屏 UI 图元渲染器。
+//
+// 路线变更(调研 v2 §7)后它**不再**实现 ui::IFrameRenderer:
+// 上屏路径已改为壳层的 ISceneFrameSink,UI 合成不再由 SDK 承担。
+// 这个类现在只负责一件事 —— 把 UI 图元离屏画出来并读回(CI / golden 用)。
+class VulkanFrameRenderer final {
  public:
   VulkanFrameRenderer(const VulkanContext& ctx, OffscreenTarget* offscreen);
-  ~VulkanFrameRenderer() override;
-
-  // 主路径:SDK 尚无 L1/L2,明确 Unsupported(见文件头说明)。
-  bool render_into_device_image(std::uint64_t cmd, ui::FrameImage* out_image,
-                                std::uint64_t* out_present_semaphore) override;
+  ~VulkanFrameRenderer();
 
   // 离屏路径:UI 图元 → 实例化渲染 → 读回。
   bool render_to_memory(ui::u32 width, ui::u32 height, std::uint8_t* out_rgba8,
-                        ui::u32 row_bytes) override;
+                        ui::u32 row_bytes);
 
   // UI 层在每帧绘制前调用,把图元灌进来(见 ui_app.cpp 的调用点)。
   UiOverlayPass& overlay_pass() { return *pass_; }

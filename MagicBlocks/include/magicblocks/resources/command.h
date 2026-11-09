@@ -1,12 +1,14 @@
 // MagicBlocks SDK —— L1 命令列表(R3)
 //
 // 设计约束(spec R3 / §5.2 / §6.3 / G5, plans-l1 §3):
-//   - **R3 恰好 11 类命令**:bind_pipeline / bind_vertex_buffer / bind_index_buffer /
+//   - **R3 的 11 类核心命令** + **P0 的 1 个纹理采样绑定(裁定 X1,共 12 个方法)**:
+//     bind_pipeline / bind_vertex_buffer / bind_index_buffer /
 //     draw / draw_indexed / draw_instanced / push_constants / set_viewport /
-//     set_scissor / begin_pass / end_pass。plans 的用例名 Command.RecordsAllOps
-//     写的是「10 类」,那是把 begin_pass/end_pass 当一对算一处;按 spec R3 的
-//     逐条枚举这里是 11 个方法,不多也不少 —— 多余的便捷命令一律不加,
-//     因为每多一条命令就要在 L2 的命令流格式里多一个 op 编号。
+//     set_scissor / begin_pass / end_pass,加上第 12 个 bind_sampled_texture。
+//     R3 列的 11 个是**能力**;X1 裁定把"绑定采样器"作为 bindPipeline 职责的
+//     自然扩展加进来(纹理是逐 draw 的,塞进 RenderPassDesc 会埋坑)。
+//     除这 12 个之外,多余的便捷命令一律不加 —— 每多一条就要在 L2 命令流
+//     格式里多一个 op 编号。
 //   - **命令流记录偏移而不是指针(M3 / spec §5.2)**:每个接受资源的命令都收
 //     ResourceId(值语义),录制层把它压成紧凑整数存进命令流,回放时同一
 //     page_id/offset 指向同一片内存。
@@ -125,6 +127,19 @@ class ICommandList {
   virtual Status set_viewport(const Viewport& viewport) = 0;
   virtual Status set_scissor(const ScissorRect& rect) = 0;
 
+  // P0 命令 12(X1 裁定):把一张可采样 2D 纹理连同它的采样器绑到 slot。
+  //
+  // 契约:
+  //   - 当前绑定的管线必须声明过 PipelineDesc::sampled_texture_slots > slot,
+  //     否则 → InvalidArgument(不静默丢弃,否则画面"没纹理"且不报错)。
+  //   - 未 bind_pipeline 就调用 → InvalidArgument;不在 pass 内 → InvalidArgument。
+  //   - texture 必须是 TextureUsage::Sampled 的 2D 纹理;sampler 必须是采样器句柄。
+  //     句柄非法/类型不对 → InvalidArgument。
+  //   - **计入 command_count()**(与 bind_pipeline 同口径,见 command_count 的注释)。
+  //   - 描述符集布局固定 set=0 / binding=slot。
+  virtual Status bind_sampled_texture(const ResourceId& texture, const ResourceId& sampler,
+                                      u32 slot) = 0;
+
   // R3 命令 10 / 11:pass 边界。未在 pass 内录制绘制命令 → InvalidArgument;
   // 未 end_pass 就 submit → InvalidArgument(录制期校验,不放过半个 pass)。
   virtual Status begin_pass(const RenderPassDesc& pass) = 0;
@@ -133,8 +148,9 @@ class ICommandList {
   // 录制状态查询(用于 Command.RecordsAllOps 的命令计数断言)。
   virtual bool recording() const = 0;
   virtual bool in_pass() const = 0;
-  // 已录制的命令条数。口径:R3 的 11 类命令每成功调用一次即 +1
+  // 已录制的命令条数。口径:上面 12 类命令每成功调用一次即 +1
   // (含 begin_pass/end_pass;录制失败的命令不计)。
+  // bind_sampled_texture **计入**(与 bind_pipeline 同口径,裁定 X1)。
   virtual u32 command_count() const = 0;
 
   // 复位:丢弃所有已录制命令并回到录制初态。

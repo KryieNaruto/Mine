@@ -1,27 +1,37 @@
 // MagicBlocks UI 消费层 —— 顶层装配实现(spec §2、§4、§5)
 //
 // 本文件是 UI 层**唯一的串联点**:Router / Hud / InputRouter / PerfGovernor /
-// Presenter 各自独立,在这里按 spec §5.2 的帧顺序装配起来。
+// SceneFrameDriver 各自独立,在这里按下面的顺序装配起来。
 //
-// 一次 `run_frame()` 的固定顺序(spec §5.2 的 1~6 步):
+// ============================================================================
+// 路线变更(必读)
+// ============================================================================
+//
+// 旧版把「场景 pass + UI pass」录进同一 command list 再上屏。调研 v2 §7 判定
+// 该路线**作废**:UI 合成交给壳层,SDK 只负责把 3D 场景渲染到壳层给的 surface。
+//
+// 一次 `run_frame()` 的固定顺序:
 //   1. 路由推进     router.update(dt)            —— 当前玩法推进
-//   2. HUD 绘制     hud.draw(overlay)             —— UI pass 的内容(图元)
+//   2. 浮层绘制     hud.draw(overlay)             —— 画在**场景之上**的 UI 图元
 //   3. 预算判定     governor.report_frame(...)    —— 用**上一帧**的真值判档
-//   4. Presenter    run_frame()                   —— wait → acquire → record → submit → present
+//   4. 场景驱动     scene_frame_.run_frame()      —— acquire → record → submit → present
 //   5. 统计回报     (drawcall / submit / 延迟)    —— 不产生任何阻塞
 //
 // 第 3 步刻意用上一帧样本:本帧的 GPU 时间此刻还不知道,拿不到就不编。
 // 这是"UI 层不读时钟"纪律的具体形态(与 SDK `EventStream` 同一条纪律)。
+//
+// 第 4 步**不碰任何 CPU 回读**(门控 check_ui_no_readback.py):
+//   场景命令列表由玩法/渲染特性在 SDK 侧录好,这里只把它交给壳层的 sink。
 #include "magicblocks/ui/ui_app.h"
 
 #include <algorithm>
 #include <cstring>
-#include <string>
 #include <new>
+#include <string>
 #include <utility>
 
 #include "overlay_impl.h"
-#include "presenter_host.h"
+#include "scene_sink_host.h"
 #include "ui_app_internal.h"
 
 namespace magicblocks::ui {
@@ -36,7 +46,7 @@ struct UiApp::Impl final : UiAppInternal {
   Hud hud_;
   InputRouter input_router_;
   PerfGovernor governor_;
-  Presenter presenter_;
+  SceneFrameDriver scene_frame_;
   detail::Overlay2D overlay_;
 
   // 默认状态存储。所有权在 Impl,但**析构点必须留在 router.cpp** ——
@@ -49,19 +59,49 @@ struct UiApp::Impl final : UiAppInternal {
   u64 frame_counter = 0;
   bool initialized = false;
 
-  void draw_ui() {
+  // 浮层图元：每一帧产出一次。**不进**场景命令列表（UI 合成归壳层）。
+  //
+  // 设计：内部累积器 `overlay_` 是**唯一**的图元产出点（离屏通道与
+  // `as_internal()->overlay()` 都读它）；若壳层提供了 `IOverlay2D`，
+  // 同一批图元再转发一份给壳层去合成。两者内容一致，只是消费方不同。
+  void draw_overlay() {
     overlay_.begin(Rect{0.f, 0.f, static_cast<f32>(cfg.display.width),
                         static_cast<f32>(cfg.display.height)});
     hud_.draw(overlay_);
     overlay_.end();
+    forward_overlay_to_shell();
+  }
+
+  // 把内部累积的图元转发给壳层的 IOverlay2D（若有）。
+  void forward_overlay_to_shell() {
+    if (!deps.overlay) return;
+    deps.overlay->begin(Rect{0.f, 0.f, static_cast<f32>(cfg.display.width),
+                             static_cast<f32>(cfg.display.height)});
+    for (const auto& p : overlay_.primitives()) {
+      const Rect r{p.a.x, p.a.y, p.b.x - p.a.x, p.b.y - p.a.y};
+      switch (p.kind) {
+        case detail::PrimitiveKind::Fill:
+          deps.overlay->fill_rect(r, p.color);
+          break;
+        case detail::PrimitiveKind::Stroke:
+          deps.overlay->stroke_rect(r, p.color);
+          break;
+        case detail::PrimitiveKind::Line: {
+          stub::StrokeStyle style{};
+          style.width_px = p.width;
+          deps.overlay->line(p.a, p.b, p.color, style);
+          break;
+        }
+      }
+    }
+    deps.overlay->end();
   }
 
   // UiAppInternal
-  void draw_ui_for_current_target() override { draw_ui(); }
+  void draw_ui_for_current_target() override { draw_overlay(); }
   const detail::Overlay2D& overlay() const override { return overlay_; }
 
   ~Impl() { delete default_store; }
-
 };
 
 // 内部接口的取用点(`UiApp` 的 friend)。只在这里出现,公开面拿不到它。
@@ -91,20 +131,15 @@ bool UiApp::init(const UiAppConfig& cfg, const UiAppDeps& deps, std::string* err
     if (error) *error = "UiApp::init: display 宽高必须 > 0";
     return false;
   }
-  // 主路径少了任何一件都无法上屏 —— 明确报错,不静默退化成离屏(spec §3 方案 A 禁止)。
+  // 主路径少了 sink 就无法上屏 —— 明确报错,不静默退化成离屏(spec §3 方案 A 禁止)。
+  // 注意:离屏模式(TargetMode::Offscreen)允许 sink 为空,由调用方自己接管。
   if (cfg.mode == TargetMode::Swapchain) {
-    if (!deps.present_surface) {
-      if (error) *error = "UiApp::init: Swapchain 模式需要 present_surface";
-      return false;
-    }
-    if (!deps.frame_renderer) {
-      if (error) *error = "UiApp::init: Swapchain 模式需要 frame_renderer";
+    if (!deps.scene_sink) {
+      if (error) *error = "UiApp::init: Swapchain 模式需要 scene_sink";
       return false;
     }
   }
 
-  // 重复 init:各子系统各有 reset()/set_config(),就地复位而不是整体赋值
-  //(Presenter / PerfGovernor 都不可拷贝赋值 —— 各自握着 pimpl 状态机)。
   d.cfg = cfg;
   d.deps = deps;
 
@@ -122,13 +157,12 @@ bool UiApp::init(const UiAppConfig& cfg, const UiAppDeps& deps, std::string* err
   d.input_router_.set_config(cfg.input);
   d.input_router_.set_hud(&d.hud_);
 
-  // 上屏链路:配置在构造期定死(present_mode / in_flight 属不可变决策),
-  // 所以这里用 placement 之外最直白的做法 —— 换一个新的 Presenter 实例。
-  d.presenter_.~Presenter();
-  new (&d.presenter_) Presenter(cfg.presenter);
-  d.presenter_.set_surface(deps.swapchain, deps.present_surface);
-  d.presenter_.set_renderer(deps.frame_renderer);
-  d.presenter_.set_offscreen_target(deps.offscreen_target);
+  // 场景帧驱动:配置在构造期定死(in_flight 属不可变决策),
+  // 所以这里用最直白的做法 —— 换一个新的实例。
+  d.scene_frame_.~SceneFrameDriver();
+  new (&d.scene_frame_) SceneFrameDriver(cfg.scene_frame);
+  d.scene_frame_.set_sink(deps.scene_sink);
+  d.scene_frame_.set_command_list(deps.scene_command_list);
 
   // 性能治理器:阈值属可变配置,允许重复 init 换一套。
   d.governor_.set_config(cfg.governor);
@@ -148,60 +182,60 @@ void UiApp::on_input(const device::InputEvent& ev) {
   Impl& d = *impl_;
   if (!d.initialized) return;
   // G6:输入到达即登记"当前帧号"(不读时钟 —— 帧号就是时间基准)
-  d.presenter_.mark_input(0);
+  d.scene_frame_.mark_input(0);
   d.input_router_.route(ev);
 }
 
 void UiApp::on_lifecycle(const device::AppLifecycleEvent& ev) {
   Impl& d = *impl_;
   if (!d.initialized) return;
+
+  // 驱动侧只跟前后台;surface 的创建/重建归壳层(它才是 ISceneFrameSink 的实现方)。
+  d.scene_frame_.on_lifecycle(ev);
+
   switch (ev.kind) {
-    case device::LifecycleKind::Paused:
-    case device::LifecycleKind::SurfaceDestroyed:
-      // G7:暂停 present,CPU 侧状态(场景/玩法/状态存储)全部保留,唤醒不出黑屏
-      d.presenter_.set_active(false);
-      break;
-    case device::LifecycleKind::SurfaceCreated:
-    case device::LifecycleKind::Resumed:
-      d.presenter_.set_active(true);
-      break;
     case device::LifecycleKind::SurfaceChanged:
       // 旋转/缩放:改尺寸 + HUD 重排 + 交换链重建(不是每帧重建,spec §5.4)
       if (ev.width && ev.height) {
         d.cfg.display.width = ev.width;
         d.cfg.display.height = ev.height;
         d.hud_.relayout(d.cfg.hud, d.cfg.display, 44.f, 64.f);
-        if (auto* host = dynamic_cast<PresenterHost*>(d.deps.present_surface)) {
+        // 若壳层用的是我们的桌面参考 sink,顺手帮它重建;移动端壳层自己处理。
+        if (auto* host = dynamic_cast<ShellSurfaceSink*>(d.deps.scene_sink)) {
           std::string err;
           host->rebuild(device::Extent2D{ev.width, ev.height}, &err);
         }
       }
       break;
+    case device::LifecycleKind::Paused:
+    case device::LifecycleKind::SurfaceDestroyed:
+    case device::LifecycleKind::SurfaceCreated:
+    case device::LifecycleKind::Resumed:
     case device::LifecycleKind::Unknown:
       break;
   }
 }
 
-FrameResult UiApp::run_frame(f32 scene_ms, f32 ui_ms) {
+SceneFrameResult UiApp::run_frame(f32 scene_ms, f32 ui_ms) {
   Impl& d = *impl_;
-  FrameResult result{};
+  SceneFrameResult result{};
   if (!d.initialized) {
-    result.status = PresenterStatus::InvalidState;
+    result.status = FrameStatus::InvalidState;
     return result;
   }
 
   // 1) 路由推进(HomeScreen 下是空操作)
   d.router_.update(1.f / 60.f);
 
-  // 2) HUD 绘制 → 图元。图元是 UI pass 的**内容**,由 Presenter 在 record 阶段录进同一帧。
-  d.draw_ui();
-  const auto ov_stats = d.overlay_.stats();
+  // 2) 浮层绘制 → 图元。**不进场景命令列表**:UI 合成由壳层完成(调研 v2 §7)。
+  d.draw_overlay();
+  const stub::IOverlay2D::Stats ov_stats = d.deps.overlay ? d.deps.overlay->stats() : stub::IOverlay2D::Stats{};
 
   // 3) 预算判定:用上一帧的真值(本帧 GPU 时间此刻未知,不编造)
   if (d.have_last_sample) d.governor_.report_frame(d.last_sample);
 
-  // 4) Presenter:wait → acquire → record → submit → present(整帧一次提交)
-  result = d.presenter_.run_frame(scene_ms, ui_ms);
+  // 4) 场景帧:acquire → record → submit → present(每帧恰好一次提交)
+  result = d.scene_frame_.run_frame();
 
   // 5) 统计回报 —— 本帧真值成为下一帧的判据
   FrameSample s{};
@@ -213,7 +247,7 @@ FrameResult UiApp::run_frame(f32 scene_ms, f32 ui_ms) {
   s.submit_count = result.submits_this_frame;
   // 稳态帧 0 次分配:图元容器与顶点缓冲都预分配(spec §6 G5 / SDK M5)
   s.vma_alloc_count = 0;
-  s.present_queue_depth = d.presenter_.frames_in_flight();
+  s.present_queue_depth = d.scene_frame_.frames_in_flight();
   s.input_latency_frames = result.input_latency_frames;
   s.ui_bytes_touched = s.vertices * 16u;  // 每顶点 16B;UI 太贵时这里会先涨
   d.last_sample = s;
@@ -223,21 +257,10 @@ FrameResult UiApp::run_frame(f32 scene_ms, f32 ui_ms) {
   return result;
 }
 
-bool UiApp::render_offscreen_to_memory(u32 width, u32 height, std::uint8_t* out_rgba8,
-                                       u32 row_bytes) {
-  Impl& d = *impl_;
-  if (!d.initialized || !out_rgba8 || !d.deps.frame_renderer) return false;
-  if (row_bytes < width * 4u) return false;
-  // 离屏路径(spec §5.5):共享同一个 IFRameRenderer 抽象,只是目标换成离屏。
-  // 图元→GPU 实例的转换由后端完成;这里只负责产出一帧 UI 图元。
-  d.draw_ui();
-  return d.deps.frame_renderer->render_to_memory(width, height, out_rgba8, row_bytes);
-}
-
 Router& UiApp::router() { return impl_->router_; }
 Hud& UiApp::hud() { return impl_->hud_; }
 InputRouter& UiApp::input() { return impl_->input_router_; }
-Presenter& UiApp::presenter() { return impl_->presenter_; }
+SceneFrameDriver& UiApp::scene_frame() { return impl_->scene_frame_; }
 PerfGovernor& UiApp::governor() { return impl_->governor_; }
 
 std::string UiApp::debug_panel() const {
@@ -253,6 +276,8 @@ std::string UiApp::debug_panel() const {
          " cam=" + std::to_string(ist.routed_camera) +
          " none=" + std::to_string(ist.unrouted) +
          " gestures=" + std::to_string(ist.gestures_emitted) + "\n";
+  out += "scene_frames=" + std::to_string(d.scene_frame_.history().size()) +
+         " last=" + to_string(d.scene_frame_.last().status) + "\n";
   return out;
 }
 

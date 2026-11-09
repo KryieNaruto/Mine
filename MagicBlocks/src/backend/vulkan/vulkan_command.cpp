@@ -67,6 +67,8 @@ const char* command_op_name(CommandOp op) {
       return "begin_pass";
     case CommandOp::EndPass:
       return "end_pass";
+    case CommandOp::BindSampledTexture:
+      return "bind_sampled_texture";
   }
   return "?";
 }
@@ -138,7 +140,31 @@ void VulkanCommandList::destroy_vk_command_buffer() {
 
 void VulkanCommandList::append(const RecordedCommand& cmd) {
   recorded_.push_back(cmd);
+  // 旁路表与 recorded_ 严格等长:绑定类命令在各自 append 之后回填指针。
+  command_pipeline_.push_back(nullptr);
   ++command_count_;  // 唯一的计数入口:每成功录制一次命令 +1(裁定 1)
+}
+
+IBuffer* VulkanCommandList::buffer_at(const ResourceId& id) const {
+  if (!id.valid()) return nullptr;
+  // 录制期缓冲数量是"场景规模"级(几十~几百),线性查足够;不做哈希表
+  // (热路径上这是命令录制期一次调用,不是每顶点/每片元)。
+  for (const auto& kv : buffers_) {
+    if (kv.first.page_id == id.page_id && kv.first.offset == id.offset) return kv.second;
+  }
+  return nullptr;
+}
+
+// 记录一条"绑定了缓冲"的命令:旁路表登记句柄 → 指针。调用方在 append 之后调用。
+void VulkanCommandList::remember_buffer(const ResourceId& id, IBuffer* buffer) {
+  if (!id.valid() || buffer == nullptr) return;
+  for (auto& kv : buffers_) {
+    if (kv.first.page_id == id.page_id && kv.first.offset == id.offset) {
+      kv.second = buffer;
+      return;
+    }
+  }
+  buffers_.emplace_back(id, buffer);
 }
 
 void VulkanCommandList::set_resource(RecordedCommand* cmd, const ResourceId& id) {
@@ -186,6 +212,7 @@ Status VulkanCommandList::bind_pipeline(IPipeline* pipeline, u64 pipeline_hash) 
   cmd.op = CommandOp::BindPipeline;
   cmd.pipeline_hash = h;
   append(cmd);
+  command_pipeline_.back() = pipeline;  // 旁路表:设备帧提交要取 VkPipeline*
   return Status::Ok_();
 }
 
@@ -198,13 +225,16 @@ Status VulkanCommandList::bind_vertex_buffer(const ResourceId& buffer, u32 bindi
                            " 越出缓冲大小 " + std::to_string(buffer.size));
   }
   // 设备态:VkBuffer 实体由设备层按 ResourceId 管理(见 vulkan_buffer.h 的说明);
-  // 本轮录制层只记句柄,真实绑定在提交路径上解析。因此这里不做 vkCmdBindVertexBuffers。
+  // 本轮录制层只记句柄,真实绑定在设备帧提交路径(vulkan_device_frame.cpp)上解析。
+  // 因此这里不做 vkCmdBindVertexBuffers。
 
   RecordedCommand cmd;
   cmd.op = CommandOp::BindVertexBuffer;
   set_resource(&cmd, buffer);
   cmd.a = binding;
+  // b 保持旧口径(低 32 位),off64 是权威的 64 位值(见 RecordedCommand::off64)。
   cmd.b = static_cast<u32>(offset);
+  cmd.off64 = offset;
   append(cmd);
   return Status::Ok_();
 }
@@ -221,7 +251,57 @@ Status VulkanCommandList::bind_index_buffer(const ResourceId& buffer, IndexForma
   set_resource(&cmd, buffer);
   cmd.a = static_cast<u32>(format);
   cmd.b = static_cast<u32>(offset);
+  cmd.off64 = offset;
   append(cmd);
+  return Status::Ok_();
+}
+
+Status VulkanCommandList::remember_buffer_binding(const ResourceId& id, IBuffer* buffer) {
+  remember_buffer(id, buffer);
+  return Status::Ok_();
+}
+
+ITexture* VulkanCommandList::texture_at(const ResourceId& id) const {
+  if (!id.valid()) return nullptr;
+  for (const auto& kv : textures_) {
+    if (kv.first.page_id == id.page_id && kv.first.offset == id.offset) return kv.second;
+  }
+  return nullptr;
+}
+
+ISampler* VulkanCommandList::sampler_at(const ResourceId& id) const {
+  if (!id.valid()) return nullptr;
+  for (const auto& kv : samplers_) {
+    if (kv.first.page_id == id.page_id && kv.first.offset == id.offset) return kv.second;
+  }
+  return nullptr;
+}
+
+Status VulkanCommandList::remember_texture_sampler(const ResourceId& texture,
+                                                   ITexture* tex, const ResourceId& sampler,
+                                                   ISampler* smp) {
+  if (texture.valid() && tex != nullptr) {
+    bool found = false;
+    for (auto& kv : textures_) {
+      if (kv.first.page_id == texture.page_id && kv.first.offset == texture.offset) {
+        kv.second = tex;
+        found = true;
+        break;
+      }
+    }
+    if (!found) textures_.emplace_back(texture, tex);
+  }
+  if (sampler.valid() && smp != nullptr) {
+    bool found = false;
+    for (auto& kv : samplers_) {
+      if (kv.first.page_id == sampler.page_id && kv.first.offset == sampler.offset) {
+        kv.second = smp;
+        found = true;
+        break;
+      }
+    }
+    if (!found) samplers_.emplace_back(sampler, smp);
+  }
   return Status::Ok_();
 }
 
@@ -537,11 +617,96 @@ Status VulkanCommandList::end_pass() {
   return Status::Ok_();
 }
 
+// ---------------------------------------------------------------- P0 命令 12(X1)
+
+Status VulkanCommandList::bind_sampled_texture(const ResourceId& texture,
+                                               const ResourceId& sampler, u32 slot) {
+  // 录制期校验:未开 pass / 未绑管线 → InvalidArgument(与 draw 同口径)。
+  if (!in_pass_) {
+    return Status::Invalid("ICommandList::bind_sampled_texture: 不在 pass 内");
+  }
+  if (bound_.pipeline == nullptr) {
+    return Status::Invalid("ICommandList::bind_sampled_texture: 未绑定管线");
+  }
+  if (!texture.valid()) {
+    return Status::Invalid("ICommandList::bind_sampled_texture: texture 句柄无效");
+  }
+  if (!sampler.valid()) {
+    return Status::Invalid("ICommandList::bind_sampled_texture: sampler 句柄无效");
+  }
+  // slot 越界 → InvalidArgument,绝不静默丢弃(否则画面"没纹理"且不报错)。
+  const u32 declared = bound_.pipeline->sampled_texture_slots();
+  if (slot >= declared) {
+    return Status::Invalid("ICommandList::bind_sampled_texture: slot " + std::to_string(slot) +
+                           " 越界(当前管线只声明了 " + std::to_string(declared) +
+                           " 个采样纹理槽;PipelineDesc::sampled_texture_slots)");
+  }
+
+  if (vk_recording_ && has_ctx_) {
+    // 设备态:此刻就把描述符写进去并绑定。描述符写入按 slot 覆盖,
+    // 同一帧内后写生效(与 Vulkan 的 descriptor 语义一致)。
+    //
+    // 注意:公共接口只给 ResourceId(M3 值语义),所以设备态必须先由
+    // remember_texture_sampler(tex_id, ITexture*, smp_id, ISampler*) 登记过,
+    // 否则拿不到 VkImageView/VkSampler —— 此时明确报 Unsupported,
+    // 绝不当成"绑成功了但没纹理"。
+    auto* vk_pipeline = dynamic_cast<VulkanPipeline*>(bound_.pipeline);
+    if (vk_pipeline == nullptr) {
+      return Status::Unsupported(
+          "ICommandList::bind_sampled_texture: 设备态只支持 VulkanPipeline 实现");
+    }
+    if (!vk_pipeline->has_descriptor_set()) {
+      return Status::Unsupported(
+          "ICommandList::bind_sampled_texture: 该管线没有设备态描述符集");
+    }
+    ITexture* tex = texture_at(texture);
+    if (tex == nullptr) {
+      return Status::Unsupported(
+          "ICommandList::bind_sampled_texture: 未登记该纹理对象(设备态需要真实 ITexture*)");
+    }
+    ISampler* smp = sampler_at(sampler);
+    if (smp == nullptr) {
+      return Status::Unsupported(
+          "ICommandList::bind_sampled_texture: 未登记该采样器对象(设备态需要真实 ISampler*)");
+    }
+    auto* vk_tex = dynamic_cast<VulkanTexture*>(tex);
+    auto* vk_smp = dynamic_cast<VulkanSampler*>(smp);
+    if (vk_tex == nullptr || !vk_tex->has_vk_view()) {
+      return Status::Unsupported(
+          "ICommandList::bind_sampled_texture: 纹理不是设备态创建的(无 VkImageView)");
+    }
+    if (vk_smp == nullptr || !vk_smp->has_vk_sampler()) {
+      return Status::Unsupported(
+          "ICommandList::bind_sampled_texture: 采样器不是设备态创建的(无 VkSampler)");
+    }
+    const Status ws = vk_pipeline->write_sampled_texture(slot, vk_tex->vk_view(),
+                                                         vk_smp->vk_sampler());
+    if (!ws.ok()) return ws;
+    const VkDescriptorSet ds = vk_pipeline->vk_descriptor_set();
+    vkCmdBindDescriptorSets(vk_cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            vk_pipeline->vk_pipeline_layout(), 0, 1, &ds, 0, nullptr);
+  }
+
+  RecordedCommand cmd;
+  cmd.op = CommandOp::BindSampledTexture;
+  set_resource(&cmd, texture);  // resource = 纹理(M3:命令流只记偏移)
+  cmd.a = slot;                 // 槽位
+  cmd.sampler = sampler;
+  cmd.packed_sampler = 0;
+  if (!sampler.pack(&cmd.packed_sampler)) cmd.packed_sampler = 0;
+  append(cmd);
+  return Status::Ok_();
+}
+
 // ---------------------------------------------------------------- 状态 / 复位
 
 void VulkanCommandList::reset() {
   destroy_vk_command_buffer();
   recorded_.clear();
+  command_pipeline_.clear();
+  buffers_.clear();
+  // P0(X1):textures_/samplers_ 同样保留(见 submit_and_wait 的说明)——
+  // 它们是弱引用映射,不随命令流清空而失效。
   command_count_ = 0;
   in_pass_ = false;
   bound_ = Bound{};
@@ -590,6 +755,11 @@ Status VulkanCommandList::submit_and_wait() {
     destroy_vk_command_buffer();
     pass_targets_pending_cleanup_ = false;
     recorded_.clear();
+    command_pipeline_.clear();
+    buffers_.clear();
+    // P0(X1):textures_/samplers_ 刻意**不清** —— 它们只是"句柄 → 有效对象"的
+    // 弱引用映射,不随命令流失效;保留下来,同一批纹理在下一帧再绑时仍能取到
+    // VkImageView/VkSampler(否则每帧都要调用方重新 remember,极易漏)。
     command_count_ = 0;
     bound_ = Bound{};
     recording_ = keep;
@@ -650,6 +820,8 @@ Status VulkanCommandList::submit_and_wait() {
   // 提交后命令列表回到可复用状态:命令缓冲释放,下一轮 begin_pass 重新走 begin 录制路径。
   destroy_vk_command_buffer();
   recorded_.clear();
+  command_pipeline_.clear();
+  buffers_.clear();
   command_count_ = 0;
   bound_ = Bound{};
   in_pass_ = false;

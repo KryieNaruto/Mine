@@ -46,7 +46,9 @@ bool has_instance_extension(const char* name) {
 }  // namespace
 
 const char* platform_surface_extension() {
-#if defined(VK_USE_PLATFORM_WIN32_KHR)
+#if defined(VK_USE_PLATFORM_ANDROID_KHR)
+  return VK_KHR_ANDROID_SURFACE_EXTENSION_NAME;
+#elif defined(VK_USE_PLATFORM_WIN32_KHR)
   return VK_KHR_WIN32_SURFACE_EXTENSION_NAME;
 #elif defined(VK_USE_PLATFORM_XCB_KHR)
   return VK_KHR_XCB_SURFACE_EXTENSION_NAME;
@@ -63,9 +65,15 @@ bool create_instance(bool enable_validation, std::uint32_t api_version, Instance
   app.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
   app.pEngineName = "MagicBlocks";
   app.engineVersion = VK_MAKE_VERSION(1, 0, 0);
-  // SwiftShader 实测 apiVersion=1.3.0;请求 1.0 保证跨驱动可用
-  app.apiVersion = VK_MAKE_VERSION(1, 0, 0);
-  (void)api_version;
+  // 请求的 API 版本由调用方决定(**必须真的用上**,见下面 api_version 的说明)。
+  // 早期版本这里硬编码 1.0 并 (void)api_version,导致:
+  //   - VulkanPagingAllocator 的 VMA 声明 vulkanApiVersion = 1.1
+  //   - L1/L2 资源路径调用 1.1 才提升为核心的 vkGetPhysicalDevice*2()
+  // 两者与实例协商出的 1.0 不一致 → 驱动/VMA 内部状态被破坏 →
+  // 表现为「创建设备后一切正常,但创建过命令列表再析构设备时堆损坏
+  // (0xc0000374)」。崩在 vkDestroyDevice,根因在实例创建,极难定位。
+  // 现在严格使用调用方给的版本(默认 1.1,SwiftShader 支持 1.3)。
+  app.apiVersion = (api_version != 0) ? api_version : VK_API_VERSION_1_1;
 
   std::vector<const char*> exts;
   exts.push_back(VK_KHR_SURFACE_EXTENSION_NAME);

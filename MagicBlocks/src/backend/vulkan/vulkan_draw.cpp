@@ -7,6 +7,8 @@
 
 #include "magicblocks_shaders.h"
 
+#include "backend/vulkan/vulkan_resource_common.h"  // to_vk_samples(MSAA 共用的唯一一份)
+
 namespace magicblocks::backend {
 
 using namespace magicblocks::device;
@@ -47,26 +49,49 @@ Status draw_selftest_grid(const VulkanContext& ctx, OffscreenTarget* target, u64
   }
 
   // 渲染过程:颜色附件初值 CLEAR(黑色),末态 GENERAL 以便读回
-  VkAttachmentDescription att{};
-  att.format = to_vk_format(target->color_format());
-  att.samples = VK_SAMPLE_COUNT_1_BIT;
-  att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-  att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-  att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-  att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-  att.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-  att.finalLayout = VK_IMAGE_LAYOUT_GENERAL;
+  //
+  // MSAA:采样数必须取自目标本身。这里曾经硬编码 VK_SAMPLE_COUNT_1_BIT,
+  // 于是即使目标图像是 4 采样,render pass 仍按 1 采样描述 →
+  // framebuffer 与 pass 的采样数不一致,完整校验层会报错、不报错时表现为
+  // "根本没抗锯齿"。samples > 1 时再挂一张单采样 resolve 附件(见下)。
+  const std::uint32_t samples = target->samples() == 0 ? 1u : target->samples();
+  const VkSampleCountFlagBits vk_samples = to_vk_samples(samples);
+
+  VkAttachmentDescription atts[2] = {};
+  atts[0].format = to_vk_format(target->color_format());
+  atts[0].samples = vk_samples;
+  atts[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+  atts[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  atts[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+  atts[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+  atts[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  atts[0].finalLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+  const bool resolve = (samples > 1);
+  if (resolve) {
+    // 多重采样颜色 → 单采样 resolve 目标。resolve 结果就是"读回看到的那张图"。
+    atts[1].format = to_vk_format(target->color_format());
+    atts[1].samples = VK_SAMPLE_COUNT_1_BIT;
+    atts[1].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    atts[1].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    atts[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    atts[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    atts[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    atts[1].finalLayout = VK_IMAGE_LAYOUT_GENERAL;  // 与单采样路径一致,读回约定不变
+  }
 
   VkAttachmentReference ref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+  VkAttachmentReference resolve_ref{1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
   VkSubpassDescription sub{};
   sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
   sub.colorAttachmentCount = 1;
   sub.pColorAttachments = &ref;
+  sub.pResolveAttachments = resolve ? &resolve_ref : nullptr;
 
   VkRenderPassCreateInfo rpci{};
   rpci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-  rpci.attachmentCount = 1;
-  rpci.pAttachments = &att;
+  rpci.attachmentCount = resolve ? 2u : 1u;
+  rpci.pAttachments = atts;
   rpci.subpassCount = 1;
   rpci.pSubpasses = &sub;
   VkRenderPass rp = VK_NULL_HANDLE;
@@ -93,17 +118,45 @@ Status draw_selftest_grid(const VulkanContext& ctx, OffscreenTarget* target, u64
   }
 
   const Extent2D ext = target->extent();
+
+  // MSAA 的 resolve 目标视图(单采样颜色图像)。samples == 1 时保持 VK_NULL_HANDLE,
+  // 下面的 framebuffer 就还是"只有一个附件"的老样子(逐字节不变的前提)。
+  VkImageView resolve_view = VK_NULL_HANDLE;
+  if (resolve) {
+    VkImageViewCreateInfo rci = vci;
+    rci.image = target->resolve_image();
+    if (rci.image == VK_NULL_HANDLE) {
+      vkDestroyImageView(ctx.device, view, nullptr);
+      vkDestroyRenderPass(ctx.device, rp, nullptr);
+      vkDestroyShaderModule(ctx.device, vs, nullptr);
+      vkDestroyShaderModule(ctx.device, fs, nullptr);
+      return Status::InitFailed("draw: 目标 samples>1 但没有 resolve 图像(OffscreenTarget::init 未建)");
+    }
+    r = vkCreateImageView(ctx.device, &rci, nullptr, &resolve_view);
+    if (r != VK_SUCCESS) {
+      vkDestroyImageView(ctx.device, view, nullptr);
+      vkDestroyRenderPass(ctx.device, rp, nullptr);
+      vkDestroyShaderModule(ctx.device, vs, nullptr);
+      vkDestroyShaderModule(ctx.device, fs, nullptr);
+      return Status::InitFailed(fmt_err("vkCreateImageView(resolve)", r));
+    }
+  }
+
+  const VkImageView fb_views[2] = {view, resolve_view};
   VkFramebufferCreateInfo fci{};
   fci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
   fci.renderPass = rp;
-  fci.attachmentCount = 1;
-  fci.pAttachments = &view;
+  fci.attachmentCount = resolve ? 2u : 1u;
+  fci.pAttachments = fb_views;
   fci.width = ext.width;
   fci.height = ext.height;
   fci.layers = 1;
   VkFramebuffer fb = VK_NULL_HANDLE;
   r = vkCreateFramebuffer(ctx.device, &fci, nullptr, &fb);
   if (r != VK_SUCCESS) {
+    if (resolve_view != VK_NULL_HANDLE) {
+      vkDestroyImageView(ctx.device, resolve_view, nullptr);
+    }
     vkDestroyImageView(ctx.device, view, nullptr);
     vkDestroyRenderPass(ctx.device, rp, nullptr);
     vkDestroyShaderModule(ctx.device, vs, nullptr);
@@ -142,7 +195,12 @@ Status draw_selftest_grid(const VulkanContext& ctx, OffscreenTarget* target, u64
   rs.lineWidth = 1.f;
   VkPipelineMultisampleStateCreateInfo ms{};
   ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-  ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+  // 断点 A(本任务的核心):这里曾经硬编码 VK_SAMPLE_COUNT_1_BIT。
+  // 必须与 render pass 附件的采样数一致,否则 vkCmdDraw 被静默丢弃
+  // (不报错,只留清屏色)或被校验层判为 framebuffer 不匹配。
+  ms.rasterizationSamples = vk_samples;
+  ms.sampleShadingEnable = VK_FALSE;  // 不做 per-sample shading(性能);MSAA 不需要它
+  ms.minSampleShading = 0.0f;
   VkPipelineColorBlendAttachmentState cba{};
   cba.colorWriteMask = 0xF;
   cba.blendEnable = VK_FALSE;
@@ -156,6 +214,7 @@ Status draw_selftest_grid(const VulkanContext& ctx, OffscreenTarget* target, u64
   r = vkCreatePipelineLayout(ctx.device, &plci, nullptr, &layout);
   if (r != VK_SUCCESS) {
     vkDestroyFramebuffer(ctx.device, fb, nullptr);
+    if (resolve_view != VK_NULL_HANDLE) vkDestroyImageView(ctx.device, resolve_view, nullptr);
     vkDestroyImageView(ctx.device, view, nullptr);
     vkDestroyRenderPass(ctx.device, rp, nullptr);
     vkDestroyShaderModule(ctx.device, vs, nullptr);
@@ -228,6 +287,7 @@ Status draw_selftest_grid(const VulkanContext& ctx, OffscreenTarget* target, u64
   if (pipe) vkDestroyPipeline(ctx.device, pipe, nullptr);
   vkDestroyPipelineLayout(ctx.device, layout, nullptr);
   vkDestroyFramebuffer(ctx.device, fb, nullptr);
+  if (resolve_view != VK_NULL_HANDLE) vkDestroyImageView(ctx.device, resolve_view, nullptr);
   vkDestroyImageView(ctx.device, view, nullptr);
   vkDestroyRenderPass(ctx.device, rp, nullptr);
   vkDestroyShaderModule(ctx.device, vs, nullptr);

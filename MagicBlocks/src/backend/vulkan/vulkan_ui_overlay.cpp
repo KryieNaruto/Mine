@@ -144,7 +144,7 @@ Status UiOverlayPass::ensure_pipeline() {
   att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
   att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
   att.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-  att.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;  // 读回前必须转 TRANSFER_SRC
+  att.finalLayout = VK_IMAGE_LAYOUT_GENERAL;  // 必须与 readback_rgba8 的 oldLayout 假定一致
 
   VkAttachmentReference ref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
   VkSubpassDescription sub{};
@@ -496,7 +496,6 @@ Status UiOverlayPass::render_offscreen() {
   vkCmdEndRenderPass(cmd);
   vkEndCommandBuffer(cmd);
   draw_calls_ = 1;
-
   // 4) 单次 submit(离屏路径;UI 层 Presenter 不再为它提交)
   VkSubmitInfo si{};
   si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -535,20 +534,22 @@ void UiOverlayPass::destroy_pipeline() {
 
 VulkanFrameRenderer::VulkanFrameRenderer(const VulkanContext& ctx, OffscreenTarget* offscreen)
     : ctx_(ctx), offscreen_(offscreen) {
-  if (offscreen_) pass_ = std::make_unique<UiOverlayPass>(ctx_, offscreen_);
+  if (!offscreen_) return;
+  pass_ = std::make_unique<UiOverlayPass>(ctx_, offscreen_);
+  // 必须在这里 init：
+  //   1. 建立 render pass / pipeline / 描述符集；
+  //   2. **建立实例容量**（set_capacity → capacity_）。
+  // 此前 init() 从未被调用，capacity_ 恒为 0，于是每一帧 append_* 全部返回
+  // Unsupported、图元被静默丢弃，离屏出图永远是全透明的空图。
+  // 调用方（CLI / 测试）只负责 append，不负责初始化。
+  Status s = pass_->init();
+  if (!s.ok()) {
+    std::fprintf(stderr, "[ui] UiOverlayPass::init 失败: %s\n", s.message.c_str());
+    pass_.reset();
+  }
 }
 
 VulkanFrameRenderer::~VulkanFrameRenderer() = default;
-
-bool VulkanFrameRenderer::render_into_device_image(std::uint64_t, ui::FrameImage* out_image,
-                                                   std::uint64_t* out_present_semaphore) {
-  // 主路径:SDK L1 ICommandList + L2 IRenderGraph 还没落地,无法把 UI 合成进
-  // 调用方给的 command buffer,也无法转 PRESENT 布局
-  // 明确失败,不假装成功;等 L1/L2 落地后替换(签名不变,UI 层零改动)
-  (void)out_image;
-  (void)out_present_semaphore;
-  return false;
-}
 
 bool VulkanFrameRenderer::render_to_memory(ui::u32 width, ui::u32 height,
                                            std::uint8_t* out_rgba8, ui::u32 row_bytes) {

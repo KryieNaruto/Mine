@@ -1,0 +1,186 @@
+// MagicBlocks L4 —— 魔法涂鸦：文档模型（F-SK 基座）
+//
+// ============================ 层归属 ============================
+// 这是 **L4 玩法层**。整个 MagicBlocks 里只有 features/ 可以出现玩法语义
+// （"涂鸦""笔画"这类词）。L0-L3 一律不得引用本文件。
+// 机械门控见 tools/check_layer_purity.py。
+//
+// ============================ 为什么存点不存网格 ============================
+// 文档存的是**逻辑采样点**，不是三角化后的 MeshData。理由：
+//   1. 撤销/重做要能精确回到"之前那几笔"，存网格则每次重三角化结果
+//      哪怕浮点有一点抖动也算不同状态，比较和去重都失效；
+//   2. 笔宽/颜色是**可后编辑参数**。存网格等于把参数烘焙死了，
+//      改一次笔宽就得重录整笔；
+//   3. 涂鸦的笔画数远小于三角形数，存点让文档小两个数量级。
+// 因此：文档 = 真源；网格 = 派生缓存（可随时丢弃重建）。
+// 这条"真源 vs 派生"的分界是本模块的核心约束，实现里任何缓存都必须
+// 能由文档完全重建，否则就是隐形的第二真源。
+//
+// ============================ 双表示（Q-SK-2 用户裁定）============================
+// 用户明确要求：**后续的笔画路径分为路径，和路径包围的布尔区域，需要预留。**
+// 所以一笔有两种几何解读，本文件同时保留、且都从同一份采样点推导：
+//
+//   PathStyle::Ribbon  —— "路径"：把折线按笔宽加粗成带状（胶囊串联）。
+//                        语义是"我在画一根线"，实体是一根有粗细的管子。
+//                        【首轮完整实现】
+//
+//   PathStyle::Region  —— "路径包围的布尔区域"：把闭合折线的**内部**填满。
+//                        语义是"我在圈一块地"，实体是圈内的那块面。
+//                        【首轮只做"闭合即成面"，即只支持 Union 语义；
+//                          Difference/Intersect/Xor 与"路径 + 区域复合"
+//                          已在接口里预留（RegionOp / PathStyle 双通道），
+//                          但未实现的分支会在调用时**显式报 Unsupported**，
+//                          绝不静默退化到 Ribbon（D8：失败要响，不许悄悄降级）。】
+//
+// 预留而不是现在就做全套，是因为首轮验收只需要 Ribbon；但接口一旦定死
+// 成"只有路径"，后面加区域语义就要动文档格式、命令流、回放——
+// 那是破坏性变更。所以现在把**通道**留下，把**实现**推迟。
+//
+// ============================ 不做的事 ============================
+//   - 不做笔刷纹理 / 压感 / 倾斜（spec §15 out-of-scope）
+//   - 不做笔画内插样条（采样点即几何，平滑交给 IPainter 的既有路径）
+//   - 不做多画布 / 图层合成
+#pragma once
+
+#include <cstdint>
+#include <vector>
+
+#include "magicblocks/primitives/types.h"
+
+namespace magicblocks::features::sketch {
+
+using primitives::Vec2;
+using primitives::Vec3;
+
+// 笔画几何的解读方式。Q-SK-2 双表示的入口。
+enum class PathStyle : std::uint8_t {
+  // "路径"：折线按笔宽加粗 → 有粗细的管子。
+  Ribbon = 0,
+  // "路径包围的布尔区域"：闭合折线内部填充 → 一块面。
+  // 首轮：调用时要求笔画已闭合（首尾距离 <= close_tolerance），否则
+  // 返回 Unsupported —— 不替用户"自动闭合"，那会改变用户画的图形。
+  Region = 1,
+};
+
+// 区域语义在有多笔合并时的布尔运算。
+//
+// 首轮只实现 Union。其余三个**存在但未实现**：
+// 调用会返回明确的 Unsupported 状态，而不是被静默当成 Union。
+// 留着它们是为了让命令流/文件格式从一开始就带上这个字段——
+// 否则将来加"挖空"功能又要改格式版本。
+enum class RegionOp : std::uint8_t {
+  Union = 0,       // 并集（首轮支持）
+  Difference = 1,  // 差集（未实现）
+  Intersect = 2,   // 交集（未实现）
+  Xor = 3,         // 异或（未实现）
+};
+
+// 笔画归属与身份。
+//
+// stroke_id **单调递增且永不复用**（D-SK-3）。理由：撤销后重画会拿到新 id，
+// 于是"撤销栈里的 id"和"画布上的 id"永远不会撞车 —— 如果用可复用的 id，
+// 重做时会出现"新笔画套用旧 id"的幽灵状态，而且只在特定撤销序列下复现。
+struct StrokeId {
+  std::uint64_t value = 0;
+  bool valid() const { return value != 0; }
+  friend bool operator==(StrokeId a, StrokeId b) { return a.value == b.value; }
+  friend bool operator!=(StrokeId a, StrokeId b) { return a.value != b.value; }
+};
+
+// 一笔涂鸦。采样点用**画布平面 2D 世界坐标**，不是屏幕像素（D-SK-2）：
+// 像素坐标一旦改变窗口大小就失效，而文档要能跨分辨率回放。
+struct Stroke {
+  StrokeId id{};
+  std::vector<Vec2> points;   // 采样点（画布平面世界坐标）
+  float width = 0.02f;        // 笔宽（世界单位，直径）
+  primitives::Color4 color{1.0f, 1.0f, 1.0f, 1.0f};
+  bool round_cap = true;
+  PathStyle style = PathStyle::Ribbon;
+  bool closed = false;        // Region 用：折线是否首尾相接
+
+  // 采样点数上限之外的点会被丢弃，用于防御异常长笔画撑爆文档。
+  // 0 表示不限。
+  std::uint32_t max_points = 4096;
+};
+
+// 撤销/重做的一项。
+//
+// 用"整笔增删"而不是"逐点增删"作为粒度：涂鸦的撤销单位天然是一笔，
+// 逐点撤销会让用户按 200 次 Ctrl+Z 才能撤掉一条线。
+struct SketchEdit {
+  enum class Kind : std::uint8_t {
+    AddStroke,     // 加了一笔
+    RemoveStroke,  // 删了一笔
+  };
+  Kind kind = Kind::AddStroke;
+  Stroke stroke{};   // AddStroke 存被加的；RemoveStroke 存被删的（供重做）
+  std::size_t index = 0;  // 在 strokes 里的位置（重做时插回原处，保持顺序稳定）
+};
+
+// 涂鸦文档。
+//
+// 刻意做成**值语义 + 可平凡拷贝**：快照 = 拷贝一份。这换来回放验证的
+// 简单（两份文档逐字段比较即可），代价是内存翻倍 —— 但一笔涂鸦的点数
+// 在 KB 级，不值得为省这点内存引入写时复制。
+class SketchDocument {
+ public:
+  SketchDocument() = default;
+
+  // ---- 笔画 ----
+  const std::vector<Stroke>& strokes() const { return strokes_; }
+  std::size_t stroke_count() const { return strokes_.size(); }
+  // 按 id 查笔画；找不到返回 nullptr（不抛异常 —— 命令流可能带旧 id）。
+  const Stroke* find(StrokeId id) const;
+
+  // 加一笔。返回新分配的 id（单调递增，永不复用）。
+  // points 为空或点数不足 → 返回无效 id 且**不改变文档**。
+  StrokeId add_stroke(Stroke stroke);
+
+  // 按 id 删一笔。成功返回 true 并压入撤销栈。
+  bool remove_stroke(StrokeId id);
+
+  // ---- 撤销 / 重做 ----
+  bool can_undo() const { return !undo_.empty(); }
+  bool can_redo() const { return !redo_.empty(); }
+  // 撤销一步。返回是否真的撤销了。
+  bool undo();
+  bool redo();
+  void clear_history();
+
+  // ---- 快照（回放校验用）----
+  // 文档指纹：对"笔画 id + 点数 + 每点坐标 + 参数"按顺序做 64 位混合。
+  // 不含任何指针/地址，因此跨进程稳定；浮点按位比较（不是 epsilon），
+  // 因为回放要求**逐位一致**而不是"看起来一样"。
+  std::uint64_t hash() const;
+
+  // 清空（同时清历史）。
+  void clear();
+
+  // ---- Region 语义约束（首轮能力边界）----
+  // 首轮是否支持给定的区域运算。调用方应先问再做，
+  // 免得执行到一半才发现不支持。
+  static bool supports_region_op(RegionOp op);
+
+  // 下一笔将拿到的 id（供命令流预分配/回放对齐）。
+  std::uint64_t next_stroke_id() const { return next_id_; }
+  void set_next_stroke_id(std::uint64_t v) { next_id_ = v; }
+
+ private:
+  void push_edit(SketchEdit edit);
+
+  std::vector<Stroke> strokes_;
+  std::vector<SketchEdit> undo_;
+  std::vector<SketchEdit> redo_;
+  std::uint64_t next_id_ = 1;  // 0 保留给"无效 id"
+};
+
+// 双表示的可选性检查：给定笔画能否用指定 style 生成几何。
+// 返回 false 时不产生任何几何，调用方必须**显式处理**（报错或跳过），
+// 不允许当成空轮廓静默继续。
+struct StyleCheck {
+  bool ok = false;
+  const char* reason = "";  // ok=false 时给出人类可读原因（静态字符串，无分配）
+};
+StyleCheck check_style(const Stroke& stroke, float close_tolerance = 1e-3f);
+
+}  // namespace magicblocks::features::sketch

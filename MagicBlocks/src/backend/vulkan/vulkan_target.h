@@ -9,6 +9,7 @@
 #include <memory>
 
 #include "backend/vulkan/vk_common.h"
+#include "backend/vulkan/vulkan_frame_target.h"
 #include "magicblocks/device/render_target.h"
 
 namespace magicblocks::backend {
@@ -40,12 +41,27 @@ std::uint32_t find_memory_type(const VulkanContext& ctx, std::uint32_t type_bits
 // 创建一张图像并由 L1 分页分配器出内存(G4:全仓零裸分配)。
 // 返回 Status;失败时不留半成品。out_page 是分配器给该图像的专用页 id,
 // 销毁图像后必须调 release_image_page(out_page)。
+//
+// samples:MSAA 采样数,缺省 VK_SAMPLE_COUNT_1_BIT(既有调用点因此逐字节不变)。
+// samples > 1 的图像不能当 TransferSrc 读回(Vulkan 禁止非 1 采样图像做
+// vkCmdCopyImageToBuffer),所以 MSAA 通路必须另配一张单采样 resolve 图像。
 Status create_image(const VulkanContext& ctx, VkFormat fmt, VkImageUsageFlags usage,
                     VkImageLayout initial_layout, std::uint32_t w, std::uint32_t h,
-                    VkImage* out_image, std::uint32_t* out_page);
+                    VkImage* out_image, std::uint32_t* out_page,
+                    VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT);
 
 // OffscreenTarget:纯离屏渲染目标。
-class OffscreenTarget final : public device::IRenderTarget {
+//
+// ⚠️ 历史坑(2026-11-06 F-SK 收尾):这里曾经写作
+//     `class OffscreenTarget final : public device::IRenderTarget, public IFrameTargetImage`
+//   —— 用了 **private** 继承。后果是 `submit_device_frame` 里的
+//     `dynamic_cast<IFrameTargetImage*>(&target)` **恒为 nullptr**(private 基类
+//   对 dynamic_cast 不可见),于是每一帧都报
+//     「submit_device_frame: 第 0 条命令(begin_pass): 目标不提供可用的颜色附件图像」。
+//   编译器不会报错(C++ 允许私有基类),而 base 顺序变化(先 IRenderTarget)
+//   又会把 vtable 的布局改掉、让别的 dynamic_cast 落到错误的 vptr 上 ——
+//   只能靠真实提交路径的测试抓到。所以:**这两个基类必须 public**。
+class OffscreenTarget final : public device::IRenderTarget, public IFrameTargetImage {
  public:
   OffscreenTarget(const VulkanContext& ctx, const device::TargetDesc& desc) : ctx_(ctx), desc_(desc) {}
   ~OffscreenTarget() override;
@@ -71,8 +87,34 @@ class OffscreenTarget final : public device::IRenderTarget {
                        SelftestKind kind = SelftestKind::kL0Default);
 
   // L0 内部用:交给离屏绘制通路
+  //
+  // MSAA 语义(重要):color_ 是**渲染用的颜色附件**,samples>1 时它是多重采样图像;
+  // resolve_image() 才是单采样、可读回的那张。所以:
+  //   - render pass / framebuffer 的附件 0 挂 color_ 的视图
+  //   - pResolveAttachments 挂 resolve_image()
+  //   - readback_rgba8 读固定读 resolve_image()(samples==1 时两者是同一张图)
   VkImage color_image() const { return color_; }
+  // MSAA 的单采样 resolve 图像。samples == 1 时**等于** color_(同一张图),
+  // 这样读回路径与历史完全一致,不会多出一张没用上的图像。
+  VkImage resolve_image() const { return resolve_ != VK_NULL_HANDLE ? resolve_ : color_; }
+  // L3 设备帧提交用:深度附件图像(with_depth=false 时为 VK_NULL_HANDLE)。
+  // 管线/pass 的深度附件形状必须与它一致(vulkan_device_frame.cpp 的 PassShape)。
+  VkImage depth_image() const { return depth_; }
   const VulkanContext& ctx() const { return ctx_; }
+
+  // IFrameTargetImage:让 submit_device_frame 不必强转具体类型。
+  // frame_color_image() 返回的是**多重采样**那张(渲染用,pass 的附件 0);
+  // frame_resolve_image() 返回单采样那张(pass 的 resolve 附件)。
+  //
+  // ⚠️ frame_resolve_image() **必须重写**。基类默认实现是
+  // `return frame_color_image();`(为交换链兜底,那边本来就没有 resolve)。
+  // 少了这个重写,MSAA 时 framebuffer 的附件 1 会拿到那张 4 采样图,
+  // 而 render pass 声明附件 1 是 1 采样 → 采样数不匹配 → vkCmdDraw 被
+  // **静默丢弃**,画面只剩清屏色(不报错,极难查)。本文件 2026-11-09 栽过这一跤。
+  VkImage frame_color_image() const override { return color_; }
+  VkImage frame_resolve_image() const override { return resolve_image(); }
+  VkImage frame_depth_image() const override { return depth_; }
+  bool frame_from_swapchain() const override { return false; }
 
  private:
   VulkanContext ctx_;
@@ -81,6 +123,10 @@ class OffscreenTarget final : public device::IRenderTarget {
   std::uint32_t color_page_ = 0xFFFFFFFFu;  // 分配器图像页 id(不是 VkDeviceMemory)
   VkImage depth_ = VK_NULL_HANDLE;
   std::uint32_t depth_page_ = 0xFFFFFFFFu;
+  // MSAA 的单采样 resolve 图像。samples == 1 时为 VK_NULL_HANDLE(不额外分配),
+  // resolve_image() 直接回落到 color_,历史路径零变化。
+  VkImage resolve_ = VK_NULL_HANDLE;
+  std::uint32_t resolve_page_ = 0xFFFFFFFFu;
 };
 
 VkFormat to_vk_format(device::Format f);

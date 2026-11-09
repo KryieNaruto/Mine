@@ -251,20 +251,148 @@ void VulkanBuffer::flush_pending() {
     pending_bytes_ = 0;
     return;
   }
-  for (const PendingUpload& up : pending_) {
-    Status s = commit_upload(up);
-    if (s.ok()) {
-      uploaded_bytes_total_ += up.size;
-      upload_commit_error_.clear();
-    } else {
-      // 记下第一条失败原因供上层查询;不重试(重试语义留给 L2 的帧内批处理)。
-      if (upload_commit_error_.empty()) upload_commit_error_ = s.message;
+  upload_commit_error_.clear();
+
+  // 目标缓冲自己可映射 → 走 memcpy 逐条提交(Staging 用途)。
+  // 目标不可映射(设备页:Vertex/Index/Uniform/Storage)→ 必须走真实 GPU 拷贝。
+  if (mapped_ != nullptr) {
+    for (const PendingUpload& up : pending_) {
+      Status s = commit_upload(up);
+      if (s.ok()) {
+        uploaded_bytes_total_ += up.size;
+      } else if (upload_commit_error_.empty()) {
+        // 记下第一条失败原因供上层查询;不重试(重试语义留给 L2 的帧内批处理)。
+        upload_commit_error_ = s.message;
+      }
+      // 无论成败都归还暂存子块(M4:归还本页,不退 VMA)。
+      (void)allocator_->free(up.staging);
     }
-    // 无论成败都归还暂存子块(M4:归还本页,不退 VMA)。
-    (void)allocator_->free(up.staging);
+  } else {
+    Status s = flush_pending_device_pages();
+    if (s.ok()) {
+      for (const PendingUpload& up : pending_) uploaded_bytes_total_ += up.size;
+    } else {
+      upload_commit_error_ = s.message;
+    }
   }
+
   pending_.clear();
   pending_bytes_ = 0;
+}
+
+Status VulkanBuffer::flush_pending_device_pages() {
+  if (!has_ctx_ || ctx_.device == VK_NULL_HANDLE || ctx_.queue == VK_NULL_HANDLE) {
+    return Status::Unsupported(
+        "VulkanBuffer::flush_pending: 纯软件态没有 VkDevice,设备页缓冲无法上传"
+        "(请用带 ctx 的设备态构造)");
+  }
+  if (vk_buffer_ == VK_NULL_HANDLE) {
+    return Status::Invalid("VulkanBuffer::flush_pending: 设备态缓冲没有 VkBuffer");
+  }
+
+  // 合并所有待提交区间:最左起点 + 覆盖到最右终点,一次拷贝。
+  // (顶点/索引上传的调用方通常一次 upload 整块,合并后即一条记录)
+  u64 lo = pending_[0].dst_offset;
+  u64 hi = pending_[0].dst_offset + pending_[0].size;
+  for (const PendingUpload& up : pending_) {
+    lo = up.dst_offset < lo ? up.dst_offset : lo;
+    const u64 end = up.dst_offset + up.size;
+    hi = end > hi ? end : hi;
+  }
+  const u64 span = hi - lo;
+  if (span == 0) return Status::Ok_();
+
+  // 1) 物化一张 HOST_VISIBLE 的临时 staging VkBuffer,把 pending 数据按偏移拷进去。
+  VkBufferCreateInfo bci{};
+  bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+  bci.size = static_cast<VkDeviceSize>(span);
+  bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+  bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+  VkBuffer staging_buf = VK_NULL_HANDLE;
+  VkResult vr = vkCreateBuffer(ctx_.device, &bci, nullptr, &staging_buf);
+  if (vr != VK_SUCCESS) {
+    return Status::OOM(std::string("flush_pending: 创建 staging VkBuffer 失败: ") +
+                       std::to_string(static_cast<int>(vr)));
+  }
+
+  VkMemoryRequirements req{};
+  vkGetBufferMemoryRequirements(ctx_.device, staging_buf, &req);
+
+  // L1:G4「全仓零裸分配」—— staging 的 VkDeviceMemory **也**必须从分页分配器要专用页,
+  // 不允许出现 vkAllocateMemory / vkMapMemory(vkBindBufferMemory 用 bind_buffer_page)。
+  // device_local=false 拿到的是 HOST_VISIBLE|COHERENT 且 MAPPED 常驻的页。
+  VulkanPagingAllocator::ImagePageRequest page_req;
+  page_req.size = req.size;
+  page_req.alignment = req.alignment;
+  page_req.memory_type_bits = req.memoryTypeBits;
+  page_req.device_local = false;
+  auto page = ctx_.allocator->allocate_image_page(page_req);
+  if (!page.ok()) {
+    vkDestroyBuffer(ctx_.device, staging_buf, nullptr);
+    return Status::OOM("flush_pending: staging 页分配失败: " + page.message());
+  }
+  const std::uint32_t staging_page = page.value().page_id;
+
+  Status bind = ctx_.allocator->bind_buffer_page(staging_page, reinterpret_cast<std::uintptr_t>(staging_buf));
+  if (!bind.ok()) {
+    ctx_.allocator->release_image_page(staging_page);
+    vkDestroyBuffer(ctx_.device, staging_buf, nullptr);
+    return Status::InitFailed("flush_pending: " + bind.message);
+  }
+
+  void* mapped = ctx_.allocator->image_page_mapped_ptr(staging_page);
+  if (mapped == nullptr) {
+    ctx_.allocator->release_image_page(staging_page);
+    vkDestroyBuffer(ctx_.device, staging_buf, nullptr);
+    return Status::InitFailed("flush_pending: staging 页拿不到常驻映射");
+  }
+
+  for (const PendingUpload& up : pending_) {
+    const void* src = allocator_->mapped_ptr(up.staging);
+    if (src == nullptr) {
+      ctx_.allocator->release_image_page(staging_page);
+      vkDestroyBuffer(ctx_.device, staging_buf, nullptr);
+      return Status::Invalid("flush_pending: 暂存子块映射丢失");
+    }
+    std::memcpy(static_cast<std::uint8_t*>(mapped) + (up.dst_offset - lo), src,
+                static_cast<std::size_t>(up.size));
+  }
+
+  // 2) 用一次性命令缓冲做 vkCmdCopyBuffer,提交并等待完成。
+  auto destroy_staging = [&]() {
+    ctx_.allocator->release_image_page(staging_page);
+    vkDestroyBuffer(ctx_.device, staging_buf, nullptr);
+  };
+
+  Status out = submit_once_sync(ctx_, "flush_pending: 设备页上传", [&](VkCommandBuffer cmd) {
+    VkBufferCopy region{};
+    region.srcOffset = 0;
+    region.dstOffset = static_cast<VkDeviceSize>(lo);
+    region.size = static_cast<VkDeviceSize>(span);
+    vkCmdCopyBuffer(cmd, staging_buf, vk_buffer_, 1, &region);
+
+    // 3) 让后续的 GPU 读取看见拷贝结果。
+    VkBufferMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT |
+                            VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = vk_buffer_;
+    barrier.offset = 0;
+    barrier.size = VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
+                             VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                         0, 0, nullptr, 1, &barrier, 0, nullptr);
+    return Status::Ok_();
+  });
+
+  destroy_staging();
+  return out;
 }
 
 Status VulkanBuffer::commit_upload(const PendingUpload& up) {
@@ -276,13 +404,9 @@ Status VulkanBuffer::commit_upload(const PendingUpload& up) {
                 static_cast<std::size_t>(up.size));
     return Status::Ok_();
   }
-  // 设备页目标:暂存子块是页内裸偏移(没有 VkBuffer 对象),本轮按 M2
-  // 「资源全部从内存页切偏移」不单独物化暂存 VkBuffer;因此给出明确的 Unsupported
-  // 而不是静默丢弃。设备侧上传由 L2 的渲染图在提交阶段用一张每帧暂存 VkBuffer 完成
-  // (spec §6.3 的帧批处理)。
-  return Status::Unsupported(
-      "VulkanBuffer::upload: 设备页目标需要在命令提交阶段物化暂存 VkBuffer(L2 帧批处理);"
-      "本轮请在 BufferUsage::Staging 的缓冲上用 write() 写数据");
+  // 设备页目标由 flush_pending() 统一走 flush_pending_device_pages()(vkCmdCopyBuffer),
+  // 不在这里逐条处理 —— 单条记录各建一次 staging 会白白多出 N 次提交。
+  return Status::Ok_();
 }
 
 resources::ResourceId VulkanBuffer::pending_staging_id(u32 index) const {

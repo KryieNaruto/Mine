@@ -71,3 +71,28 @@ MagicBlocks\build\magicblocks-ui-cli.exe render --width 320 --height 240 `
 被 `ui_Offscreen.MatchesGolden`（`tests/ui_test.cpp`）使用。与 `golden_l0.png` 不同，
 它**不**带 4x4 色块结构断言——UI 的判据是通道序/朝向由 `ui_Offscreen.RendersDeterministicFrame`
 的确定性 + 同像素复现兜底。
+
+## golden_l2.png —— L2 场景层基线
+
+与 `golden_l0.png` / `golden_ui.png` 同尺寸（320x240 RGBA8），但是**另一套配色**：
+
+| 项 | L0（golden_l0.png） | L2（golden_l2.png） |
+| --- | --- | --- |
+| 左上角实例 0 | 纯红 | **纯绿** |
+| 清屏色 | 纯黑 (0,0,0) | **深蓝 (13,20,51)** |
+
+两套基线**不能互相冒充**：`L2Golden.MatchesL2Baseline` 除了逐像素比对，还额外断言
+"左上角必须是纯绿 / 右上角必须不是纯绿 / 背景必须偏蓝而不是纯黑"。
+把 `golden_l2.png` 换成 L0 那份，第一条断言立刻失败。
+
+**`frame_index` 必须是偶数**，绿色标定点才落在左上角。
+
+重生成：
+
+```powershell
+MagicBlocks\build\magicblocks-l2-cli.exe record --scene demo --width 320 --height 240 \
+    --frame-index 0 --record s.mbl2 --output MagicBlocks\tests\data\golden_l2.png
+```
+
+重生成后必须跑一遍 `magicblocks_test.exe --gtest_filter=L2Golden.*` 确认通过，
+并核对左上角确实是纯绿、背景确实偏蓝。

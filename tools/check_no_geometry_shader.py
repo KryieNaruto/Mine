@@ -31,7 +31,15 @@ FORBIDDEN_PATTERNS = [
     (re.compile(r"GL_(TRIANGLES|LINES|LINES_STRIP)_ADJACENCY"), "邻接图元枚举"),
     (re.compile(r"\b(?:shader|Shader|Stage)\s*[:=]\s*(geom|geometry)\b"), "shader stage 声明为 geometry"),
     (re.compile(r"\bVK_SHADER_STAGE_GEOMETRY_BIT\b"), "Vulkan 几何着色器 stage 位"),
-    (re.compile(r"\.(geom|geometry)\b"), "几何着色器源文件后缀"),
+    # 几何着色器源文件后缀。只匹配"像文件路径里出现 .geom/.geometry"的情形:
+    #   前面必须是路径分隔符/引号/行首(即后缀紧跟在一个文件名后面),
+    #   后面必须是真正的文件名字符之后的行尾/引号/空白。
+    # 不这么收紧的话,`painter.geometry()`、`p.geometry().vertices` 这类
+    # **普通 C++ 方法调用**会被误判(实际发生过: Painter 测试里
+    # `for (const auto& v : p.geometry().vertices)` 被这条规则命中)。
+    # 收紧后依然能抓到 "shaders/stroke.geometry"、'x.geom"'、Path("a.geometry")。
+    (re.compile(r"""(?:^|[/\\"'\s])[\w\-.]+\.(?:geom|geometry)["'\s,;)\]}]"""),
+     "几何着色器源文件后缀"),
 ]
 
 SHADER_EXTS = {".vert", ".frag", ".comp", ".es", ".glsl"}
@@ -104,7 +112,10 @@ def main(argv):
     if problems:
         print("[G1] 违规 %d 处(禁止几何着色器):" % len(problems))
         for p in problems:
-            print("  " + p)
+            # 违规行可能带 BOM 或 Windows 控制台是 GBK,直接 print 会 UnicodeEncodeError
+            # 崩掉 —— 那就变成"发现违规但门控自己崩了",退出码语义完全乱掉。
+            # 统一用 backslashreplace,保证任何字节都能打出来且退出码仍是 1。
+            print("  " + p.encode("utf-8", "backslashreplace").decode("utf-8"))
         return 1
     print("[G1] OK 扫描 %d 个文件,无几何着色器" % len(victims))
     return 0

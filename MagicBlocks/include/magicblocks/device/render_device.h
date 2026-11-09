@@ -52,6 +52,22 @@ class IRenderDevice {
       const resources::PipelineDesc& desc) = 0;
   virtual Result<std::unique_ptr<resources::ICommandList>> create_command_list() = 0;
 
+  // 把一条**已录制完成**的命令列表真正下发执行(设备帧提交)。
+  //
+  // 为什么需要这个入口:resources::ICommandList 的 draw 系列在设备态只做
+  // "录制进命令流",并把命令编码到它自己的 VkCommandBuffer 的做法只在
+  // backend 内的 submit_device_frame() 里成立。没有这条公开通路时,
+  // 上层(L2/L3/demo)即使把 11 类命令全录对了,像素也不会出现在目标上 ——
+  // 只能借用 OffscreenTarget::draw_selftest() 那条写死几何的旁路。
+  //
+  // 契约:
+  //   - list 必须由**本设备**的 create_command_list() 产生,且已 end_pass
+  //     (in_pass() == false)。
+  //   - 成功后目标附件内容即为该命令流的执行结果;配合
+  //     IRenderTarget::readback_rgba8 取出像素。
+  //   - 失败即整帧不提交(D8:不静默降级),返回带原因的非 Ok Status。
+  virtual Status submit_command_list(resources::ICommandList& list) = 0;
+
   // 生命周期事件(D7):SurfaceChanged → 重建,SurfaceDestroyed → 失效。
   virtual Status notify_lifecycle(const AppLifecycleEvent& ev) = 0;
 

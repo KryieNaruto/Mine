@@ -26,8 +26,8 @@
 | **L1** | `resources/` 资源层 + VMA 分页分配器 + ICommandList | ✅ **已完成**（20 用例全绿） |
 | **L2** | scene / 渲染图 / 命令流录制回放 | ✅ **已完成**（123 用例，1 例已知失败） |
 | **UI 消费层** | Presenter 状态机 / HUD / 输入路由 / 离屏出图 | ✅ **已完成**（3 张 golden） |
-| L3 | primitives（三角化=libtess2、布尔=Clipper2、OBJ=tinyobjloader） | ⬜ 未开始 |
-| L4 | features（玩法层，**唯一允许出现玩法名**的地方） | ⬜ 未开始 |
+| L3 | primitives（相机/ECS/材质/合批/画笔/覆盖层/拾取/Gizmo/图元/OBJ/BVH） | ✅ **M1~M5 全部完成**（389/389 用例全绿，含 L4 新增）→ [L3_DELIVERY.md](L3_DELIVERY.md) |
+| L4 | features（玩法层，**唯一允许出现玩法名**的地方） | 🟡 **F-SK 涂鸦基座已完成**（389/389 全绿）→ [F-SK 设计](../../docs/superpowers/specs/2026-11-05-magicblocks-l4-fsk-sketch-design.md) |
 
 > **定位裁定（R-1，2026-11-03）**：SDK 是 **"计算/几何库 + 离屏渲染器"**，上屏与控件 UI 移交
 > 平台壳层（Android SurfaceView + Compose）。已落地的 `ISwapchain` / `Presenter` /
@@ -275,13 +275,34 @@ vulkan_swapchain_*_stub.cpp  提供对面平台的符号，避免 LNK2019 且保
 **`ICommandList` 一共 11 个方法**（见 `command.h`）。`recording()` 在设备态由
 `begin_pass()` 置真（软件态由 `init()` 置真）；`submit_and_wait()` 对未开启的列表是合法的 `Ok`。
 
-### L2（场景 / 渲染图）怎么接
+### L2（场景 / 渲染图）—— 已完成，这里是它的契约
 - 资源一律通过 `IRenderDevice::create_buffer/create_texture/create_sampler/
   create_pipeline/create_command_list` 拿，**不要**直接 new `Vulkan*` 或碰 `VulkanPagingAllocator`。
 - `vulkan_draw.*` 的 `draw_selftest()` 是**测试绘制例程**，L2 另起渲染图，届时它退化为测试专用。
   不要把它当渲染图的起点。
 - `OffscreenTarget` 只做"分配/布局/读回"，不含编排逻辑。L2 的编排放 `src/scene/`。
 - 帧边界挂点：`IFrameSync::advance_frame_index()` + `IMemoryAllocator::begin_frame()`。
+- **接口全在 `include/magicblocks/scene/`，公共头零 `Vk*`**（G3 强制）。七个头：
+  `types.h` / `scene.h` / `submit_queue.h` / `render_graph.h` /
+  `command_stream.h` / `feature.h` / `recorder.h`。
+- **双写 (W1-W4)**：`IRecorder` 先调 L1 的 `ICommandList`，**L1 返回 Ok 之后**才把同一条
+  命令追加进 `CommandStream`。L1 是唯一权威，录制与执行不会漂移。
+  等式 `commands.size() == target.command_count()` 由 `Recorder.RecordsAllElevenCommandTypes` 守着。
+- **L1 的 `draw*` 不产生像素**：L1 只 `append(cmd)`，真正的 `vkCmdDraw` 在提交时。
+  因此 golden 的像素来自 `OffscreenTarget::draw_selftest()` 这条真实绘制路径，
+  **不是** `replay()` 的结果。两者不要混为一谈。
+- **`PassRecord::area` 保留原始值**：L1 的 `begin_pass` 把 `area_width==0` 解析成 extent
+  后再存，L2 的 `PassRecord`/`CommandRecord.pass_area` 存**原样**的 0。
+  上层要 extent 就自己解析，不要指望 L2 已经替你换过。
+- **禁止 `replay()` 后依赖命令列表内容**：回放把整帧重录进调用方给的列表并**留给调用方**，
+  不在返回前 reset。
+- **L2 不读时钟**（D13）：时间戳只能由调用方传入。门控
+  `tools/check_scene_no_clock.py` 扫描 `include/magicblocks/scene/**` 与 `src/scene/**`。
+  一旦 L2 内部读时钟，哈希会随机器漂移，回放比对与 golden 全部失效。
+- **命令流二进制头部有版本号**：`kBinaryFormatVersion`。改动 body 布局必须升版本，
+  否则旧文件会被当新格式误读。v1→v2 就是因为把 `backend` 字符串移进了 body
+  （v1 只有头部 1 字节枚举，`"vulkan"` 与 `"vulkan2"` 哈希碰撞）。
+
 
 ### L4（features）唯一允许玩法名
 G3 门控在 backend 内禁玩法名（`sketch`/`blocks`/`voxel`/`stamp`/`squeeze`/`捏捏乐`/`涂鸦`/`积木`/`叠叠乐`/`印章`）。
@@ -328,7 +349,7 @@ MagicBlocks\build\magicblocks-l0-cli.exe render --width 320 --height 240 `
 
 ---
 
-## 9. 测试清单（99 项）
+## 9. 测试清单（145 项）
 
 **25 个 L0 gtest 用例 / 8 个套件** —— 覆盖 D1-D8：
 

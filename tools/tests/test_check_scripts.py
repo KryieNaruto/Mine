@@ -20,6 +20,7 @@ if TOOLS_DIR not in sys.path:
 import check_layer_purity  # noqa: E402
 import check_no_geometry_shader  # noqa: E402
 import check_no_raw_alloc  # noqa: E402
+import check_scene_no_clock  # noqa: E402
 
 
 def make_project(tmp, shaders=None, src_files=None, include_files=None):
@@ -419,6 +420,104 @@ class GateNoRawAllocTest(unittest.TestCase):
                     "#define VMA_IMPLEMENTATION\nvoid vkAllocateMemory(){}\n"})
             rc, out = run(check_no_raw_alloc, tmp)
             self.assertEqual(rc, 0, out)
+
+
+class GateSceneNoClockTest(unittest.TestCase):
+    """L2 时钟门控:场景层不允许出现任何时钟/计时 API(spec D13)。
+
+    正向:干净代码必须 rc=0。
+    负向:每种时钟写法都必须 rc=1 —— 门控脚本只"存在"不"断言"是第 11 版审阅
+    点名过的失效模式,所以每个 pattern 都要有独立负向样本。
+    """
+
+    SCENE_SRC = "src/scene/command_stream.cpp"
+    SCENE_INC = "include/magicblocks/scene/scene.h"
+
+    @staticmethod
+    def _scene_project(tmp, body, rel=None):
+        rel = rel or GateSceneNoClockTest.SCENE_SRC
+        path = os.path.join(tmp, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(body)
+        return tmp
+
+    def test_clean_scene_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._scene_project(tmp, "void f(){ unsigned long long t = 42; }\n")
+            rc, out = run(check_scene_no_clock, tmp)
+            self.assertEqual(rc, 0, out)
+
+    def test_header_also_scanned(self):
+        """include/magicblocks/scene/** 同样在范围内(不只是 src/)。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._scene_project(
+                tmp, "inline auto now(){ return std::chrono::steady_clock::now(); }\n",
+                rel=self.SCENE_INC)
+            rc, out = run(check_scene_no_clock, tmp)
+            self.assertEqual(rc, 1, out)
+
+    def test_each_clock_api_fails(self):
+        spellings = [
+            "auto a = std::chrono::steady_clock::now();",
+            "auto a = std::chrono::system_clock::now();",
+            "auto a = std::chrono::high_resolution_clock::now();",
+            "auto a = steady_clock::now();",
+            "auto a = system_clock::now();",
+            "auto a = high_resolution_clock::now();",
+            "std::time_t a = time(nullptr);",
+            "clock_t a = clock();",
+            "DWORD a = GetTickCount();",
+            "DWORD64 a = GetTickCount64();",
+            "LARGE_INTEGER c; QueryPerformanceCounter(&c);",
+            "gettimeofday(&tv, nullptr);",
+            "clock_gettime(CLOCK_MONOTONIC, &ts);",
+            "timespec_get(&ts, TIME_UTC);",
+        ]
+        for spelling in spellings:
+            with self.subTest(spelling=spelling), tempfile.TemporaryDirectory() as tmp:
+                self._scene_project(tmp, spelling + "\n")
+                rc, out = run(check_scene_no_clock, tmp)
+                self.assertEqual(rc, 1, "未抓到: %s -- %s" % (spelling, out))
+
+    def test_comment_mentions_are_ignored(self):
+        """注释里提到时钟不算违规(门控只认代码行)。"""
+        body = (
+            "// 这里绝不能写 std::chrono::steady_clock\n"
+            "/* 历史实现用过 time( 和 clock( */\n"
+            "void f(){ int x = 0; }\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            self._scene_project(tmp, body)
+            rc, out = run(check_scene_no_clock, tmp)
+            self.assertEqual(rc, 0, out)
+
+    def test_string_literal_mentions_are_ignored(self):
+        """错误消息里写出 API 名字不算违规。"""
+        body = 'const char* msg = "禁止 time( 与 std::chrono";\nvoid f(){}\n'
+        with tempfile.TemporaryDirectory() as tmp:
+            self._scene_project(tmp, body)
+            rc, out = run(check_scene_no_clock, tmp)
+            self.assertEqual(rc, 0, out)
+
+    def test_tests_and_tools_not_scanned(self):
+        """tests/ 与 tools/ 不在范围内(测试本身可以用时钟)。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            for rel in ("tests/clock_using_test.cpp", "tools/helper.cpp"):
+                path = os.path.join(tmp, rel)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("auto t = std::chrono::steady_clock::now();\n")
+            rc, out = run(check_scene_no_clock, tmp)
+            self.assertEqual(rc, 0, out)
+
+    def test_violation_reports_file_and_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._scene_project(tmp, "void f(){}\nvoid g(){ time(nullptr); }\n")
+            rc, out = run(check_scene_no_clock, tmp)
+            self.assertEqual(rc, 1, out)
+            self.assertIn(":2", out)
+            self.assertIn(self.SCENE_SRC, out)
 
 
 if __name__ == "__main__":

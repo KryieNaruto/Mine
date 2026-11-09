@@ -49,6 +49,10 @@ class VulkanSwapchain final : public device::ISwapchain, public SwapchainImagePr
   // 内部:surface 是否已失效(lifecycle SurfaceDestroyed 后为 true)
   bool surface_alive() const { return surface_ != VK_NULL_HANDLE; }
 
+  // 上屏三件事(见 device/swapchain.h)
+  device::ISwapchain::ImageResult acquire_next_image() override;
+  device::ISwapchain::ImageStatus present_current() override;
+
  private:
   device::Status destroy_swapchain();
   device::Status create_swapchain_objects(device::Extent2D extent);
@@ -65,6 +69,9 @@ class VulkanSwapchain final : public device::ISwapchain, public SwapchainImagePr
   std::vector<device::PresentMode> modes_;
   // 每张 image 包一个只读 IRenderTarget 视图(不拥有图像)
   std::vector<std::unique_ptr<device::IRenderTarget>> views_;
+  // acquire 用 fence:保证覆盖写之前 GPU 已经用完这张图。
+  VkFence acquire_fence_ = VK_NULL_HANDLE;
+  bool surface_lost_ = false;
 };
 
 }  // namespace magicblocks::backend

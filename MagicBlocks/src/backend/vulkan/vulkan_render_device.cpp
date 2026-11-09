@@ -6,6 +6,7 @@
 #include "backend/vulkan/vulkan_draw.h"
 #include "backend/vulkan/vulkan_buffer.h"
 #include "backend/vulkan/vulkan_command.h"
+#include "backend/vulkan/vulkan_device_frame.h"
 #include "backend/vulkan/vulkan_pipeline.h"
 #include "backend/vulkan/vulkan_swapchain.h"
 #include "backend/vulkan/vulkan_texture.h"
@@ -44,7 +45,15 @@ Status VulkanRenderDevice::init(const DeviceDesc& desc, const std::string& devic
   }
 
   std::string err;
-  if (!create_instance(desc.enable_validation, VK_MAKE_VERSION(1, 0, 0), &inst_, &err)) {
+  // API 版本必须与 backend 实际用到的功能一致:
+  //   - VulkanPagingAllocator 建 VMA 时写的是 vulkanApiVersion = VK_API_VERSION_1_1
+  //   - L1/L2 资源路径大量调用 vkGetPhysicalDevice*2()（1.1 才提升为核心）
+  // 之前这里请求的是 1.0,与 VMA 声明的 1.1 不一致:校验层会报
+  // UNASSIGNED-API-Version-Violation,驱动侧 VMA 走 1.0 兼容路径并破坏内部状态,
+  // 表现为「创建命令列表后,设备析构时堆损坏(0xc0000374)」——
+  // 一个非常难查的 bug:崩在 vkDestroyDevice,根因却在实例创建。
+  // SwiftShader 支持 1.3,请求 1.1 是安全下限。
+  if (!create_instance(desc.enable_validation, VK_API_VERSION_1_1, &inst_, &err)) {
     return Status::InitFailed(err.empty() ? "创建 Vulkan 实例失败" : err);
   }
 
@@ -233,6 +242,8 @@ Result<std::unique_ptr<resources::IBuffer>> VulkanRenderDevice::create_buffer(
   auto b = std::make_unique<VulkanBuffer>(ctx_, allocator_.get(), desc);
   Status s = b->init();
   if (!s.ok()) return s;
+  // 登记句柄 → 指针,供 submit_command_list() 反查(见 bind_known_buffers)。
+  if (b->id().valid()) known_buffers_.emplace_back(b->id(), b.get());
   return std::unique_ptr<resources::IBuffer>(std::move(b));
 }
 
@@ -263,12 +274,62 @@ Result<std::unique_ptr<resources::IPipeline>> VulkanRenderDevice::create_pipelin
   return std::unique_ptr<resources::IPipeline>(std::move(p));
 }
 
+Result<std::unique_ptr<resources::IPipeline>> VulkanRenderDevice::create_pipeline_for_shape(
+    const resources::PipelineDesc& desc, const AttachmentShape& shape) {
+  if (!logical_ready_) return Status::InitFailed("设备未初始化");
+  auto p = std::make_unique<VulkanPipeline>(ctx_, desc, shape);
+  Status s = p->init();
+  if (!s.ok()) return s;
+  return std::unique_ptr<resources::IPipeline>(std::move(p));
+}
+
 Result<std::unique_ptr<resources::ICommandList>> VulkanRenderDevice::create_command_list() {
   if (!logical_ready_) return Status::InitFailed("设备未初始化");
   auto c = std::make_unique<VulkanCommandList>(ctx_);
   Status s = c->init();
   if (!s.ok()) return s;
   return std::unique_ptr<resources::ICommandList>(std::move(c));
+}
+
+// ---------------------------------------------------------------- 设备帧提交
+
+// 命令列表里只有 ResourceId,设备帧提交需要 IBuffer*。这里按设备自己登记过的
+// 句柄表把指针补进命令列表(命令列表内部维护 ResourceId → IBuffer* 的反查表)。
+void VulkanRenderDevice::bind_known_buffers(VulkanCommandList& list) const {
+  for (const auto& kv : known_buffers_) {
+    (void)list.remember_buffer_binding(kv.first, kv.second);
+  }
+}
+
+Status VulkanRenderDevice::submit_command_list(resources::ICommandList& list) {
+  if (!logical_ready_) return Status::InitFailed("submit_command_list: 设备未初始化");
+
+  // 认具体实现类型拿 recorded():公共面故意不暴露命令流细节。
+  auto* cmd = dynamic_cast<VulkanCommandList*>(&list);
+  if (cmd == nullptr) {
+    return Status::Unsupported(
+        "submit_command_list: 只支持由本设备的 create_command_list() 产生的命令列表");
+  }
+  if (cmd->in_pass()) {
+    return Status::Invalid("submit_command_list: 命令列表还有未 end_pass 的 pass");
+  }
+  if (cmd->command_count() == 0) {
+    return Status::Invalid("submit_command_list: 命令列表为空(没有可下发的绘制)");
+  }
+
+  // 补全句柄 → 指针的反查表,否则设备帧提交会报"缓冲不是本设备的 VulkanBuffer"。
+  bind_known_buffers(*cmd);
+
+  // 走已经实现完整的设备帧提交通路(11 类命令 → vkCmd* → fence 等待)。
+  // 统计只用于本地断言:录了命令却一个 draw 都没下发属于配置错误,要报出来,
+  // 而不是返回成功让上层去翻一张空图。
+  DeviceFrameStats stats{};
+  Status s = submit_device_frame(ctx_, *cmd, &stats);
+  if (!s.ok()) return s;
+  if (stats.draw_calls == 0) {
+    return Status::Invalid("submit_command_list: 提交成功但没有任何 draw 被下发");
+  }
+  return Status::Ok_();
 }
 
 // ---------------------------------------------------------------- 工厂
