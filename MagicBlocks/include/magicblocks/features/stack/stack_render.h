@@ -105,6 +105,16 @@ struct StackFrameDesc {
   bool debug_inner_pass_first = false;
   // 内面 pass 开关。关掉只为 `InnerPassChangesPixels` 的对照图。
   bool inner_pass_enabled = true;
+
+  // 实例写入顺序（设计 §10.6.1 / D-VX-5）。
+  //
+  // surface_order 默认 Index：表面 pass 开深度测试，顺序不影响结果。
+  // inner_order 默认 **YZX**：内面 pass 是 depthTest=OFF，绘制顺序**就是**
+  // 遮挡顺序，所以必须由空间坐标决定而不是由落笔历史决定。
+  // 把 inner_order 改成 Index 只为让用例"产出不同实例顺序"可被观测，
+  // 生产路径不给关掉它的旋钮。
+  CellOrder surface_order = CellOrder::Index;
+  CellOrder inner_order = CellOrder::YZX;
 };
 
 // 一帧的渲染统计 —— 供用例断言"没有偷偷多发 draw / 多提交"。
@@ -117,7 +127,11 @@ struct StackRenderStats {
   // 单实例旁路是否被触发（见下方 M9 裁定）。默认策略是 **pad**，所以恒 0。
   std::uint32_t single_instance_bypass = 0;
   bool instance_buffer_bound = true;
-  Status last_status = Status::Ok_();
+  // 内面 pass 这一帧实际用的实例顺序（D-VX-5 的观测点）。
+  CellOrder inner_order = CellOrder::YZX;
+  // 本帧内面 pass 是否真的绑了**独立**的内面实例缓冲
+  // （false = 两种顺序相同，复用了表面缓冲）。
+  bool inner_buffer_distinct = false;
 };
 
 // 实例缓冲的最小实例数。
@@ -148,7 +162,22 @@ class IStackRenderer {
   virtual const StackPassPair& passes() const = 0;
 
   // 把 set 烘成实例缓冲（每块一条 InstanceAttribs，末端按 M9 pad 到 >= 2）。
+  //
+  // **同时烘两份**（§10.6 + D-VX-5）：
+  //   surface_instances_ —— 真源下标序（CellOrder::Index）
+  //   inner_instances_   —— `(y,z,x)` 升序稳定排序（CellOrder::YZX）
+  // 两者各有一个 Buffer。表面 pass 绑第一份、内面 pass 绑第二份。
+  // 顺序相同时（例如本来就按 yzx 插入）**复用同一个 Buffer**，省一次创建。
   virtual StackStatus build_instances(const GridSpec& grid, const IBlockSet& set) = 0;
+
+  // 两种顺序各写成了什么格子序列 —— 供用例直接比对顺序本身，
+  // 而不必从像素反推。
+  virtual const std::vector<Cell>& surface_cells() const = 0;
+  virtual const std::vector<Cell>& inner_cells() const = 0;
+
+  // 两种顺序的实例数据哈希。相等 ⇔ 两份实例缓冲逐字节相同。
+  virtual std::uint64_t surface_instance_hash() const = 0;
+  virtual std::uint64_t inner_instance_hash() const = 0;
 
   // 实例数量（含 pad）。用例据此断言 pad 生效、且永不等于 1。
   virtual std::uint32_t instance_count() const = 0;

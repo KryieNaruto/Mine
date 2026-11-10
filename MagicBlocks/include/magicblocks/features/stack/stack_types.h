@@ -199,4 +199,36 @@ struct CellHash {
   }
 };
 
+// ---------------------------------------------------------------- 实例顺序（D-VX-5）
+
+// 内面 pass 实例缓冲的排序规则（设计 §10.6.1）。
+//
+// 为什么必须有这个东西：内面 pass 是 `depthTest=OFF`（§10.3），**深度测试
+// 不参与**，所以"谁盖谁"完全由**绘制顺序**决定。若直接用真源插入序，那
+// 顺序是**落笔顺序**而不是空间顺序 —— 同一个最终棋盘，换一种落笔先后就会
+// 画出不同的内面。那不是确定性，是"确定地依赖历史"。
+//
+// 所以内面 pass 必须按空间序 `(y, z, x)` 升序排：完全由格子坐标决定，
+// 与落笔历史无关。
+enum class CellOrder : std::uint8_t {
+  Index = 0,  // 真源下标序（表面 pass 用；它开深度测试，顺序无关）
+  YZX = 1,    // 先 y 升序、再 z 升序、再 x 升序（内面 pass 用）
+};
+
+inline const char* cell_order_name(CellOrder o) {
+  return o == CellOrder::YZX ? "YZX" : "Index";
+}
+
+// `(y, z, x)` 升序的严格弱序。**注意顺序**：与 `Cell::operator<` 的
+// dy→dz→dx 一致，但这里单独写出来而不是复用 `operator<`，因为
+// `operator<` 是"格子的全序"，而这里是"实例写入顺序"，两者语义不同，
+// 将来任一方要变时不该互相牵连。
+struct CellOrderLess {
+  bool operator()(const Cell& a, const Cell& b) const noexcept {
+    if (a.y != b.y) return a.y < b.y;
+    if (a.z != b.z) return a.z < b.z;
+    return a.x < b.x;
+  }
+};
+
 }  // namespace magicblocks::features::stack

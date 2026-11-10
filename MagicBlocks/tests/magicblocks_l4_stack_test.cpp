@@ -2365,3 +2365,301 @@ TEST(StackCommandMode, ReplayPixelsByteIdentical) {
   }
   SUCCEED();
 }
+
+// 用指定相机渲染一帧，返回 RGBA 像素。
+//
+// 与 render_once 的区别：相机由调用方给。D-VX-5 的用例需要**俯视**视角，
+// 让内面 pass 的绘制顺序成为画面的直接决定因素。
+std::vector<std::uint8_t> render_with_camera(dev::IRenderDevice* device, mbst::IStackRenderer& r,
+                                             const mbst::IBlockSet& set, const mbst::GridSpec& g,
+                                             int w, int h, const mbp::ICamera& cam) {
+  dev::TargetDesc td;
+  td.kind = dev::TargetDesc::Kind::Offscreen;
+  td.extent.width = static_cast<std::uint32_t>(w);
+  td.extent.height = static_cast<std::uint32_t>(h);
+  td.samples = 1;
+  td.with_depth = true;
+  auto tgt = device->create_offscreen_target(td);
+  if (!tgt.ok()) return {};
+
+  if (!r.build_instances(g, set)) return {};
+
+  auto cl = device->create_command_list();
+  if (!cl.ok()) return {};
+
+  mbst::StackFrameDesc fd{};
+  fd.set = &set;
+  fd.width = static_cast<std::uint32_t>(w);
+  fd.height = static_cast<std::uint32_t>(h);
+  fd.clear_color[0] = 0.05f;
+  fd.clear_color[1] = 0.07f;
+  fd.clear_color[2] = 0.10f;
+  fd.clear_color[3] = 1.0f;
+  fd.inner_pass_enabled = true;
+  std::memcpy(fd.view_proj, cam.view_proj_matrix().m, sizeof(float) * 16);
+
+  if (!r.record_frame(*cl.value(), tgt.value().get(), fd)) return {};
+  if (!device->submit_command_list(*cl.value()).ok()) return {};
+
+  std::vector<std::uint8_t> px(static_cast<std::size_t>(w) * h * 4, 0u);
+  if (!tgt.value()->readback_rgba8(px.data(), px.size()).ok()) return {};
+  return px;
+}
+
+// 俯视相机：正对着 y 轴往下看。这样画面里每个像素都是"从上往下穿过的
+// 最后一块"——而内面 pass 是 depthTest=OFF 的最后一个 pass，所以画面上
+// 的最终颜色**就是内面 pass 的绘制顺序的直接结果**。
+std::unique_ptr<mbp::ICamera> top_down_camera(int w, int h) {
+  auto cam = mbp::create_camera();
+  if (!cam) return nullptr;
+  mbp::CameraDesc cd;
+  cd.kind = mbp::ProjectionKind::Perspective;
+  cd.fov_y_degrees = 45.0f;
+  cd.near_plane = 0.1f;
+  cd.far_plane = 200.0f;
+  cd.viewport.width = static_cast<std::uint32_t>(w);
+  cd.viewport.height = static_cast<std::uint32_t>(h);
+  if (!cam->set_desc(cd).ok()) return nullptr;
+  mbp::CameraPose pose;
+  pose.position = {0.0f, 4.0f, 0.001f};  // 微偏一点点，避免 up 向量退化
+  pose.target = {0.0f, 0.0f, 0.0f};
+  pose.up = {0.0f, 0.0f, -1.0f};
+  if (!cam->set_pose(pose).ok()) return nullptr;
+  return cam;
+}
+
+
+// ---------------------------------------------------------------- D-VX-5 实例顺序
+//
+// 设计 §10.4 第 7 条：内面 pass 是 `depthTest=OFF`，**深度测试不参与**，
+// 所以"谁盖谁"完全由绘制顺序决定。若用真源插入序，那个顺序是**落笔顺序**
+// 而不是空间顺序 —— 同一个最终棋盘，换一种落笔先后就画出不同的内面。
+// 那不是确定性，是"确定地依赖历史"。
+//
+// 所以内面 pass 必须按 `(y, z, x)` 升序排（与落笔历史无关）。
+
+namespace {
+
+// 用**指定的落笔顺序**构造同样的最终棋盘。
+//
+// `order[i]` 表示"第 i 笔用哪个格子"。所有格子一一对应，所以无论顺序怎么变，
+// 最终真源里**格子集合与颜色完全相同**，唯一区别是数组下标的排布。
+std::unique_ptr<mbst::IBlockSet> build_board_in_order(const mbst::GridSpec& g,
+                                                      const std::vector<mbst::Cell>& cells,
+                                                      const std::vector<std::uint32_t>& colors) {
+  auto r = mbst::create_block_set(g);
+  if (!r.ok()) return nullptr;
+  auto set = std::move(r).take();
+  for (std::size_t i = 0; i < cells.size(); ++i) {
+    mbst::Block b{};
+    b.cell = cells[i];
+    b.color = colors[i];
+    b.stroke_id = static_cast<std::uint32_t>(i + 1);
+    b.flags = 0;
+    if (!set->add(b).ok()) return nullptr;
+  }
+  return set;
+}
+
+// 一块 3x2x2 的实心小堆：够让"内面互相遮挡"真实发生。
+std::vector<mbst::Cell> solid_block_cells() {
+  std::vector<mbst::Cell> c;
+  for (int y = 0; y < 2; ++y)
+    for (int z = -1; z <= 0; ++z)
+      for (int x = -1; x <= 1; ++x) c.push_back(mbst::Cell{x, y, z});
+  return c;
+}
+
+}  // namespace
+
+TEST(StackCellOrder, YzxSortsByYThenZThenX) {
+  // 排序规则本身：先 y、再 z、再 x。用手算期望序列钉住。
+  std::vector<mbst::Cell> cells = {
+      {1, 1, 0},   // y=1 → 最后
+      {2, 0, 0},   // y=0,z=0,x=2
+      {0, 0, 0},   // y=0,z=0,x=0 → 最前
+      {1, 0, 0},   // y=0,z=0,x=1
+      {-1, 0, 1},  // y=0,z=1,x=-1
+  };
+  std::stable_sort(cells.begin(), cells.end(), mbst::CellOrderLess{});
+
+  // 期望：(0,0,0) < (1,0,0) < (2,0,0) < (-1,0,1) < (1,1,0)
+  EXPECT_EQ(cells[0].x, 0); EXPECT_EQ(cells[0].y, 0); EXPECT_EQ(cells[0].z, 0);
+  EXPECT_EQ(cells[1].x, 1); EXPECT_EQ(cells[1].y, 0); EXPECT_EQ(cells[1].z, 0);
+  EXPECT_EQ(cells[2].x, 2); EXPECT_EQ(cells[2].y, 0); EXPECT_EQ(cells[2].z, 0);
+  EXPECT_EQ(cells[3].x, -1); EXPECT_EQ(cells[3].y, 0); EXPECT_EQ(cells[3].z, 1);
+  EXPECT_EQ(cells[4].x, 1); EXPECT_EQ(cells[4].y, 1); EXPECT_EQ(cells[4].z, 0);
+}
+
+TEST(StackCellOrder, SurfaceAndInnerOrdersDiffer) {
+  // 两种 CellOrder 必须产出**不同**的实例顺序。
+  // 若它们相同，说明 YZX 根本没生效，后面那条"不同落笔顺序像素相同"
+  // 会因为"两边都用插入序"而假通过。
+  auto dev_r = dev::create_render_device(software_desc());
+  ASSERT_TRUE(dev_r.ok()) << dev_r.message();
+  ASSERT_TRUE(reserve_pages(dev_r.value().get()));
+
+  std::unique_ptr<mbst::IStackRenderer> r = mbst::create_stack_renderer();
+  ASSERT_NE(r, nullptr);
+  ASSERT_TRUE(r->create_passes(dev_r.value().get(), 1).ok());
+
+  const mbst::GridSpec g = render_grid();
+  // 故意用**非 yzx**的插入顺序：先 z 由大到小、再 x 由大到小。
+  std::vector<mbst::Cell> cells;
+  for (int z = 1; z >= -1; --z)
+    for (int x = 1; x >= -1; --x) cells.push_back(mbst::Cell{x, 1, z});
+  std::vector<std::uint32_t> colors(cells.size(), 0x808080FFu);
+
+  auto set = build_board_in_order(g, cells, colors);
+  ASSERT_NE(set, nullptr);
+  ASSERT_TRUE(r->build_instances(g, *set).ok());
+
+  // 表面序 = 真源插入序，必须与输入逐格相等。
+  ASSERT_EQ(r->surface_cells().size(), cells.size());
+  for (std::size_t i = 0; i < cells.size(); ++i) {
+    EXPECT_EQ(r->surface_cells()[i].x, cells[i].x) << "表面序第 " << i << " 格 x 不符";
+    EXPECT_EQ(r->surface_cells()[i].z, cells[i].z) << "表面序第 " << i << " 格 z 不符";
+  }
+
+  // 内面序 = yzx 升序：必须先按 z 升序、再按 x 升序。
+  EXPECT_EQ(r->inner_cells().size(), cells.size());
+  for (std::size_t i = 0; i + 1 < r->inner_cells().size(); ++i) {
+    const mbst::Cell& a = r->inner_cells()[i];
+    const mbst::Cell& b = r->inner_cells()[i + 1];
+    EXPECT_FALSE(mbst::CellOrderLess{}(b, a))
+        << "内面序在 (" << a.x << "," << a.y << "," << a.z << ") 之后出现了更大的 ("
+        << b.x << "," << b.y << "," << b.z << ")";
+  }
+  // 两者确实不同（输入不是 yzx 序，所以必然不同）。
+  bool differs = false;
+  for (std::size_t i = 0; i < cells.size(); ++i) {
+    if (r->surface_cells()[i].x != r->inner_cells()[i].x ||
+        r->surface_cells()[i].z != r->inner_cells()[i].z) {
+      differs = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(differs) << "表面序与内面序完全相同 —— YZX 排序没有生效";
+  // 实例数据也必须真的不同（不只是格子序列变量不同）。
+  EXPECT_NE(r->surface_instance_hash(), r->inner_instance_hash());
+}
+
+TEST(StackCellOrder, SameBoardDifferentStrokeOrderGivesSameInnerPixels) {
+  // **这是把"不确定性压成契约"的可验证判据。**
+  //
+  // 两块真源的内容完全相同（同格子、同颜色），只有**落笔顺序**不同。
+  // 用同一个渲染器出两张内面 pass 的图，必须**逐像素相同**。
+  //
+  // 若内面 pass 用插入序，这两张图会不同 —— 那就说明内面结果依赖历史。
+  auto dev_r = dev::create_render_device(software_desc());
+  ASSERT_TRUE(dev_r.ok()) << dev_r.message();
+  ASSERT_TRUE(reserve_pages(dev_r.value().get()));
+
+  std::unique_ptr<mbst::IStackRenderer> r = mbst::create_stack_renderer();
+  ASSERT_NE(r, nullptr);
+  ASSERT_TRUE(r->create_passes(dev_r.value().get(), 1).ok());
+
+  const mbst::GridSpec g = render_grid();
+  const std::vector<mbst::Cell> base = solid_block_cells();
+
+  // 每格一个固定颜色（按格子内容定，不按落笔位置定），
+  // 这样"同格子同色"在两种顺序下都成立。
+  std::vector<std::uint32_t> colors;
+  for (const mbst::Cell& c : base) {
+    const std::uint32_t mix = static_cast<std::uint32_t>((c.x + 2) * 40 + (c.y + 1) * 90 + (c.z + 2) * 20);
+    colors.push_back(0xFF000000u | (mix << 16) | ((mix ^ 0x55u) << 8) | 0xFFu);
+  }
+
+  // 顺序 A：原序。顺序 B：完全反转。
+  std::vector<mbst::Cell> cells_a = base;
+  std::vector<std::uint32_t> col_a = colors;
+  std::vector<mbst::Cell> cells_b;
+  std::vector<std::uint32_t> col_b;
+  for (std::size_t i = base.size(); i-- > 0;) {
+    cells_b.push_back(base[i]);
+    col_b.push_back(colors[i]);
+  }
+
+  auto set_a = build_board_in_order(g, cells_a, col_a);
+  auto set_b = build_board_in_order(g, cells_b, col_b);
+  ASSERT_NE(set_a, nullptr);
+  ASSERT_NE(set_b, nullptr);
+  // 前提：两块真源的 hash 不同（因为数组顺序不同），但**格子集合**相同。
+  EXPECT_NE(set_a->hash(), set_b->hash())
+      << "两块真源 hash 相同，说明测试前提(落笔顺序不同)没构造出来";
+
+  const int W = 200, H = 150;
+  auto cam = top_down_camera(W, H);
+  ASSERT_NE(cam, nullptr) << "俯视相机创建失败";
+  const std::vector<std::uint8_t> px_a =
+      render_with_camera(dev_r.value().get(), *r, *set_a, g, W, H, *cam);
+  const std::vector<std::uint8_t> px_b =
+      render_with_camera(dev_r.value().get(), *r, *set_b, g, W, H, *cam);
+  ASSERT_EQ(px_a.size(), static_cast<std::size_t>(W) * H * 4);
+  ASSERT_EQ(px_b.size(), static_cast<std::size_t>(W) * H * 4);
+
+  // 先确认真画了东西（否则两张全背景图相等 = 空过）。
+  const std::uint8_t bg[3] = {13, 18, 26};
+  std::size_t fg = 0;
+  for (std::size_t i = 0; i + 3 < px_a.size(); i += 4) {
+    if (px_a[i] != bg[0] || px_a[i + 1] != bg[1] || px_a[i + 2] != bg[2]) ++fg;
+  }
+  ASSERT_GT(fg, 500u) << "内面图几乎没有前景像素，像素比较会退化成空过";
+
+  std::size_t diff = px_a.size();
+  for (std::size_t i = 0; i < px_a.size(); ++i) {
+    if (px_a[i] != px_b[i]) { diff = i; break; }
+  }
+  if (diff != px_a.size()) {
+    const std::size_t p = diff / 4;
+    FAIL() << "同棋盘不同落笔顺序，内面像素不同 —— D-VX-5 未生效。首处差异 (" << (p % W)
+           << "," << (p / W) << ") 通道 " << (diff % 4) << "  A=" << static_cast<int>(px_a[diff])
+           << " B=" << static_cast<int>(px_b[diff]);
+  }
+  SUCCEED();
+}
+
+TEST(StackCellOrder, InnerBufferIsDistinctWhenOrdersDiffer) {
+  // 顺序不同时必须真的绑**两份**实例缓冲（不是同一份拷两份数据）。
+  // 同时验证顺序相同时会复用一份 —— 两条分支都要覆盖。
+  auto dev_r = dev::create_render_device(software_desc());
+  ASSERT_TRUE(dev_r.ok()) << dev_r.message();
+  ASSERT_TRUE(reserve_pages(dev_r.value().get()));
+
+  std::unique_ptr<mbst::IStackRenderer> r = mbst::create_stack_renderer();
+  ASSERT_NE(r, nullptr);
+  ASSERT_TRUE(r->create_passes(dev_r.value().get(), 1).ok());
+  const mbst::GridSpec g = render_grid();
+
+  // (a) 插入序不是 yzx ⇒ 两个 hash 不同。
+  {
+    std::vector<mbst::Cell> cells;
+    for (int z = 1; z >= -1; --z)
+      for (int x = 1; x >= -1; --x) cells.push_back(mbst::Cell{x, 0, z});
+    std::vector<std::uint32_t> colors(cells.size(), 0x40C040FFu);
+    auto set = build_board_in_order(g, cells, colors);
+    ASSERT_NE(set, nullptr);
+    ASSERT_TRUE(r->build_instances(g, *set).ok());
+    EXPECT_NE(r->surface_instance_hash(), r->inner_instance_hash())
+        << "顺序不同却得到相同实例数据";
+  }
+
+  // (b) 插入序**就是** yzx ⇒ 两份数据逐字节相同。
+  {
+    std::vector<mbst::Cell> cells = solid_block_cells();
+    std::stable_sort(cells.begin(), cells.end(), mbst::CellOrderLess{});
+    std::vector<std::uint32_t> colors(cells.size(), 0x4040C0FFu);
+    auto set = build_board_in_order(g, cells, colors);
+    ASSERT_NE(set, nullptr);
+    ASSERT_TRUE(r->build_instances(g, *set).ok());
+    EXPECT_EQ(r->surface_instance_hash(), r->inner_instance_hash())
+        << "插入序已是 yzx，两份实例数据应当完全相同";
+    // 格子序列也应逐格相等。
+    ASSERT_EQ(r->surface_cells().size(), r->inner_cells().size());
+    for (std::size_t i = 0; i < r->surface_cells().size(); ++i) {
+      EXPECT_EQ(r->surface_cells()[i].x, r->inner_cells()[i].x);
+      EXPECT_EQ(r->surface_cells()[i].y, r->inner_cells()[i].y);
+      EXPECT_EQ(r->surface_cells()[i].z, r->inner_cells()[i].z);
+    }
+  }
+}
