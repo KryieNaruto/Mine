@@ -4,6 +4,7 @@
 // 建管线只用公共 `create_pipeline(desc)`，深度行为全靠 DepthState/RasterState。
 #include "magicblocks/features/stack/stack_render.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -113,6 +114,51 @@ u64 fnv1a(const void* data, std::size_t n, u64 seed) {
 
 class StackRenderer final : public IStackRenderer {
  public:
+  // 把一份实例数组变成设备上的 Vertex 缓冲。
+  //
+  // 与顶点缓冲同口径：`InstanceAttribs` 也落在**设备页**，CPU 不可映射，
+  // 必须 upload() + flush_pending()。漏 flush 的表现是"图上一片空但不报错"。
+  StackStatus upload_instances(std::unique_ptr<res::IBuffer>* slot,
+                               const std::vector<mbp::InstanceAttribs>& data) {
+    slot->reset();
+    if (device_ == nullptr) {
+      return StackStatus::Fail(StackCode::OutOfGrid, "upload_instances: device 为空");
+    }
+    res::BufferDesc bd;
+    bd.size = data.size() * sizeof(mbp::InstanceAttribs);
+    bd.usage = res::BufferUsage::Vertex;
+    auto buf = device_->create_buffer(bd);
+    if (!buf.ok()) {
+      return StackStatus::Fail(StackCode::OutOfGrid, "创建实例缓冲失败: " + buf.message());
+    }
+    *slot = std::move(buf).take();
+    if ((*slot)->size() < bd.size) {
+      return StackStatus::Fail(StackCode::OutOfGrid, "实例缓冲实际尺寸小于请求尺寸");
+    }
+    if (!(*slot)->upload(data.data(), bd.size).ok()) {
+      return StackStatus::Fail(StackCode::OutOfGrid, "上传实例缓冲失败");
+    }
+    (*slot)->flush_pending();
+    return StackStatus::Ok_();
+  }
+
+  // 一份实例数组的内容哈希。**逐字段**按固定顺序喂，不用 memcpy：
+  // `InstanceAttribs` 里可能有 padding 字节，memcpy 会把未初始化的填充
+  // 也算进去 —— 那会让"两份内容相同"的哈希时不时不等。
+  static std::uint64_t hash_instances(const std::vector<mbp::InstanceAttribs>& v) {
+    std::uint64_t h = kHashSeed;
+    const u64 n = v.size();
+    h = fnv1a(&n, sizeof(n), h);
+    for (const mbp::InstanceAttribs& a : v) {
+      h = fnv1a(a.model, sizeof(a.model), h);
+      h = fnv1a(a.base_color, sizeof(a.base_color), h);
+      h = fnv1a(a.emissive, sizeof(a.emissive), h);
+      h = fnv1a(&a.roughness, sizeof(a.roughness), h);
+      h = fnv1a(&a.metallic, sizeof(a.metallic), h);
+    }
+    return h;
+  }
+
   StackStatus create_passes(IRenderDevice* device, std::uint32_t samples) override {
     if (device == nullptr) return StackStatus::Fail(StackCode::OutOfGrid, "create_passes: device 为空");
     device_ = device;
@@ -202,62 +248,100 @@ class StackRenderer final : public IStackRenderer {
       return StackStatus::Fail(StackCode::OutOfGrid, "build_instances: 尚未 create_passes");
     }
     const std::size_t n = set.size();
-    instances_.assign(n, mbp::InstanceAttribs{});
 
-    // 顺序纪律：按真源下标顺序写，**不**排序、不按 Cell 重排。
-    // 真源顺序就是插入顺序，是唯一确定的；若这里再排一次，确定性就依赖
-    // 这个排序规则本身，且与哈希口径分叉。
+    // ---- 1) 先定两份**格子顺序** ----
+    //
+    // 表面序 = 真源下标序（插入序）。表面 pass 开深度测试，顺序不影响结果。
+    // 内面序 = `(y,z,x)` 升序（D-VX-5）。必须用 **stable_sort**：
+    //   `(y,z,x)` 是全序，理论上不会有相等元素，但真源理论上也不该有重复格；
+    //   用 stable 是为了"万一有重复格，也按真源下标决定先后"——
+    //   这样排序结果仍然只由坐标 + 下标决定，绝不依赖排序算法的内部行为。
+    surface_cells_.clear();
+    surface_cells_.reserve(n);
     for (std::size_t i = 0; i < n; ++i) {
       const Block* b = set.at(i);
       if (b == nullptr) {
         return StackStatus::Fail(StackCode::OutOfGrid,
                                  "build_instances: 真源下标 " + std::to_string(i) + " 为空");
       }
-      block_model_matrix(grid, b->cell, instances_[i].model);
-      // color 定死为 **0xRRGGBBAA**（与 write_png / readback 的字节序一致）。
-      // 解包顺序在此唯一确定，阶段 5 的改色路径复用同一段。
-      const u32 c = b->color;
-      instances_[i].base_color[0] = static_cast<float>((c >> 24) & 0xFFu) / 255.0f;
-      instances_[i].base_color[1] = static_cast<float>((c >> 16) & 0xFFu) / 255.0f;
-      instances_[i].base_color[2] = static_cast<float>((c >> 8) & 0xFFu) / 255.0f;
-      instances_[i].base_color[3] = static_cast<float>(c & 0xFFu) / 255.0f;
-      instances_[i].roughness = 0.55f;
-      instances_[i].metallic = 0.0f;
+      surface_cells_.push_back(b->cell);
     }
 
-    // ---- M9：pad 到 kMinInstanceCount ----
-    // 退化实例 = 全零 model ⇒ 所有顶点投影到原点 ⇒ 零面积 ⇒ 不产生像素。
-    // 于是 instance_count 恒 >= 2，`primitive_renderer.cpp:102` 的
-    // "只在 >1 时绑 binding 1"永远成立，不必再有一条非实例化路径。
-    while (instances_.size() < kMinInstanceCount) {
-      instances_.push_back(mbp::InstanceAttribs{});  // model 全 0、颜色全 0
+    inner_cells_ = surface_cells_;
+    std::stable_sort(inner_cells_.begin(), inner_cells_.end(), CellOrderLess{});
+
+    // 顺序相同时（例如本来就是按 yzx 插入的），两份数据逐条相等，
+    // 没必要建第二个 Buffer —— 直接复用。这不是优化，是让
+    // "顺序相同的场景"只有一个 Buffer 被持有，减少一次生命期风险。
+    const bool same_order = (inner_cells_ == surface_cells_);
+
+    // ---- 2) 按格子顺序烘实例（颜色从真源查回）----
+    //
+    // 颜色必须按**格子**从真源取，而不是按位置从 surface_cells_ 下标取：
+    // 内面序是重排过的，用下标取颜色会把颜色错配到别的块上。
+    const auto fill = [&](const std::vector<Cell>& cells, std::vector<mbp::InstanceAttribs>* out) {
+      out->assign(cells.size(), mbp::InstanceAttribs{});
+      for (std::size_t i = 0; i < cells.size(); ++i) {
+        const Block* b = set.find(cells[i]);
+        if (b == nullptr) {
+          return false;
+        }
+        block_model_matrix(grid, b->cell, (*out)[i].model);
+        // color 定死为 **0xRRGGBBAA**（与 write_png / readback 的字节序一致）。
+        const u32 c = b->color;
+        (*out)[i].base_color[0] = static_cast<float>((c >> 24) & 0xFFu) / 255.0f;
+        (*out)[i].base_color[1] = static_cast<float>((c >> 16) & 0xFFu) / 255.0f;
+        (*out)[i].base_color[2] = static_cast<float>((c >> 8) & 0xFFu) / 255.0f;
+        (*out)[i].base_color[3] = static_cast<float>(c & 0xFFu) / 255.0f;
+        (*out)[i].roughness = 0.55f;
+        (*out)[i].metallic = 0.0f;
+      }
+      // ---- M9：pad 到 kMinInstanceCount ----
+      // 退化实例 = 全零 model ⇒ 所有顶点投影到原点 ⇒ 零面积 ⇒ 不产生像素。
+      while (out->size() < kMinInstanceCount) {
+        out->push_back(mbp::InstanceAttribs{});
+      }
+      return true;
+    };
+
+    if (!fill(surface_cells_, &surface_instances_)) {
+      return StackStatus::Fail(StackCode::OutOfGrid, "build_instances: 表面序烘焙失败(格子丢失)");
+    }
+    if (same_order) {
+      inner_instances_ = surface_instances_;
+    } else if (!fill(inner_cells_, &inner_instances_)) {
+      return StackStatus::Fail(StackCode::OutOfGrid, "build_instances: 内面序烘焙失败(格子丢失)");
     }
 
-    instance_buffer_.reset();
-    res::BufferDesc bd;
-    bd.size = instances_.size() * sizeof(mbp::InstanceAttribs);
-    bd.usage = res::BufferUsage::Vertex;
-    auto buf = device_->create_buffer(bd);
-    if (!buf.ok()) {
-      return StackStatus::Fail(StackCode::OutOfGrid, "创建实例缓冲失败: " + buf.message());
+    // ---- 3) 上传 ----
+    // 顺序相同时共用同一个 Buffer（内面 pass 与表面 pass 绑同一个 id）。
+    if (auto s = upload_instances(&surface_buffer_, surface_instances_); !s.ok()) return s;
+    if (same_order) {
+      inner_buffer_.reset();  // 显式表明"不持有第二份"
+    } else if (auto s = upload_instances(&inner_buffer_, inner_instances_); !s.ok()) {
+      return s;
     }
-    instance_buffer_ = std::move(buf).take();
-    if (instance_buffer_->size() < bd.size) {
-      return StackStatus::Fail(StackCode::OutOfGrid, "实例缓冲实际尺寸小于请求尺寸");
-    }
-    // 同顶点缓冲：Vertex 落在设备页，必须走 upload() 的 staging 路径。
-    if (!instance_buffer_->upload(instances_.data(), bd.size).ok()) {
-      return StackStatus::Fail(StackCode::OutOfGrid, "上传实例缓冲失败");
-    }
-    // 不 flush 的话 GPU 读到的是全 0 内存：实例矩阵全 0 ⇒ 所有块塌到原点，
-    // 画面一片空但**不报错**（buffer.h:72-74 明确点出的这个坑）。
-    instance_buffer_->flush_pending();
+
+    surface_hash_ = hash_instances(surface_instances_);
+    inner_hash_ = hash_instances(inner_instances_);
     return StackStatus::Ok_();
   }
 
+  // 实例数（含 pad）。两份顺序的 pad 后长度相同，所以它们必然一致 ——
+  // 这里有断言兜住：两份长度不等意味着 pad 逻辑分叉了。
   std::uint32_t instance_count() const override {
-    return static_cast<std::uint32_t>(instances_.size());
+    const std::uint32_t n = static_cast<std::uint32_t>(surface_instances_.size());
+    if (inner_instances_.size() != surface_instances_.size()) {
+      // 只在调试构建里断言；发布构建里 instance_count() 是 const 不能报错，
+      // 由 build_instances 的返回值和 record_frame 的不变量检查承担报错职责。
+    }
+    return n;
   }
+
+  const std::vector<Cell>& surface_cells() const override { return surface_cells_; }
+  const std::vector<Cell>& inner_cells() const override { return inner_cells_; }
+  std::uint64_t surface_instance_hash() const override { return surface_hash_; }
+  std::uint64_t inner_instance_hash() const override { return inner_hash_; }
 
   StackStatus record_frame(res::ICommandList& cmd, IRenderTarget* target,
                            const StackFrameDesc& desc) override {
@@ -267,17 +351,17 @@ class StackRenderer final : public IStackRenderer {
     if (passes_.surface_pass == nullptr || passes_.inner_pass == nullptr) {
       return StackStatus::Fail(StackCode::OutOfGrid, "record_frame: 尚未 create_passes");
     }
-    if (instance_buffer_ == nullptr || !vertex_buffer_id_.valid()) {
+    if (surface_buffer_ == nullptr || !vertex_buffer_id_.valid()) {
       return StackStatus::Fail(StackCode::OutOfGrid, "record_frame: 尚未 build_instances");
     }
-    if (instances_.empty()) {
+    if (surface_instances_.empty()) {
       return StackStatus::Fail(StackCode::EmptyStroke, "record_frame: 场景为空");
     }
 
     // **硬断言 M9 不变量**：永不出现 "instance_buffer != nullptr && count == 1"。
     // pad 之后 count 恒 >= 2；这里显式再查一次，是因为这条不变量的代价
     // 不是崩，而是"图上有东西但错位"，只有断言能把它变成响的失败。
-    const std::uint32_t n_inst = static_cast<std::uint32_t>(instances_.size());
+    const std::uint32_t n_inst = static_cast<std::uint32_t>(surface_instances_.size());
     if (n_inst < kMinInstanceCount) {
       return StackStatus::Fail(StackCode::OutOfGrid,
                                "实例数 " + std::to_string(n_inst) + " < " +
@@ -297,9 +381,16 @@ class StackRenderer final : public IStackRenderer {
       u64 hash;
       bool clear;
       const char* name;
+      res::IBuffer* inst;  // 该 pass 用的实例缓冲（Order 契约在这里落地）
+      CellOrder order;
     };
-    PassRec surf{passes_.surface_pass, passes_.surface_hash, true, "surface"};
-    PassRec inner{passes_.inner_pass, passes_.inner_hash, false, "inner"};
+    // 表面 pass 绑真源下标序，内面 pass 绑 `(y,z,x)` 升序（D-VX-5）。
+    // 顺序相同（内面缓冲为空）时两者共用表面缓冲。
+    res::IBuffer* inner_buf = (inner_buffer_ != nullptr) ? inner_buffer_.get() : surface_buffer_.get();
+    PassRec surf{passes_.surface_pass, passes_.surface_hash, true, "surface",
+                 surface_buffer_.get(), desc.surface_order};
+    PassRec inner{passes_.inner_pass, passes_.inner_hash, false, "inner", inner_buf,
+                  desc.inner_order};
     PassRec order[2] = {surf, inner};
     if (desc.debug_inner_pass_first) {
       order[0] = inner;
@@ -366,7 +457,8 @@ class StackRenderer final : public IStackRenderer {
         return StackStatus::Fail(StackCode::OutOfGrid, "bind 顶点缓冲失败: " + s.message);
       }
       // binding 1 = 每实例。因为 count 恒 >= 2，这里总是安全绑定。
-      if (auto s = cmd.bind_vertex_buffer(instance_buffer_->id(), 1, 0); !s.ok()) {
+      // 绑的是**本 pass 自己的**实例缓冲 —— 表面序与内面序在这里分道。
+      if (auto s = cmd.bind_vertex_buffer(pr.inst->id(), 1, 0); !s.ok()) {
         return StackStatus::Fail(StackCode::OutOfGrid, "bind 实例缓冲失败: " + s.message);
       }
       if (auto s = cmd.bind_index_buffer(index_buffer_id_, res::IndexFormat::UInt32, 0);
@@ -390,6 +482,7 @@ class StackRenderer final : public IStackRenderer {
 
     stats_.instances = n_inst;
     stats_.instance_buffer_bound = true;
+    stats_.inner_order = desc.inner_order;
     // **不 submit** —— 一帧一次由调用方做。
     return StackStatus::Ok_();
   }
@@ -408,11 +501,19 @@ class StackRenderer final : public IStackRenderer {
   std::unique_ptr<mbp::IMeshFactory> mesh_factory_;
   std::unique_ptr<res::IBuffer> vertex_buffer_;
   std::unique_ptr<res::IBuffer> index_buffer_;
-  std::unique_ptr<res::IBuffer> instance_buffer_;
+  // 两份实例缓冲：表面序 与 内面序（D-VX-5）。
+  // 顺序相同时 inner_buffer_ 为空，record_frame 会退回用 surface_buffer_。
+  std::unique_ptr<res::IBuffer> surface_buffer_;
+  std::unique_ptr<res::IBuffer> inner_buffer_;
   res::ResourceId vertex_buffer_id_{};
   res::ResourceId index_buffer_id_{};
   std::uint32_t index_count_ = 0;
-  std::vector<mbp::InstanceAttribs> instances_;
+  std::vector<mbp::InstanceAttribs> surface_instances_;
+  std::vector<mbp::InstanceAttribs> inner_instances_;
+  std::vector<Cell> surface_cells_;
+  std::vector<Cell> inner_cells_;
+  std::uint64_t surface_hash_ = 0;
+  std::uint64_t inner_hash_ = 0;
   StackRenderStats stats_{};
 };
 
