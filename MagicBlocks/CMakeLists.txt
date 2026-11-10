@@ -243,6 +243,14 @@ add_library(magicblocks STATIC
   # ---- L4 玩法层：魔法涂鸦(F-SK) ----
   src/features/sketch/sketch_document.cpp
   src/features/sketch/sketch_pipeline.cpp
+  # ---- L4 玩法层：魔法叠叠乐(F-VX) ----
+  src/features/stack/block_set.cpp
+  src/features/stack/block_brush.cpp
+  src/features/stack/stack_render.cpp
+  src/features/stack/grid_overlay.cpp
+  src/features/stack/color_mode.cpp
+  src/features/stack/shape_template.cpp
+  src/features/stack/stack_command.cpp
   ${MB_SHADER_HEADER})
 target_include_directories(magicblocks PUBLIC include PRIVATE src ${CMAKE_CURRENT_BINARY_DIR} ${MB_VMA_INCLUDE})
 # Android：池里的 tess2 是 Windows 二进制，不能链进 arm64。直接从源码编。
@@ -439,6 +447,8 @@ add_executable(magicblocks_test
   tests/magicblocks_l3_outline_test.cpp
   tests/magicblocks_l3_stroke_test.cpp
   tests/magicblocks_l4_sketch_test.cpp
+  tests/magicblocks_l4_stack_test.cpp
+  tests/magicblocks_l4_stack_command_test.cpp
   tests/magicblocks_msaa_test.cpp)
 target_link_libraries(magicblocks_test PRIVATE magicblocks GTest::gtest GTest::gtest_main)
 target_include_directories(magicblocks_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_BINARY_DIR})
@@ -452,7 +462,12 @@ target_compile_definitions(magicblocks_test PRIVATE
   MB_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data"
   MB_CLI_PATH="$<TARGET_FILE:magicblocks-l0-cli>"
   MB_UI_CLI_PATH="$<TARGET_FILE:magicblocks-ui-cli>"
-  MB_L3_CLI_PATH="$<TARGET_FILE:magicblocks-l3-cli>")
+  MB_L3_CLI_PATH="$<TARGET_FILE:magicblocks-l3-cli>"
+  # 阶段 7 的 StackGates.* 用例要在 gtest 里直接跑门禁脚本，
+  # 所以把解释器与仓根一并传进去（不靠 PATH 里的 python 名字）。
+  MB_PYTHON_EXE="${Python3_EXECUTABLE}"
+  MB_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
+  MB_MINE_ROOT="${MINE_ROOT}")
 gtest_discover_tests(magicblocks_test
   PROPERTIES RESOURCE_LOCK vulkan)
 endif()
