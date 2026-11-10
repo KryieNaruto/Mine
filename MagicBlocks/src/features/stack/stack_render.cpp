@@ -5,6 +5,7 @@
 #include "magicblocks/features/stack/stack_render.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -331,10 +332,12 @@ class StackRenderer final : public IStackRenderer {
   // 这里有断言兜住：两份长度不等意味着 pad 逻辑分叉了。
   std::uint32_t instance_count() const override {
     const std::uint32_t n = static_cast<std::uint32_t>(surface_instances_.size());
-    if (inner_instances_.size() != surface_instances_.size()) {
-      // 只在调试构建里断言；发布构建里 instance_count() 是 const 不能报错，
-      // 由 build_instances 的返回值和 record_frame 的不变量检查承担报错职责。
-    }
+    // 两份 pad 后长度必须一致（pad 是同一个循环、同一个下限）。不等说明 pad 逻辑
+    // 分叉了 —— 这是编程错误而非输入错误，所以用 assert 而非返回错误：
+    // instance_count() 是 const，报不了错；真正的运行期兜底在 build_instances
+    // 的返回值与 record_frame 的 M9 不变量检查里。
+    assert(inner_instances_.size() == surface_instances_.size() &&
+           "D-VX-5: 表面序与内面序实例数不一致，pad 逻辑分叉");
     return n;
   }
 
