@@ -49,6 +49,11 @@ class VulkanSwapchain final : public device::ISwapchain, public SwapchainImagePr
   // 内部:surface 是否已失效(lifecycle SurfaceDestroyed 后为 true)
   bool surface_alive() const { return surface_ != VK_NULL_HANDLE; }
 
+  // 该 swapchain 的 preTransform（VkSurfaceTransformFlagBitsKHR 位值）。
+  // **backend 私有**：只有 Android 渲染层用它补偿屏幕旋转造成的
+  // 宽高比失真与手势方向错位。0 表示没取到（视同 IDENTITY）。
+  std::uint32_t pre_transform() const { return pre_transform_; }
+
   // 上屏三件事(见 device/swapchain.h)
   device::ISwapchain::ImageResult acquire_next_image() override;
   device::ISwapchain::ImageStatus present_current() override;
@@ -72,6 +77,7 @@ class VulkanSwapchain final : public device::ISwapchain, public SwapchainImagePr
   // acquire 用 fence:保证覆盖写之前 GPU 已经用完这张图。
   VkFence acquire_fence_ = VK_NULL_HANDLE;
   bool surface_lost_ = false;
+  std::uint32_t pre_transform_ = 0;
 };
 
 }  // namespace magicblocks::backend

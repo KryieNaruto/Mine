@@ -206,11 +206,11 @@
 block_session → block_placement → world_grid(L3)
 block_render  → block_scene → IWorld(L3) → build_draw_requests(L3) → IBatchBuilder(L3)
 block_render  → overlay2d(L3) + primitive_renderer(L3)
-block_meshes  → mesh_factory(L3) / mesh_loader(L3)
-block_document: **零 L3 依赖**（纯数据 + 纯运算），理由见 §4.1
+block_document: 只依赖 `world_grid.h`（`Cell`/`GridSpec` 归 L3，见 §3.2.1 的修正）
+block_document: 只依赖 `world_grid.h`（`Cell`/`GridSpec` 归 L3，见 §3.2.1 的修正）
 ```
 
-`block_document` 不依赖任何 L3 头文件 —— 这样它可以脱离设备、脱离相机做**纯逻辑单测**，
+`block_document` 除 `world_grid.h` 外不依赖其他 L3 头文件 —— 这样它仍可脱离设备、脱离相机做**纯逻辑单测**，
 和 F-SK 的 `SketchDocument` 一个套路。
 
 #### 3.2.1 类型归属：**每个类型只在一层定义一次**（Q-BL-9）
@@ -240,7 +240,7 @@ block_document: **零 L3 依赖**（纯数据 + 纯运算），理由见 §4.1
 > 若哪天有人在 L4 里重新声明一个 `GridSpec`，这两条断言会直接编译失败 ——
 > 比"靠 review 记住"可靠。**若断言写不出来（因为 L4 确实定义了同名类型），就是设计走偏了。**
 
-> ⚠️ 注意：`block_document` 的"零 L3 依赖"（§4.1）因此**不再是零**，它要 include `world_grid.h`
+> ⚠️ 注意：`block_document` 原先在 §3.2 声明的"零 L3 依赖"**已不成立**，它必须 include `world_grid.h` 取 `Cell`/`GridSpec`。
 > 取 `Cell` / `GridSpec`。这是有意的取舍：**类型归属正确性 > 头文件纯度**；
 > `world_grid.h` 是纯数据 + 纯函数，不含设备/相机，**纯逻辑单测仍然成立**（不创建 `IWorldGrid` 实例即可）。
 
@@ -925,9 +925,10 @@ expect doc_hash 5b189304596cbda8
 | R3 | gizmo 拖拽与积木整格吸附打架 | 中 | Q-BL-5：拖拽期间不写文档，松手才提交 |
 | R4 | `IWorldGrid` 的"按列压缩"在稀疏大场景退化 | 低 | **先定容量再定实现**：`GridSpec.half_extent` 首轮固定 16（±16 格），`set_occupied` 越界**显式返回 `Status::Invalid`**（不 clamp、不扩容）；真有更大场景需求时按新 spec 换三维哈希，**不在本轮留"必要时再换"的口子** |
 | R5 | OBJ 导入让 draw 次数与外形种数解耦失败 | 低 | 首轮只允许**一个**导入外形槽位；超过则报错（D8） |
-| R6 | golden 跨平台不一致 | 中 | Windows/SwiftShader 为**本轮唯一验收基线**（本机只有这个环境）；Linux 一致性本轮**不宣称**。不写"待验证"这种悬空结论，而是**如实标注**：`MagicBlocks/tests/data/README.md` 的 golden 段必须写明"本基线仅在 Windows+SwiftShader 上生成与校验；Linux+lavapipe 未在本环境执行" |
+| R6 | 代码层平台无关失守 | 中 | 阶段 0 加 grep 门控断言：`src/features/**`、`src/primitives/**` 零 `#ifdef`／零 `WIN32`·`_WIN32`·`__linux__`·`ANDROID`·`__APPLE__`。**可断言项，必须绿**（与 R9 分工：R6 = 代码里不许有平台分支；R9 = golden 只有一份） |
 | R7 | 玩法词泄漏进 SDK | 中 | **两套门控**：G3 扫 `src/backend/**`（`blocks` 违规）；G7 扫 `include/magicblocks/primitives/**` 与 `src/primitives/**`（`voxel`/`积木` 等违规，`block`/`blocks` 标识符按 G7 既有白名单放行，见 §3.3）；两者都要**接进 ctest**（G7 当前未注册，列 GAP-P2） |
 | R8 | 既有 368 测试回归 | 高 | G5：任何改动后必须 368+ 全绿且 0 跳过 |
+| **R9** | **golden 只有单平台基线**（SKILL `:52`/`:138` 要求"双平台同一套测试与 golden"） | **高** | **本轮显式未达成**（本机只有 Windows+SwiftShader，无 Linux 环境）。<br>**后果**：①golden PNG 与 `doc_hash` 只在 Windows+SwiftShader 上生成过一次，Linux/Android/iOS 下曲面细分与浮点差异可能让 golden 不匹配；②跨平台回归**无法在本轮拦截**。<br>**主路径处置**：`tests/data/README.md` 的 golden 段写明"仅在 Windows+SwiftShader 生成与校验"；任何改动吸附容差／相机默认值／网格尺寸后，**必须两平台各生成一次**。<br>**必补工单**：合并后立即开"F-BL golden 双平台基线"任务（Linux+lavapipe 构建 + 跑全部 golden + 差异归因），**在下一个 F-* 迭代开工前完成**。<br>（与计划 §9 R9 逐字一致） |
 
 ---
 

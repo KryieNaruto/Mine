@@ -163,6 +163,7 @@ Status VulkanSwapchain::create_swapchain_objects(Extent2D extent) {
   scci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
   scci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
   scci.preTransform = caps.currentTransform;
+    pre_transform_ = static_cast<std::uint32_t>(caps.currentTransform);
   scci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
   scci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
   scci.clipped = VK_TRUE;

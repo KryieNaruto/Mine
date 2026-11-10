@@ -14,6 +14,7 @@
 // 这是 backend/ 之外唯一 include 它们的文件（src/android/），符合 G3
 // —— 它不写任何 Vk* 类型，只用 AttachmentShape/Format 这类 device 层值类型。
 #include "backend/vulkan/vulkan_render_device.h"
+#include "backend/vulkan/vulkan_swapchain.h"
 
 #include "magicblocks_shaders.h"
 
@@ -245,6 +246,18 @@ bool SceneRenderer::attach_surface(void* window, int width, int height, std::str
   height_ = height;
   frame_count_ = 0;
 
+  // 记录屏幕旋转：把 VkSurfaceTransformFlagBitsKHR 转成角度。
+  // 这台 pad 是 ROTATE_90 —— 见头文件里对 width_/height_ 与手势方向的说明。
+  pre_transform_ = 0;
+  rotation_deg_ = 0;
+  if (auto* vsc = dynamic_cast<backend::VulkanSwapchain*>(swapchain_.get())) {
+    const std::uint32_t pt = vsc->pre_transform();
+    pre_transform_ = pt;
+    if (pt & VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR) rotation_deg_ = 90;
+    else if (pt & VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR) rotation_deg_ = 180;
+    else if (pt & VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR) rotation_deg_ = 270;
+  }
+
   // 管线必须按**交换链真实颜色格式**重建。
   // 理由：VkPipeline 绑定的 VkRenderPass 与 begin_pass 用的 render pass
   // 必须逐项兼容（格式/采样/深度）。create_resources() 里建的是离屏
@@ -318,16 +331,35 @@ bool SceneRenderer::record_into(dev::IRenderTarget* target, float yaw, float pit
   const prim::Vec3 center{pan_x, pan_y, 0.f};
   const prim::Vec3 up{0.f, 1.f, 0.f};
   const prim::Mat4 view = prim::make_look_at(eye, center, up);
-  const prim::Mat4 proj =
-      prim::make_perspective(60.f * kPi / 180.f,
-                             static_cast<float>(width_) / static_cast<float>(height_), 0.1f, 100.f);
+
+  // 投影宽高比必须用**屏幕上实际呈现**的尺寸，而不是 swapchain image 的尺寸。
+  //
+  // 这台 pad 是横屏应用但面板物理竖置（ROTATE_90）。swapchain image 是
+  // 2160x1440（未旋转），SurfaceFlinger 合成时把它旋转 90° 铺满屏幕，
+  // 屏幕上看到的是 1440x2160 —— 两个方向的像素密度差 1.5 倍。
+  //
+  // 若直接用 image 的 2160/1440 = 1.5 当 aspect，画出来的正方体会被横向拉长
+  // 1.5 倍（实测 891x396，宽高比 2.25 = 1.5 x 1.5），看起来就是个长方体。
+  // 遇到 90/270 旋转时取倒数，让投影在最终屏幕朝向下正确。
+  const bool rot90 = (rotation_deg_ == 90 || rotation_deg_ == 270);
+  const float img_aspect = static_cast<float>(width_) / static_cast<float>(height_);
+  const float aspect = rot90 ? (1.f / img_aspect) : img_aspect;
+  const prim::Mat4 proj = prim::make_perspective(60.f * kPi / 180.f, aspect, 0.1f, 100.f);
   const prim::Mat4 view_proj = proj * view;
 
   // 模型矩阵：先 pitch（绕 X）再 yaw（绕 Y）—— 即"拖动旋转"。
+  //
+  // 注意旋转屏幕下两个轴要互换：手指在屏幕上左右滑，产生的是屏幕空间的 dX，
+  // 而这个 dX 在**未旋转的 image 空间**里是纵向。若不互换，就会出现
+  // "左右拖像上下转、上下拖像左右转"（用户反馈的问题 1）。
+  // Kotlin 侧统一按"屏幕坐标系"上报（x=屏幕右，y=屏幕下），这里做轴映射。
+  const float rot_x = rot90 ? pitch : yaw;   // 绕 X 轴（屏幕左右滑 → 上下翻）
+  const float rot_y = rot90 ? yaw : pitch;   // 绕 Y 轴（屏幕上下滑 → 左右转）
+
   const prim::Mat4 rot_pitch =
-      prim::make_rotation_quat(std::sin(pitch * 0.5f), 0.f, 0.f, std::cos(pitch * 0.5f));
+      prim::make_rotation_quat(std::sin(rot_x * 0.5f), 0.f, 0.f, std::cos(rot_x * 0.5f));
   const prim::Mat4 rot_yaw =
-      prim::make_rotation_quat(0.f, std::sin(yaw * 0.5f), 0.f, std::cos(yaw * 0.5f));
+      prim::make_rotation_quat(0.f, std::sin(rot_y * 0.5f), 0.f, std::cos(rot_y * 0.5f));
   const prim::Mat4 world = rot_yaw * rot_pitch;
 
   PushConstants pc{};

@@ -96,6 +96,18 @@ class SceneRenderer {
 
   int width_ = 0;
   int height_ = 0;
+
+  // 屏幕相对 swapchain image 的旋转（度：0/90/180/270）。
+  //
+  // pad 是横屏应用但面板物理竖置，SurfaceFlinger 合成时把 image 旋转 90° 铺满屏幕。
+  // 这带来两个后果，必须一起处理：
+  //   1) 宽高比：屏幕上看到的是 image 高/宽，投影必须取倒数，否则正方体被拉成 1.5:1；
+  //   2) 手势方向：手指在屏幕上左右滑，对应的其实是 image 空间里的上下，
+  //      不补偿就会出现"左右拖像上下转"。
+  // 取值来自 swapchain 的 VkSurfaceTransformFlagBitsKHR；取不到时为 0。
+  std::uint32_t pre_transform_ = 0;
+  int rotation_deg_ = 0;
+
   std::uint64_t frame_count_ = 0;
   std::string last_error_;
   std::mutex mutex_;  // Kotlin 的 UI 线程只有一条，加锁是为了防 life-cycle 竞态

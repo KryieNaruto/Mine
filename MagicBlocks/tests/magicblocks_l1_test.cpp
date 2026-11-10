@@ -783,7 +783,12 @@ TEST(PipelineSampledTexture, RejectsOutOfRangeSlot) {
   auto sm = d->create_sampler(res::SamplerDesc{});
   ASSERT_TRUE(sm.ok()) << sm.message();
 
-  auto tgt = d->create_offscreen_target({8, 8, dev::Format::RGBA8_UNORM});
+  dev::TargetDesc tdesc;
+  tdesc.kind = dev::TargetDesc::Kind::Offscreen;
+  tdesc.extent = {8, 8};
+  tdesc.with_depth = false;
+  tdesc.format = dev::Format::RGBA8_UNORM;
+  auto tgt = d->create_offscreen_target(tdesc);
   ASSERT_TRUE(tgt.ok()) << tgt.message();
   auto cl = d->create_command_list();
   ASSERT_TRUE(cl.ok()) << cl.message();
@@ -828,13 +833,21 @@ TEST(PipelineSampledTexture, RecordsIntoCommandStream) {
   ASSERT_TRUE(tr.ok()) << tr.message();
   auto sm = d->create_sampler(res::SamplerDesc{});
   ASSERT_TRUE(sm.ok()) << sm.message();
-  auto tgt = d->create_offscreen_target({8, 8, dev::Format::RGBA8_UNORM});
+  dev::TargetDesc tdesc;
+  tdesc.kind = dev::TargetDesc::Kind::Offscreen;
+  tdesc.extent = {8, 8};
+  tdesc.with_depth = false;
+  tdesc.format = dev::Format::RGBA8_UNORM;
+  auto tgt = d->create_offscreen_target(tdesc);
   ASSERT_TRUE(tgt.ok()) << tgt.message();
   auto cl = d->create_command_list();
   ASSERT_TRUE(cl.ok()) << cl.message();
   auto* vcl = dynamic_cast<magicblocks::backend::VulkanCommandList*>(cl.value().get());
   ASSERT_NE(vcl, nullptr);
   ASSERT_TRUE(vcl->init().ok());
+  ASSERT_TRUE(vcl->remember_texture_sampler(tr.value()->id(), tr.value().get(),
+                                            sm.value()->id(), sm.value().get())
+                  .ok());
 
   res::RenderPassDesc rp;
   rp.target = tgt.value().get();
@@ -859,7 +872,12 @@ TEST(PipelineSampledTexture, RecordsIntoCommandStream) {
     magicblocks::resources::u64 expect = 0;
     ASSERT_TRUE(c.resource.pack(&expect)) << "纹理句柄必须可打包";
     EXPECT_EQ(c.packed_resource, expect) << "命令流存的是偏移不是指针";
-    EXPECT_NE(c.packed_sampler, 0u) << "采样器句柄也必须打包";
+    // 采样器用专用页号(kSamplerPage),超出 pack() 的 16 位页宽,
+    // 所以采样器的稳定身份直接记在 packed_sampler = id(= slot_index)。
+    EXPECT_NE(c.packed_sampler, 0u) << "采样器槽位号必须记进命令流";
+    EXPECT_EQ(c.packed_sampler, c.sampler.id) << "采样器身份 = slot_index";
+    EXPECT_EQ(c.sampler.page_id, res::ResourceId::kSamplerPage)
+        << "采样器句柄用专用页号,不占真实内存页";
     EXPECT_EQ(c.resource.page_id, tr.value()->id().page_id);
     if (c.a == 0) saw_slot0 = true;
     if (c.a == 1) saw_slot1 = true;

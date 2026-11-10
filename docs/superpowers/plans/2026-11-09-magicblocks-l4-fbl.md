@@ -28,7 +28,8 @@ L3 spec（`2026-11-04-magicblocks-l3-primitives-design.md`）
 |---|---|---|
 | **CLI 模式**（无头、可脚本化） | `magicblocks-l3-cli blocks`（既有增强）+ `blocks-sim --script/--record/--replay --verify` | §6 |
 | **离屏渲染输出图像** | 全部走 `OffscreenTarget` + `readback_rgba8` → PNG；无窗口/无显示服务 | §6、§9 |
-| **平台无关一套代码** | **代码层可机械校验**：`src/features/**` 与 `src/primitives/**` 零 `#ifdef`/零平台宏/零 `WIN32`·`__linux__` 分支（阶段 0 加一条 grep 门控断言）。**本轮验收基线 = Windows + SwiftShader**（本机唯一可执行环境）；`tests/data/README.md` 如实标注 Linux+lavapipe 未在本机执行 | §9 R6、阶段 0 |
+| **平台无关一套代码** | ✅ **可机械校验**：`src/features/**` 与 `src/primitives/**` 零 `#ifdef` / 零平台宏 / 零 `WIN32`·`__linux__` 分支（阶段 0 加 grep 门控断言，必须绿） | §9 R6 |
+| **双平台同一套测试与 golden**（SKILL `:52`/`:138`） | ⚠️ **本轮未达成** → 显式遗留风险 **R9**（本机只有 Windows+SwiftShader；Linux+lavapipe 未构建、未跑 golden）。**不写成"不宣称"这种第三种状态**：写成未达成 + 后果 + 必补工单 | §9 R9、设计 §12 R9 |
 | **不回退原则（D8）** | 见 §5：所有失败显式报错；无"跳过 / 降级 / 换库 / 改默认" | §5 |
 | **零玩法分支进 SDK** | `world_grid.h` 不含玩法词；G3 门控 + 负向自测 | §4.0 |
 
@@ -57,7 +58,7 @@ L3 spec（`2026-11-04-magicblocks-l3-primitives-design.md`）
 | F17 | 玩法词门控现状 | ⚠️ G3 的 `GAMEPLAY_NAMES` 含 `blocks`，**只在 `src/backend/**` 判**；`src/features/` 合法 | `tools/check_layer_purity.py:29,129-134` |
 | F18 | `check_deps_tests.py` 断言用例文件数 | ✅ **不受影响**：它数的是 `tools/tests/test_*.py`（默认 12），**不是** gtest 文件 | `tools/check_deps_tests.py:22,32-38` |
 | F19 | 残留堆损坏（全量跑偶发） | ⚠️ 已定位到 private 基类并修复，连跑 6 次稳定；**根因未逐行坐实** → 列 R1 | BL 设计 §14 |
-| F20 | 工作区未提交文件 | ⚠️ **119 项未提交**（清理 24 个 `*.obj` 前的 133 项已不含垃圾）；HEAD 只有 L0 + 部分 L2，`src/primitives/`、`include/magicblocks/primitives/`、`include/magicblocks/features/` **整目录未跟踪** | `git ls-tree -r HEAD`；`git status --porcelain` |
+| F20 | 工作区未提交文件 | ⚠️ **125 项未提交**（实测 `(git status --porcelain).Count`）；HEAD 只有 L0 + 部分 L2，`src/primitives/`、`include/magicblocks/primitives/`、`include/magicblocks/features/`、`src/features/` **整目录未跟踪**（`git ls-tree HEAD src/` 为空 → 阶段 0 只能 `git add <路径>`，`git stash` 对本场景无效） | `(git status --porcelain).Count` = 125 |
 | F21 | G7 / G8 门控脚本存在但**未接进 ctest** | ⚠️ `tools/check_l3_no_gameplay_names.py`、`check_l3_command_parity.py` 存在；`CMakeLists.txt` 里 `add_test(NAME magicblocks_gate_*)` **只有 8 条**（g1/g3/g4/deps/scripts/uig1/uig2/ui_scripts） | `Select-String -Pattern "add_test\(NAME magicblocks_gate_"` 计数 = 8 |
 | F22 | G7 对 `block/blocks` **有按完整标识符的白名单** | ✅ 有依据：arena 的 `blocks_` 是"内存块"，误报会逼人关掉整条规则 | `check_l3_no_gameplay_names.py:49-62` |
 | F23 | `pick_scene` 的 `PickHit::normal` 是**假值** | ❌ `out->normal = Vec3{0,0,1}` 硬编码；`NarrowPhase` 只回报 `t`，物理上无法给法线 | `picker.cpp:411-412`、`picker.h:107` |
@@ -79,8 +80,8 @@ L3 spec（`2026-11-04-magicblocks-l3-primitives-design.md`）
 
 | # | 产出 | 验收 |
 |---|---|---|
-| 0.1 | **基线上线**：在 `main` 上提交既有成果 —— 但**按"可独立构建的闭包"切分，不是按层切分**。理由：`include/magicblocks/primitives/**`、`src/primitives/**`、`src/l3_cli/**`、`include/magicblocks/features/**`、`src/features/**`、`CMakeLists.txt`、`tests/magicblocks_l3_*.cpp`、`tests/magicblocks_l4_sketch_test.cpp` 之间是**互相引用的一张网**（`CMakeLists.txt` 同时引用 l3_cli 与 sketch 测试），按层切会让每个中间 commit 都构建失败。<br>**实际两刀**：<br>① `feat(baseline): L1–L3 与 F-SK 引擎底座完整入库`（上述整张网一次性提交 + `shaders/l3_*`、`shaders/overlay2d.*`、`include/magicblocks/features/**`、`src/features/**`、`tests/data/golden_l3_*.png`）<br>② `feat(f-sketch): F-SK 验收产物与 golden`（`tests/data/_out_l4_*.png` 清理后仅保留 golden + README 段）<br>③ `docs(l4): F-BL/F-VX 设计与计划` | **每一刀都在 `main` 上 `build.ps1` + `run_tests.ps1` 全绿 + `ctest -R gate` 全绿后才提交**；`git stash` 逐刀验证（先在 HEAD 上 stash 掉未提交文件，再把该刀的文件 pop 出来构建） |
-| 0.2 | **补 G7/G8 进 ctest**（GAP-P2）：`add_test(NAME magicblocks_gate_g7_l3_no_gameplay_names ...)`、`magicblocks_gate_g8_l3_command_parity` | `ctest -R gate` 从 **10 项 → 12 项**全绿 |
+| 0.1 | **基线上线**：在 `main` 上提交既有成果 —— 但**按"可独立构建的闭包"切分，不是按层切分**。理由：`include/magicblocks/primitives/**`、`src/primitives/**`、`src/l3_cli/**`、`include/magicblocks/features/**`、`src/features/**`、`CMakeLists.txt`、`tests/magicblocks_l3_*.cpp`、`tests/magicblocks_l4_sketch_test.cpp` 之间是**互相引用的一张网**（`CMakeLists.txt` 同时引用 l3_cli 与 sketch 测试），按层切会让每个中间 commit 都构建失败。<br>**实际两刀**：<br>① `feat(baseline): L1–L3 与 F-SK 引擎底座完整入库`（上述整张网一次性提交 + `shaders/l3_*`、`shaders/overlay2d.*`、`include/magicblocks/features/**`、`src/features/**`、`tests/data/golden_l3_*.png`）<br>② `feat(f-sketch): F-SK 验收产物与 golden`（`tests/data/_out_l4_*.png` 清理后仅保留 golden + README 段）<br>③ `docs(l4): F-BL/F-VX 设计与计划` | **每一刀验证"干净检出可构建"**：`git add <该刀路径>` → `git commit` → `git worktree add ../_verify <commit>` → **在 `../_verify` 内**跑 `build.ps1` + `run_tests.ps1` + `ctest -R gate` → 全绿才 `git worktree remove ../_verify` → 做下一刀。<br>⚠️ **禁止用 `git stash`**：本场景文件**全部未跟踪**（`git ls-tree HEAD src/` 与 `include/magicblocks/` 实测为空），`git stash` 默认不收未跟踪文件，即便 `-u` 也只切换本地状态，**验证不到干净检出** |
+| 0.2 | **补 G7/G8 进 ctest**（GAP-P2）：`add_test(NAME magicblocks_gate_g7_l3_no_gameplay_names ...)`、`magicblocks_gate_g8_l3_command_parity` | `ctest -R gate` 从 **8 → 10 条** gate 全绿（CTest 总数 21 → 23） |
 | 0.3 | **门控负向自测**（追加到**既有** `tools/tests/test_check_scripts.py`，**不得新建 `test_*.py`** —— `check_deps_tests.py:22,35` 对 `tools/tests/test_*.py` 精确断言 = 12） | `magicblocks_gate_scripts_selftest` 绿；`check_deps_tests.py` 仍报"12 个用例文件" |
 | 0.4 | 负向样本两则：①`src/backend/` 临时插 `blocks` → G3 必须红；②`include/magicblocks/primitives/` 临时插 `voxel` → G7 必须红；③反向：`src/features/blocks/` 插 `blocks` → G3 必须**绿**（证明玩法层合法） | 三条断言都在 `test_check_scripts.py` 里 |
 
@@ -237,10 +238,10 @@ L3 spec（`2026-11-04-magicblocks-l3-primitives-design.md`）
 |---|---|---|
 | 6.1 | `tests/data/golden_blocks.png`（640×400，固定脚本） | `check_png_content.py` rc=0 |
 | 6.2 | 结构化断言 `BlocksE2E.MatchesGoldenStructure`（**不只比字节**：断言"选中块的包围盒中心在画面里"、"至少 2 种颜色出现"） | A13 |
-| 6.3 | `tests/data/README.md` 补 golden_blocks 段：怎么重生成、断言什么、**生成环境声明**（Windows + SwiftShader；Linux+lavapipe 本轮未在本机执行，不宣称一致） | 文档与 R6 口径一致 |
+| 6.3 | `tests/data/README.md` 补 golden_blocks 段：怎么重生成、断言什么、**生成环境声明**（Windows + SwiftShader） | 文档与 **R9** 口径一致 |
 | 6.4 | **ASan 全量（A15，主路径，不是兜底）**：`build-asan` 构建 → 全量跑 → 退出码 0 且输出无 `AddressSanitizer`/`LeakSanitizer` 字样 | R1 的机械判据 |
 | 6.5 | `MagicBlocks/docs/L4_DELIVERY.md`（新）+ `ARCHITECTURE.md` §1 进度表更新 L4 行 | 文档与代码一致 |
-| 6.6 | 全量：ctest 全绿（368+新增）、**连跑 ≥6 次零失败**、`ctest -R gate` **12 项**全绿 | 附录数字 |
+| 6.6 | 全量：ctest 全绿（368+新增）、**连跑 ≥6 次零失败**、`ctest -R gate` **10 条** gate 全绿（CTest 总数 23） | 附录数字 |
 
 ---
 
@@ -407,11 +408,27 @@ expect doc_hash <Hex16>   # 阶段 6 用 --print-state 实测值替换；入库�
 > 同一个屏幕坐标，因为**状态不同**（Idle vs Selected 同一块），语义不同。
 > 这三条 `expect` 合起来就是 BL-2/BL-3/Q-BL-4/Q-BL-10 四条语义的**完整机械判据**。
 
-既有 `blocks` / `sketch` 子命令的默认行为**不得改变**，回归用具体 CTest 名核对：
+**⚠️ 既有缺口（复审实测）**：`blocks` / `sketch` 两个子命令**目前没有任何 CTest 覆盖** ——
+`CMakeLists.txt` 现有 21 条 `add_test` 里**没有** `magicblocks_cli_blocks` / `magicblocks_cli_sketch`
+（只有 `magicblocks_gate_*` 8 条、`magicblocks_cli_device`·`render_png`·`ui_*` 6 条、`magicblocks_l2_*` 7 条）。
+所以下面的"回归命令"**必须先补注册才可执行**，否则 `ctest -R ...` 匹配零个测试、永远 rc=0 = **假绿**。
+
+**阶段 4 增加一条硬产出（补既有缺口；不是 F-BL 引入的，但本轮要改 `src/l3_cli/main.cpp`，一并补齐）**：
+
+| 新增 CTest | 命令（可执行名 = `magicblocks-l3-cli`，`CMakeLists.txt:363`；`add_test` 里用已有变量 `${MB_L3_CLI_PATH}`，`:455`） | 断言 |
+|---|---|---|
+| `magicblocks_cli_blocks` | `magicblocks-l3-cli blocks --width 64 --height 64 --blocks 4 --output _out_blocks_cli.png` | rc=0 且 PNG 存在、体积 > 1 KB |
+| `magicblocks_cli_sketch` | `magicblocks-l3-cli sketch --width 64 --height 64 --strokes 3 --output _out_sketch_cli.png`（`--strokes` 与 `--output` 由 `cmd_sketch` 校验必填，解析见 `main.cpp:106`） | rc=0 且 PNG 存在 |
+| `magicblocks_blocks_sim_golden_script` | `magicblocks-l3-cli blocks-sim --script tests/data/golden_blocks_script.txt` | rc=0（脚本阶段 6 才产出：阶段 5 先注册 `DISABLED`，阶段 6 启用） |
+
+注册后本条才可执行：
 
 ```powershell
-ctest -R "magicblocks_cli_blocks|magicblocks_cli_sketch" --output-on-failure
+ctest -R "magicblocks_cli_blocks|magicblocks_cli_sketch|magicblocks_blocks_sim_golden_script" --output-on-failure
 ```
+
+> 三处命名（§6.1 的 `blocks-sim --print-state`、§6.2 两步契约、本节 CTest 名）
+> **统一为 `magicblocks_blocks_sim_golden_script`** —— 一个东西一个名字。
 
 ---
 
@@ -421,7 +438,7 @@ ctest -R "magicblocks_cli_blocks|magicblocks_cli_sketch" --output-on-failure
 |---|---|---|
 | 新增 gtest 用例 | **56**（逐阶段相加，见下表；8+1+2+15+8+7+8+5+2） | 0 |
 | 既有用例回归 | 368 → **424**（368 + 56）且 **0 跳过** | 368 |
-| 门控项数 | **10**（原 8 条 gate + 2 条 UI 自测）+ **2**（G7/G8）= **12** | 10 |
+| 门控项数 | gate **8 → 10** 条（+G7/+G8，二者都属 `add_test(NAME magicblocks_gate_*)` 家族）；CTest 总数 **21 → 23**。注意：`magicblocks_gate_uig1_no_readback`(:475)、`magicblocks_gate_uig2_single_submit`(:477)、`magicblocks_gate_ui_scripts_selftest`(:479) **已在这 8 条内，不另计** | gate 8 / CTest 21 |
 | `tools/tests/test_*.py` | **保持 12**（负向自测**追加**到 `test_check_scripts.py`，不新建文件） | 12 |
 | 全量连跑 | ≥ 6 次，0 失败 | — |
 | ASan 全量 | 1 次，退出码 0 且无 sanitizer 报告 | 未跑 |
@@ -451,7 +468,7 @@ ctest -R "magicblocks_cli_blocks|magicblocks_cli_sketch" --output-on-failure
 
 | 阶段 | 依赖 | 估时 | 验收门槛 | 位置 |
 |---|---|---|---|---|
-| 0 基线入库 + G7/G8 接入 | — | 0.5 d | 每刀 build+全量绿；gate 8→**10** 条直测 + 2 条自测 = **12 项** | **主工作区** |
+| 0 基线入库 + G7/G8 接入 | — | 0.5 d | 每刀在 `../_verify` 干净检出内 build+全量绿；gate **8 → 10** 条（CTest 21 → 23） | **主工作区** |
 | 1 `IWorldGrid` | 0 | 0.5 d | 8 例绿（独立测试文件） | 工作树 |
 | 1.5 `IPicker` GAP-P1 | 1 | 0.5 d | `SceneHitReportsRealNormal` 绿 | 工作树 |
 | 2 `BlockDocument` | 1 | 1 d | 15 例绿 | 工作树 |
@@ -471,9 +488,10 @@ ctest -R "magicblocks_cli_blocks|magicblocks_cli_sketch" --output-on-failure
 | R3 | gizmo 拖拽与整格吸附冲突 | Q-BL-5：松手才提交 |
 | R4 | `IWorldGrid` 稀疏退化 | 容量先定死 `half_extent = 16`，越界**显式 `Status::Invalid`**；更大场景需求另起 spec |
 | R5 | OBJ 让 draw 次数增长 | 首轮只允许**一个**导入外形槽位；超限**报错**（不回退共享网格） |
-| R6 | golden 跨平台 | **Windows + SwiftShader 是本轮唯一验收基线**（本机只有这个环境）；Linux+lavapipe 本轮**不宣称**一致，`tests/data/README.md` 里如实写"未在本机执行"，不留"待验证"这种悬空结论 |
+| R6 | 代码层平台无关失守 | 中 | 阶段 0 加 grep 门控断言：`src/features/**`、`src/primitives/**` 零 `#ifdef`／零 `WIN32`·`_WIN32`·`__linux__`·`ANDROID`·`__APPLE__`。**可断言项，必须绿**（与 R9 分工：R6 = 代码里不许有平台分支；R9 = golden 只有一份） |
 | R7 | 玩法词泄漏 | **G3**（`src/backend/**` 出现 `blocks` → 违规）+ **G7**（`src/primitives/**` 出现 `voxel`/`积木` → 违规；`block/blocks` 标识符按既有白名单放行）+ 负向自测（追加进 `test_check_scripts.py`） |
-| R8 | `blocks` / `sketch` CLI 默认行为被改动 | 阶段 4 结束前必跑 `ctest -R "magicblocks_cli_blocks|magicblocks_cli_sketch"`，并对照 `git diff src/l3_cli/main.cpp` 确认只新增分支 |
+| R8 | `blocks` / `sketch` CLI 默认行为被改动 | **先补 CTest 注册（见 §6.2 的三条新 CTest）再跑** `ctest -R "magicblocks_cli_blocks|magicblocks_cli_sketch|magicblocks_blocks_sim_golden_script"`，并对照 `git diff src/l3_cli/main.cpp` 确认只新增分支。<br>⚠️ 这两个 CTest **本轮才创建**（现有 21 条 `add_test` 里没有它们）；**未注册时该命令匹配零个测试、rc=0，属假绿，不得作为通过依据** |
+| **R9** | **golden 只有单平台基线**（SKILL `:52`/`:138` 要求"双平台同一套测试与 golden"） | **高** | **本轮显式未达成**（本机只有 Windows+SwiftShader，无 Linux 环境）。<br>**后果**：①golden PNG 与 `doc_hash` 只在 Windows+SwiftShader 上生成过一次，Linux/Android/iOS 下曲面细分与浮点差异可能让 golden 不匹配；②跨平台回归**无法在本轮拦截**。<br>**主路径处置**：`tests/data/README.md` 的 golden 段写明"仅在 Windows+SwiftShader 生成与校验"；任何改动吸附容差／相机默认值／网格尺寸后，**必须两平台各生成一次**。<br>**必补工单**：合并后立即开"F-BL golden 双平台基线"任务（Linux+lavapipe 构建 + 跑全部 golden + 差异归因），**在下一个 F-* 迭代开工前完成**。<br>（与设计 §12 R9 逐字一致） |
 
 ---
 
@@ -482,7 +500,7 @@ ctest -R "magicblocks_cli_blocks|magicblocks_cli_sketch" --output-on-failure
 | 项 | 值 |
 |---|---|
 | ctest | 368/368（2026-11-09 实测，连跑 6 次一致） |
-| 门控项数 | 10（阶段 0 后应为 **12**：+G7 +G8） |
+| 门控项数 | gate **8 → 10** 条（CTest 总数 21 → 23） |
 | 门控 rc | G1/G3/G4/deps/scripts/UIG1/UIG2/UI-scripts 全 0 |
 | `check_deps_tests --expect-files` | **12**（`tools/tests/test_*.py`；gtest 文件不计入，F18 已确认） |
 | 基线提交切分 | 待阶段 0.1 完成后填（每个 commit 的 hash + 该 commit 的测试结果） |

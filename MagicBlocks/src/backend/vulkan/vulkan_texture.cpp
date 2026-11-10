@@ -630,11 +630,21 @@ u32 allocate_sampler_slot() { return g_sampler_slot.fetch_add(1, std::memory_ord
 
 VulkanSampler::VulkanSampler(const SamplerDesc& desc) : has_ctx_(false), desc_(desc) {
   slot_index_ = allocate_sampler_slot();
+  // P0(X1):给采样器发一个**有效**句柄(不占内存页,见 handles.h 的 kSamplerPage)。
+  // valid() 的条件:page_id != kInvalidPage、size != 0;id 存稳定槽位号。
+  id_.page_id = ResourceId::kSamplerPage;
+  id_.offset = 0;
+  id_.size = 1;  // 采样器没有字节量,1 表示"非空对象"
+  id_.id = slot_index_;
 }
 
 VulkanSampler::VulkanSampler(const VulkanContext& ctx, const SamplerDesc& desc)
     : ctx_(ctx), has_ctx_(true), desc_(desc) {
   slot_index_ = allocate_sampler_slot();
+  id_.page_id = ResourceId::kSamplerPage;
+  id_.offset = 0;
+  id_.size = 1;
+  id_.id = slot_index_;
 }
 
 VulkanSampler::~VulkanSampler() {

@@ -692,8 +692,10 @@ Status VulkanCommandList::bind_sampled_texture(const ResourceId& texture,
   set_resource(&cmd, texture);  // resource = 纹理(M3:命令流只记偏移)
   cmd.a = slot;                 // 槽位
   cmd.sampler = sampler;
-  cmd.packed_sampler = 0;
-  if (!sampler.pack(&cmd.packed_sampler)) cmd.packed_sampler = 0;
+  // 采样器句柄的 page_id 是 kSamplerPage(见 handles.h),超出 pack() 的 16 位页号
+  // 宽度,所以**不要求**打包成功;采样器的稳定身份就是 id(= slot_index),
+  // 单独记进 packed_sampler 供 L2 去重/复现用。
+  cmd.packed_sampler = sampler.id;
   append(cmd);
   return Status::Ok_();
 }

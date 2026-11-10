@@ -40,6 +40,11 @@ struct ResourceId {
 
   // 判空用:页号恒从 0 开始,所以 kInvalidPage 不会与真实页冲突。
   static constexpr u32 kInvalidPage = 0xFFFFFFFFu;
+  // 采样器专用页号(P0 / X1):ISampler 不占内存子块,但 bind_sampled_texture
+  // 的签名要求传一个**有效**句柄。给采样器发这个专用 page_id(size != 0、
+  // id = slot_index)让 valid() 通过,同时不占任何真实页号 —— 真实页号从 0
+  // 递增且 validate() 有 "page_id == pages 下标" 不变量,永远到不了这个值。
+  static constexpr u32 kSamplerPage = 0xFFFFFFFEu;
 
   bool valid() const { return page_id != kInvalidPage && size != 0; }
   // 页内闭开区间 [offset, offset+size)。
