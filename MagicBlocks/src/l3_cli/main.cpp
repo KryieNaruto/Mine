@@ -22,6 +22,7 @@
 #define NOMINMAX
 #endif
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -48,6 +49,12 @@
 #include "magicblocks/resources/buffer.h"
 #include "magicblocks/resources/command.h"
 #include "magicblocks/resources/pipeline.h"
+#include "magicblocks/features/stack/block_brush.h"
+#include "magicblocks/features/stack/block_set.h"
+#include "magicblocks/features/stack/color_mode.h"
+#include "magicblocks/features/stack/shape_template.h"
+#include "magicblocks/features/stack/stack_render.h"
+#include "magicblocks/features/stack/stack_types.h"
 #include "magicblocks/features/sketch/sketch_document.h"
 #include "magicblocks/features/sketch/sketch_pipeline.h"
 #include "magicblocks_shaders.h"
@@ -56,6 +63,7 @@ namespace dev = magicblocks::device;
 namespace res = magicblocks::resources;
 namespace mbp = magicblocks::primitives;
 namespace featsketch = magicblocks::features::sketch;
+namespace mbst = magicblocks::features::stack;
 
 namespace {
 
@@ -77,6 +85,20 @@ struct Args {
   // ---- F-SK（涂鸦）----
   int sketch_pattern = 0;  // 0=波浪(Ribbon) 1=方框(Region) 2=交叉(并集)
   bool merge = false;      // 是否把所有 Ribbon 并成一个实体
+  // ---- F-VX（魔法叠叠乐）----
+  // 以下只给 stack 子命令用。缺省值即契约默认值（spec §13.1）。
+  int layers = 8;
+  float cell_size = 0.5f;
+  int column_height = 1;
+  std::string shape_template;  // 空 = 不用模板（按列高堆）
+  int template_radius = 2;
+  std::string color_mode;      // 空 = flat
+  int lock_layer = -1;         // -1 = 不锁层
+  // --inner-pass：缺省 on（契约默认），但取值必须显式；
+  // 不接受 auto/default/空这类"让程序自己决定"的写法。
+  bool inner_pass = true;
+  bool inner_pass_given = false;
+  bool dry_run = false;  // 只跑到逻辑阶段，不建设备不出图（§13.3）
 };
 
 void print_usage() {
@@ -87,6 +109,11 @@ void print_usage() {
       "  magicblocks-l3-cli gizmo  --width 640 --height 400 --output gizmo.png\n"
       "  magicblocks-l3-cli sketch --width 640 --height 400 --strokes 3\n"
       "                            [--sketch-pattern 0|1|2] [--merge] --output sketch.png\n"
+      "  magicblocks-l3-cli stack  --width 640 --height 400 --layers 8 --strokes 3\n"
+      "                            [--cell-size 0.5] [--column-height 1]\n"
+      "                            [--template square|circle|cross|sphere] [--template-radius 2]\n"
+      "                            [--color-mode flat|by-layer|by-stroke] [--lock-layer N]\n"
+      "                            [--inner-pass on|off] [--dry-run] --output stack.png\n"
       "\n"
       "通用可选参数:\n"
       "  --msaa N    MSAA 采样数(1=关闭,缺省;可填设备支持的 2/4/8)。\n"
@@ -133,6 +160,51 @@ int parse_args(int argc, char** argv, Args* out) {
     } else if (a == "--msaa") {
       if (!take_value(argc, argv, &i, "--msaa", &v)) return -2;
       out->msaa = std::atoi(v.c_str());
+    } else if (a == "--layers") {
+      if (!take_value(argc, argv, &i, "--layers", &v)) return -2;
+      out->layers = std::atoi(v.c_str());
+    } else if (a == "--cell-size") {
+      if (!take_value(argc, argv, &i, "--cell-size", &v)) return -2;
+      out->cell_size = static_cast<float>(std::atof(v.c_str()));
+    } else if (a == "--column-height") {
+      if (!take_value(argc, argv, &i, "--column-height", &v)) return -2;
+      out->column_height = std::atoi(v.c_str());
+    } else if (a == "--template") {
+      if (!take_value(argc, argv, &i, "--template", &v)) return -2;
+      out->shape_template = v;
+    } else if (a == "--template-radius") {
+      if (!take_value(argc, argv, &i, "--template-radius", &v)) return -2;
+      out->template_radius = std::atoi(v.c_str());
+    } else if (a == "--color-mode") {
+      if (!take_value(argc, argv, &i, "--color-mode", &v)) return -2;
+      out->color_mode = v;
+    } else if (a == "--lock-layer") {
+      if (!take_value(argc, argv, &i, "--lock-layer", &v)) return -2;
+      out->lock_layer = std::atoi(v.c_str());
+    } else if (a == "--inner-pass") {
+      if (!take_value(argc, argv, &i, "--inner-pass", &v)) return -2;
+      // 只接受 on/off/1/0/true/false。**不接受** auto/default/空值：
+      // "让程序自己决定内面 pass 开不开"等于把正确性交给隐式规则，
+      // 出图结果会随缺省值改动而变而无人知情。
+      if (v == "on" || v == "1" || v == "true") {
+        out->inner_pass = true;
+      } else if (v == "off" || v == "0" || v == "false") {
+        out->inner_pass = false;
+      } else {
+        std::fprintf(stderr, "--inner-pass 取值必须显式(on|off|1|0|true|false), 实际: %s\n",
+                     v.c_str());
+        return -2;
+      }
+      out->inner_pass_given = true;
+    } else if (a == "--dry-run") {
+      out->dry_run = true;
+    } else if (a == "--inner-depth-const") {
+      // §13.1 / D-VX-4′：该参数**不存在**，且永远不该存在。
+      // 它对应 depthConstWrite → depthBounds 特性（本设备从未请求，属 UB）。
+      // 给出专门一条错误信息，而不是笼统的"未知参数"，避免有人以为是自己拼错。
+      std::fprintf(stderr,
+                   "--inner-depth-const 不可用: 它依赖未启用的 depthBounds 特性(D-VX-4′)");
+      return -2;
     } else if (a == "--seed") {
       if (!take_value(argc, argv, &i, "--seed", &v)) return -2;
       out->seed = static_cast<unsigned>(std::strtoul(v.c_str(), nullptr, 10));
@@ -2043,6 +2115,427 @@ int cmd_sketch(const Args& args) {
   return 0;
 }
 
+// ================================================================ F-VX：魔法叠叠乐
+
+// 一笔"输入笔迹"的世界坐标（生成式，不读随机数/时钟）。
+struct StackStrokeInput {
+  std::vector<mbp::Vec2> points;  // 世界 xz 平面上的连续坐标
+  int plane_layer = 0;            // 该笔投在哪个层平面上
+};
+
+// 为第 i 笔生成确定的笔迹：绕原点的圆弧段。所有量由 i / strokes 完全决定
+// ⇒ 同参数出图逐字节相同（spec §13.3）。
+std::vector<StackStrokeInput> make_stack_strokes(int strokes, int layers, float cell_size,
+                                                 int half_extent, int column_height) {
+  std::vector<StackStrokeInput> out;
+  if (strokes <= 0) return out;
+  const float span = static_cast<float>(half_extent) * cell_size;
+  // 列高的顶部不能越过网格顶面：第 L 层起摞 column_height 块要求
+  // L + column_height <= layers。第一版没约束，--column-height 3 时第一笔
+  // 就撞在"柱高越顶"上整笔失败 —— 参数本身没写错，是生成器把笔放错了层。
+  const int max_base = (layers > 0) ? (layers - column_height) : 0;
+  const int layer_span = (max_base > 0) ? (max_base + 1) : 1;
+  for (int i = 0; i < strokes; ++i) {
+    StackStrokeInput s;
+    s.plane_layer = (i % layer_span);
+    // 半径随笔数递增：后画的圈更大，视觉上"越叠越外扩"。
+    const float r = span * (0.42f + 0.07f * static_cast<float>(i));
+    // 起始角黄金分割步进：每笔错开且不重复。
+    const float a0 = 6.2831853f * 0.6180339887f * static_cast<float>(i);
+    constexpr int kSeg = 28;
+    s.points.reserve(kSeg + 1);
+    for (int k = 0; k <= kSeg; ++k) {
+      const float a = a0 + 6.2831853f * static_cast<float>(k) / static_cast<float>(kSeg);
+      s.points.push_back(mbp::Vec2{r * std::cos(a), r * std::sin(a)});
+    }
+    out.push_back(std::move(s));
+  }
+  return out;
+}
+
+mbst::ColorMode parse_color_mode(const std::string& text, bool* ok) {
+  *ok = true;
+  if (text.empty() || text == "flat") return mbst::ColorMode::Flat;
+  if (text == "by-layer") return mbst::ColorMode::ByLayer;
+  if (text == "by-stroke") return mbst::ColorMode::ByStroke;
+  *ok = false;
+  return mbst::ColorMode::Flat;
+}
+
+int cmd_stack(const Args& args) {
+  // ---- 0) 参数校验：全部在此处响，绝不带着非法参数往下走 ----
+  if (args.output.empty() && !args.dry_run) {
+    std::fprintf(stderr, "[stack] 参数错误: --output 必填\n");
+    return 2;
+  }
+  if (args.width <= 0 || args.height <= 0) {
+    std::fprintf(stderr, "[stack] 参数错误: --width/--height 必须为正\n");
+    return 2;
+  }
+  if (args.layers <= 0) {
+    std::fprintf(stderr, "[stack] 参数错误: --layers 必须为正\n");
+    return 2;
+  }
+  if (!(args.cell_size > 0.0f)) {
+    std::fprintf(stderr, "[stack] 参数错误: --cell-size 必须 > 0\n");
+    return 2;
+  }
+  if (args.strokes <= 0) {
+    // 0 笔 = 没有任何方块，必须拒绝。若照写一张纯背景色 PNG，
+    // 那张空图就会被 golden 锁死成"正确的图"。
+    std::fprintf(stderr, "[stack] 参数错误: --strokes 必须 >= 1\n");
+    return 2;
+  }
+  if (args.column_height <= 0) {
+    std::fprintf(stderr, "[stack] 参数错误: --column-height 必须 >= 1\n");
+    return 2;
+  }
+  if (!args.shape_template.empty() && args.column_height != 1) {
+    // spec §12：两种堆叠规则不能混，混起来结果没有唯一解释。
+    std::fprintf(stderr,
+                 "[stack] 参数错误: --template 与 --column-height 互斥"
+                 "（同时给出时堆叠规则无唯一解释）\n");
+    return 2;
+  }
+  if (args.template_radius < 1) {
+    std::fprintf(stderr, "[stack] 参数错误: --template-radius 必须 >= 1\n");
+    return 2;
+  }
+
+  bool cm_ok = false;
+  const mbst::ColorMode color_mode = parse_color_mode(args.color_mode, &cm_ok);
+  if (!cm_ok) {
+    std::fprintf(stderr, "[stack] 参数错误: 未知 --color-mode %s\n", args.color_mode.c_str());
+    return 2;
+  }
+
+  mbst::GridSpec grid;
+  grid.origin[0] = 0.0f;
+  grid.origin[1] = 0.0f;
+  grid.origin[2] = 0.0f;
+  grid.cell_size = args.cell_size;
+  grid.layers = args.layers;
+  grid.half_extent = 8;  // 原点居中 ⇒ 合法域 [-8, 8)
+
+  // 模板先解析（未知名字在建设备之前就响）。
+  std::unique_ptr<mbst::IShapeTemplate> tmpl_api;
+  mbst::ShapeTemplate tmpl{};
+  std::vector<mbst::Cell> tmpl_offsets;
+  if (!args.shape_template.empty()) {
+    tmpl_api = mbst::create_shape_template();
+    auto gen = tmpl_api->generate(args.shape_template, args.template_radius);
+    if (!gen.ok()) {
+      std::fprintf(stderr, "[stack] 参数错误: %s\n", gen.text().c_str());
+      return 2;
+    }
+    tmpl_offsets = std::move(gen).take();
+    tmpl.name = args.shape_template.c_str();
+    tmpl.offsets = tmpl_offsets.data();
+    tmpl.count = tmpl_offsets.size();
+  }
+
+  // ---- 1) 逻辑：构造笔迹（纯 CPU，不碰设备）----
+  const std::vector<StackStrokeInput> inputs =
+      make_stack_strokes(args.strokes, args.layers, args.cell_size, grid.half_extent,
+                         args.column_height);
+
+  // ---- 2) 逐笔吸附 → DDA → 去重 → IBlockSet ----
+  auto set_r = mbst::create_block_set(grid);
+  if (!set_r.ok()) {
+    std::fprintf(stderr, "[code=%d] %s\n", static_cast<int>(set_r.error_code()),
+                 set_r.text().c_str());
+    return 1;
+  }
+  std::unique_ptr<mbst::IBlockSet> set = std::move(set_r).take();
+
+  mbst::BrushConfig bcfg;
+  bcfg.grid = grid;
+  bcfg.column_height = args.column_height;
+  std::unique_ptr<mbst::IBlockBrush> brush = mbst::create_block_brush(bcfg);
+  if (!brush) {
+    std::fprintf(stderr, "[stack] 创建笔刷失败\n");
+    return 1;
+  }
+
+  // 层锁在下面的逐笔循环里设：每笔按自己的 plane_layer 锁，
+  // --lock-layer 作为用户覆盖项把全部笔迹压到同一层。
+  // 不要在这里预先锁一次 —— 那会让后面每笔的 lock() 覆盖它，等于白写。
+
+  // 每笔一个确定颜色（黄金分割色相，视觉上互相区分）。
+  const mbst::ColorPalette stroke_colors = mbst::make_default_palette(inputs.size());
+
+  std::uint32_t total_skipped = 0;
+  std::uint32_t total_emitted = 0;
+  // 跨笔重叠被滤掉的格数（与笔迹内部的 total_skipped 分开统计：
+  // 前者是"后画的圈压在先画的圈上"，是叠叠乐的正常形态；
+  // 后者是同一条笔迹内部的 DDA 重复。）
+  std::uint32_t total_cross_skipped = 0;
+  std::vector<mbp::Ray> rays;
+  for (std::size_t i = 0; i < inputs.size(); ++i) {
+    const StackStrokeInput& in = inputs[i];
+    const float plane_y =
+        grid.origin[1] + (static_cast<float>(in.plane_layer) + 0.5f) * grid.cell_size;
+
+    // **必须逐笔锁层**，不能只靠射线高度决定落在哪一层。
+    //
+    // 理由（实测踩到）：未锁层时笔刷走 `pick_layer_for_ray`，它的判据是
+    // "射线与网格体积的第一交点所在的层"。我们的射线从网格**上方**垂直向下打，
+    // 第一交点恒在顶面 ⇒ 永远落在第 layers-1 层。结果 `--strokes 3` 生成的三笔
+    //（本意分别在第 0/1/2 层）全部摞在第 7 层，屏幕上只剩最上面那一圈；
+    // 而 `--column-height 3` 立刻撞"柱高越顶"。这不是生成器的错，是调用方
+    // 没告诉笔刷"我要第几层"。
+    // `--lock-layer` 是用户覆盖项；没给时按每笔自己的 plane_layer 锁。
+    const std::int32_t want_layer = (args.lock_layer >= 0) ? args.lock_layer : in.plane_layer;
+    if (auto ls = brush->layer_lock().lock(want_layer); !ls.ok()) {
+      std::fprintf(stderr, "[code=%d] %s\n", static_cast<int>(ls.error_code()), ls.text().c_str());
+      return 1;
+    }
+
+    // 平面笔迹 → 世界射线：从该层平面上方垂直向下，落点即笔迹点。
+    rays.clear();
+    rays.reserve(in.points.size());
+    for (const mbp::Vec2& p : in.points) {
+      rays.push_back(mbp::Ray{mbp::Vec3{p.x, plane_y + 8.0f, p.y}, mbp::Vec3{0.0f, -1.0f, 0.0f}});
+    }
+
+    auto plan_r = brush->stroke(rays.data(), rays.size());
+    if (!plan_r.ok()) {
+      std::fprintf(stderr, "[code=%d] 第 %zu 笔: %s\n", static_cast<int>(plan_r.error_code()), i,
+                   plan_r.text().c_str());
+      return 1;
+    }
+    const mbst::StrokePlan plan = plan_r.value();
+    total_skipped += plan.stats.skipped_occupied;
+    total_emitted += plan.stats.cells_emitted;
+    if (plan.cells.empty()) continue;
+
+    // 有模板时，把每个已吸附格当作模板锚点展开；否则按列高直接落块。
+    //
+    // ⚠️ 与 `IBlockBrush::commit` 的分工：commit 是"整笔原子、碰到已占格就
+    // 整体失败"（§7 的语义，给交互式落笔用：用户点到的格已占，应该整笔拒绝
+    // 而不是画出一半）。CLI 是**批量堆叠**，后画的圈天然会压在先画的圈上 ——
+    // 那是"叠叠乐"的正常形态，不是错误。所以这里不走 commit，而是自己按
+    // 列高生成块，再走 `add_stroke` 的"跳过已占格"路径（plan.stats.
+    // skipped_occupied 已经统计过笔迹内部的重叠，这里统计跨笔的重叠）。
+    std::vector<mbst::Cell> cells;
+    if (tmpl.count > 0) {
+      for (const mbst::Cell& anchor : plan.cells) {
+        auto ex = mbst::expand_template(grid, anchor, tmpl);
+        if (!ex.ok()) {
+          std::fprintf(stderr, "[code=%d] %s\n", static_cast<int>(ex.error_code()),
+                       ex.text().c_str());
+          return 1;
+        }
+        const std::vector<mbst::Cell>& v = ex.value();
+        cells.insert(cells.end(), v.begin(), v.end());
+      }
+      std::sort(cells.begin(), cells.end());
+      cells.erase(std::unique(cells.begin(), cells.end()), cells.end());
+    } else {
+      cells.reserve(plan.cells.size() * static_cast<std::size_t>(args.column_height));
+      for (const mbst::Cell& base : plan.cells) {
+        for (int k = 0; k < args.column_height; ++k) {
+          mbst::Cell c;
+          c.x = base.x;
+          c.y = base.y + k;
+          c.z = base.z;
+          cells.push_back(c);
+        }
+      }
+    }
+
+    // 滤掉已被占用的格（跨笔重叠）。剩下的为空 → 这一笔完全被前笔盖住，
+    // 跳过即可；不必报错，因为它不是逻辑错误。
+    std::vector<mbst::Cell> fresh;
+    fresh.reserve(cells.size());
+    for (const mbst::Cell& c : cells) {
+      if (set->find(c) == nullptr) fresh.push_back(c);
+    }
+    total_cross_skipped += static_cast<std::uint32_t>(cells.size() - fresh.size());
+    if (fresh.empty()) continue;
+
+    auto add = mbst::add_stroke(set.get(), fresh, stroke_colors[i], set->next_stroke_id());
+    if (!add.ok()) {
+      std::fprintf(stderr, "[code=%d] %s\n", static_cast<int>(add.error_code()),
+                   add.text().c_str());
+      return 1;
+    }
+  }
+
+  if (set->size() == 0) {
+    std::fprintf(stderr, "[stack] 逻辑错误: 没有产生任何方块，拒绝出图\n");
+    return 1;
+  }
+
+  // ---- 颜色模式 ----
+  // 三种模式对色板形状的要求不同（Flat 必须恰好 1 项），所以按模式构造，
+  // 而不是拿"每笔一色"那张表硬套 —— 后者在 Flat 下必然报 ColorOutOfRange。
+  mbst::ColorPalette mode_palette;
+  switch (color_mode) {
+    case mbst::ColorMode::Flat:
+      mode_palette = mbst::make_default_palette(1);  // 整堆同色
+      break;
+    case mbst::ColorMode::ByLayer:
+      // 每层一色：层数就是天然基数，取模不会绕回。
+      mode_palette = mbst::make_default_palette(static_cast<std::size_t>(grid.layers));
+      break;
+    case mbst::ColorMode::ByStroke:
+      mode_palette = stroke_colors;  // 每笔一色
+      break;
+  }
+  mbst::ColorApplyStats cstats{};
+  if (auto s = mbst::apply_color_mode(*set, color_mode, mode_palette, &cstats); !s.ok()) {
+    std::fprintf(stderr, "[code=%d] %s\n", static_cast<int>(s.error_code()), s.text().c_str());
+    return 1;
+  }
+
+  const std::uint64_t doc_hash = set->hash();
+
+  // ---- dry-run：到此为止，不建设备、不出图（spec §13.3）----
+  if (args.dry_run) {
+    std::printf("[stack] dry-run 笔画 %zu | 方块 %zu | 发射 %u 跳过 %u | doc_hash=%016llx\n",
+                set->stroke_count(), set->size(), total_emitted, total_skipped,
+                static_cast<unsigned long long>(doc_hash));
+    return 0;
+  }
+  // ---- 3) 设备 ----
+  auto dev_r = dev::create_render_device(software_desc());
+  if (!dev_r.ok()) {
+    std::fprintf(stderr, "[stack] 创建设备失败: %s\n", dev_r.message().c_str());
+    return 1;
+  }
+  dev::IRenderDevice* device = dev_r.value().get();
+  {
+    res::IMemoryAllocator* alloc = device->memory_allocator();
+    for (res::MemoryKind kind :
+         {res::MemoryKind::Vertex, res::MemoryKind::Index, res::MemoryKind::Staging}) {
+      if (auto s = alloc->reserve_pages(kind, 4); !s.ok()) {
+        std::fprintf(stderr, "[stack] 预取内存页失败: %s\n", s.message.c_str());
+        return 1;
+      }
+    }
+  }
+
+  const int w = args.width;
+  const int h = args.height;
+
+  // ---- 4) 离屏目标（必须带深度：表面 pass 要按深度裁决）----
+  dev::TargetDesc td;
+  td.kind = dev::TargetDesc::Kind::Offscreen;
+  td.extent = {static_cast<dev::u32>(w), static_cast<dev::u32>(h)};
+  td.with_depth = true;
+  if (!apply_msaa(*device, args.msaa, &td)) return 2;
+  auto tgt_r = device->create_offscreen_target(td);
+  if (!tgt_r.ok()) {
+    std::fprintf(stderr, "[stack] 创建离屏目标失败: %s\n", tgt_r.message().c_str());
+    return 1;
+  }
+  dev::IRenderTarget* target = tgt_r.value().get();
+
+  // 相机：斜俯视，能看到顶盖 + 侧壁 + 层间缝隙。
+  auto camera_owned = mbp::create_camera();
+  if (!camera_owned) {
+    std::fprintf(stderr, "[stack] 创建相机失败\n");
+    return 1;
+  }
+  mbp::ICamera* camera = camera_owned.get();
+  {
+    mbp::CameraDesc cd;
+    cd.kind = mbp::ProjectionKind::Perspective;
+    cd.fov_y_degrees = 45.0f;
+    cd.near_plane = 0.05f;
+    cd.far_plane = 100.0f;
+    cd.viewport.width = static_cast<mbp::u32>(w);
+    cd.viewport.height = static_cast<mbp::u32>(h);
+    if (auto s = camera->set_desc(cd); !s.ok()) {
+      std::fprintf(stderr, "[stack] 设置相机参数失败: %s\n", s.message.c_str());
+      return 1;
+    }
+    mbp::CameraPose pose;
+    // 网格世界尺度：cell_size=0.5、half_extent=8 ⇒ 可堆叠区域约 [-4,4]，
+    // 高度 layers*cell_size = 4。相机距离必须与这个尺度匹配 ——
+    // 第一版用了 (4.2,3.6,5.0) 看 (0,0.9,0)，曝光后发现物体被压成画面最下面
+    // 6 像素高的一条（几何全在视锥底边附近），也就是"出了图但等于没画"。
+    // 这里改成 2.5 倍视野距离，让 ±4 的世界角点都落在画面内。
+    pose.position = {9.0f, 7.0f, 9.0f};
+    pose.target = {0.0f, 1.2f, 0.0f};
+    pose.up = {0.0f, 1.0f, 0.0f};
+    if (auto s = camera->set_pose(pose); !s.ok()) {
+      std::fprintf(stderr, "[stack] 设置相机位姿失败: %s\n", s.message.c_str());
+      return 1;
+    }
+  }
+
+  mbst::StackFrameDesc frame;
+  frame.set = set.get();
+  std::memcpy(frame.view_proj, camera->view_proj_matrix().m, sizeof(float) * 16);
+  frame.width = static_cast<std::uint32_t>(w);
+  frame.height = static_cast<std::uint32_t>(h);
+  frame.clear_color[0] = 0.06f;
+  frame.clear_color[1] = 0.07f;
+  frame.clear_color[2] = 0.10f;
+  frame.clear_color[3] = 1.0f;
+  frame.inner_pass_enabled = args.inner_pass;
+  // debug_inner_pass_first 恒 false：生产路径不提供关掉正确性的旋钮。
+
+  // ---- 5) 两条管线 + 实例缓冲 ----
+  auto renderer = mbst::create_stack_renderer();
+  if (auto s = renderer->create_passes(device, static_cast<std::uint32_t>(args.msaa)); !s.ok()) {
+    std::fprintf(stderr, "[stack] 创建双 pass 失败: %s\n", s.text().c_str());
+    return 1;
+  }
+  if (auto s = renderer->build_instances(grid, *set); !s.ok()) {
+    std::fprintf(stderr, "[stack] 构建实例失败: %s\n", s.text().c_str());
+    return 1;
+  }
+
+  // ---- 6) 录制（渲染器只录不交）----
+  auto cmd_r = device->create_command_list();
+  if (!cmd_r.ok()) {
+    std::fprintf(stderr, "[stack] 创建命令列表失败: %s\n", cmd_r.message().c_str());
+    return 1;
+  }
+  res::ICommandList* cmd = cmd_r.value().get();
+
+  renderer->reset_stats();
+  if (auto s = renderer->record_frame(*cmd, target, frame); !s.ok()) {
+    std::fprintf(stderr, "[stack] 录制失败: %s\n", s.text().c_str());
+    return 1;
+  }
+
+  // ---- 7) 一帧一次提交（G5：提交权在调用方）----
+  if (auto s = device->submit_command_list(*cmd); !s.ok()) {
+    std::fprintf(stderr, "[stack] 提交失败: %s\n", s.message.c_str());
+    return 1;
+  }
+
+  // ---- 8) 读回 + 写 PNG ----
+  std::vector<std::uint8_t> rgba(static_cast<std::size_t>(w) * h * 4u, 0);
+  if (auto s = target->readback_rgba8(rgba.data(), rgba.size()); !s.ok()) {
+    std::fprintf(stderr, "[stack] 读回失败: %s\n", s.message.c_str());
+    return 1;
+  }
+
+  magicblocks::ImageRgba8 img;
+  img.width = static_cast<std::uint32_t>(w);
+  img.height = static_cast<std::uint32_t>(h);
+  img.pixels = std::move(rgba);
+  std::string err;
+  if (!magicblocks::write_png_rgba8(args.output, img, &err)) {
+    std::fprintf(stderr, "[stack] 写 PNG 失败: %s\n", err.c_str());
+    return 1;
+  }
+
+  const mbst::StackRenderStats& st = renderer->stats();
+  std::printf(
+      "[stack] 笔画 %zu | 方块 %zu -> 请求 %zu -> 合批 %u (pass %u) | drawcall %u 管线切换 %u | "
+      "doc_hash=%016llx inst=%u | 已写出 %s (%dx%d)\n",
+      set->stroke_count(), set->size(), set->size(), st.draw_calls, st.begin_passes, st.draw_calls,
+      st.pipeline_binds, static_cast<unsigned long long>(doc_hash), st.instances,
+      args.output.c_str(), w, h);
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -2061,6 +2554,7 @@ int main(int argc, char** argv) {
   if (args.cmd == "blocks") return cmd_blocks(args);
   if (args.cmd == "gizmo") return cmd_gizmo(args);
   if (args.cmd == "sketch") return cmd_sketch(args);
+  if (args.cmd == "stack") return cmd_stack(args);
 
   std::fprintf(stderr, "未知子命令: %s\n", args.cmd.c_str());
   print_usage();
