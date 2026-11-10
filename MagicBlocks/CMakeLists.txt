@@ -466,6 +466,10 @@ add_test(NAME magicblocks_gate_g3_layer_purity
   COMMAND ${MB_PY} ${MINE_ROOT}/tools/check_layer_purity.py --root ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME magicblocks_gate_g4_no_raw_alloc
   COMMAND ${MB_PY} ${MINE_ROOT}/tools/check_no_raw_alloc.py --root ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME magicblocks_gate_g7_l3_no_gameplay_names
+  COMMAND ${MB_PY} ${MINE_ROOT}/tools/check_l3_no_gameplay_names.py --root ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME magicblocks_gate_g8_l3_command_parity
+  COMMAND ${MB_PY} ${MINE_ROOT}/tools/check_l3_command_parity.py --root ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME magicblocks_gate_deps_tests
   COMMAND ${MB_PY} ${MINE_ROOT}/tools/check_deps_tests.py)
 add_test(NAME magicblocks_gate_scripts_selftest
