@@ -20,6 +20,8 @@ if TOOLS_DIR not in sys.path:
 import check_layer_purity  # noqa: E402
 import check_no_geometry_shader  # noqa: E402
 import check_no_raw_alloc  # noqa: E402
+import check_l3_command_parity  # noqa: E402
+import check_l3_no_gameplay_names  # noqa: E402
 import check_scene_no_clock  # noqa: E402
 
 
@@ -519,6 +521,141 @@ class GateSceneNoClockTest(unittest.TestCase):
             self.assertIn(":2", out)
             self.assertIn(self.SCENE_SRC, out)
 
+
+# --- G7: L3 primitives 层零玩法名 ---
+
+def l3_project(tmp, src=None, inc=None):
+    """造只含 L3 目录的最小树。"""
+    files = {}
+    for rel, txt in (src or {}).items():
+        files[os.path.join("src", "primitives", rel)] = txt
+    for rel, txt in (inc or {}).items():
+        files[os.path.join("include", "magicblocks", "primitives", rel)] = txt
+    for rel, txt in files.items():
+        path = os.path.join(tmp, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(txt)
+    return tmp
+
+
+class GateL3NoGameplayNamesTest(unittest.TestCase):
+    """G7: L3 底座不得知道玩法叫什么。"""
+
+    def test_compliant_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            l3_project(tmp, src={"camera.cpp": "float f(){ return 1.0f; }"})
+            rc, out = run(check_l3_no_gameplay_names, tmp)
+            self.assertEqual(rc, 0, out)
+
+    def test_voxel_in_src_fails(self):
+        """voxel 是玩法名, 出现在 L3 源码里即违规。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            l3_project(tmp, src={"world.cpp": "int build_voxel_scene(){ return 0; }"})
+            rc, out = run(check_l3_no_gameplay_names, tmp)
+            self.assertEqual(rc, 1, out)
+            self.assertIn("voxel", out.lower())
+
+    def test_camel_case_name_fails(self):
+        """驼峰必须切: VoxelCamera -> [voxel, camera]。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            l3_project(tmp, inc={"camera.h": "struct VoxelCamera {};"})
+            rc, out = run(check_l3_no_gameplay_names, tmp)
+            self.assertEqual(rc, 1, out)
+
+    def test_chinese_name_in_code_fails(self):
+        """中文玩法名出现在代码里即违规。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            l3_project(tmp, src={"overlay2d.cpp": "int 画积木格子(){ return 0; }"})
+            rc, out = run(check_l3_no_gameplay_names, tmp)
+            self.assertEqual(rc, 1, out)
+
+    def test_chinese_name_in_comment_allowed(self):
+        """注释里提到玩法名是合法的(说明文字, 不是代码)。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            l3_project(tmp, src={"overlay2d.cpp": "// 画积木格子"})
+            rc, out = run(check_l3_no_gameplay_names, tmp)
+            self.assertEqual(rc, 0, out)
+
+    def test_arena_blocks_allowlisted(self):
+        """arena 的 blocks_ 是内存块, 必须放行。"""
+        txt = "struct Arena { std::vector<Block> blocks_; };\n"
+        txt += "void f(Arena& a){ for (Block& b : a.blocks_) { (void)b; } }\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            l3_project(tmp, src={"alloc.cpp": txt})
+            rc, out = run(check_l3_no_gameplay_names, tmp)
+            self.assertEqual(rc, 0, out)
+
+    def test_blocks_compound_is_tolerated_by_design(self):
+        """已知边界: blocks_gameplay 切词后 [blocks, gameplay],
+        blocks 在白名单内所以放行 —— 这是白名单的代价: 宁可放行少数
+        装饰性组合, 也不能因误报把整条规则关掉。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            l3_project(tmp, src={"world.cpp": "int blocks_gameplay(){ return 0; }"})
+            rc, out = run(check_l3_no_gameplay_names, tmp)
+            self.assertEqual(rc, 0, out)
+
+    def test_magicblocks_namespace_allowlisted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            l3_project(tmp, src={"types.cpp": "namespace magicblocks { }"})
+            rc, out = run(check_l3_no_gameplay_names, tmp)
+            self.assertEqual(rc, 0, out)
+
+    def test_features_dir_not_scanned(self):
+        """features 层允许有玩法名 —— G7 只管 L3。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            l3_project(tmp)
+            path = os.path.join(tmp, "src", "features", "sketch", "doc.cpp")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("int sketch_voxel(){ return 0; }")
+            rc, out = run(check_l3_no_gameplay_names, tmp)
+            self.assertEqual(rc, 0, out)
+
+
+# --- G8: L3 命令流对等性 ---
+
+class GateL3CommandParityTest(unittest.TestCase):
+    """G8: L3 不得直接碰 Vulkan 命令流/读回。"""
+
+    def test_compliant_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            l3_project(tmp, src={"camera.cpp": "float f(){ return 1.0f; }"})
+            rc, out = run(check_l3_command_parity, tmp)
+            self.assertEqual(rc, 0, out)
+
+    def test_backend_include_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            l3_project(tmp, src={"renderer.cpp": "#include " + chr(34) + "backend/vulkan/vulkan_device.h" + chr(34)})
+            rc, out = run(check_l3_command_parity, tmp)
+            self.assertEqual(rc, 1, out)
+
+    def test_vulkan_type_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            l3_project(tmp, inc={"renderer.h": "struct A { VkImage img; };"})
+            rc, out = run(check_l3_command_parity, tmp)
+            self.assertEqual(rc, 1, out)
+
+    def test_vulkan_call_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            l3_project(tmp, src={"mesh.cpp": "void f(){ vkCmdDraw(); }"})
+            rc, out = run(check_l3_command_parity, tmp)
+            self.assertEqual(rc, 1, out)
+
+    def test_raw_readback_fails(self):
+        """裸 vkMapMemory/等待会 stall 整帧, 必须拦。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            l3_project(tmp, src={"picker.cpp": "void f(){ vkMapMemory(); }"})
+            rc, out = run(check_l3_command_parity, tmp)
+            self.assertEqual(rc, 1, out)
+
+    def test_features_dir_not_scanned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            l3_project(tmp)
+            path = os.path.join(tmp, "src", "features", "sketch", "r.cpp")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("void f(){ vkCmdDraw(); }")
 
 if __name__ == "__main__":
     unittest.main()

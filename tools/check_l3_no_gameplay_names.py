@@ -66,6 +66,9 @@ IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # 分词用:**按非字母数字切**,`_` 也当分隔符。
 # 这样 `is_voxel_scene` → [is, voxel, scene],`blocks_` → [blocks]。
 ALNUM_RE = re.compile(r"[A-Za-z0-9]+")
+# 驼峰边界：`VoxelCamera` → [Voxel, Camera]。
+# 不切的话只有 `VoxelCamera` 一个整词，`voxel` 永远匹配不到。
+CAMEL_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+")
 
 # 英文玩法名的集合(小写),供分词后比对
 GAMEPLAY_NAMES_LOWER = {n.lower() for n in GAMEPLAY_NAMES if n.isascii()}
@@ -128,7 +131,10 @@ def scan_file(path):
         #   整行匹配会把两者混为一谈 → alloc.cpp 报 7 处误报 → 规则被迫关掉。
         #   按词比对时可以用 ALLOWED_IDENTIFIERS 精确放行 `block`/`blocks`,
         #   而 `blocks_gameplay` 这类新名字仍会被抓。
-        words = [w.lower() for w in ALNUM_RE.findall(cleaned)]
+        words = []
+        for tok in ALNUM_RE.findall(cleaned):
+            words.extend(CAMEL_RE.findall(tok))
+        words = [w.lower() for w in words]
         hit = None
         for w in words:
             if w in ALLOWED_IDENTIFIERS:
