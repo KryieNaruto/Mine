@@ -255,3 +255,134 @@ kNonPlanarFace/kConcaveFace/kTooLarge`。
 （`IMesh` / `ICamera` / `IMaterial` / `IPicker` / `IOverlay2D` / `IBatchBuilder`）。
 
 落笔走**格点吸附**（spec 的 A 方案），不做 FreeFloat。
+
+---
+
+# L4 F-VX 魔法叠叠乐 交付记录
+
+> 对应设计：`docs/superpowers/specs/2026-11-09-magicblocks-l4-fvx-stack-design.md`
+> 对应计划：`docs/superpowers/plans/2026-11-09-magicblocks-l4-fvx.md`
+> 交付日期：2026-11-10　　分支：`l4-fvx` → 合入 `main`
+
+## 总览
+
+| 阶段 | 内容 | 新增用例 |
+|---|---|---|
+| 0 | 基线校准（主分支当时不可构建，先补齐才能开工） | 0 |
+| 1 | `Cell` / `Block`(24B) / `GridSpec` / `IBlockSet` 纯 CPU 数据模型 | 15 |
+| 2 | `IBlockBrush` 笔刷链（射线→吸附→DDA→去重）+ 层锁 | 19 |
+| 3 | 双 pass 渲染（表面 pass + 内面 pass），**全仓首个 `with_depth=true` 公共 API 像素回归** | 6 |
+| 4 | `IOverlay2D` 网格绘制 | 8 |
+| 5 | 颜色模式 + `IShapeTemplate` | 14 |
+| 6 | CLI `stack` 子命令 + 离屏 PNG 出图 | 10 |
+| 7 | 命令模式三态校验（哈希 + 像素）+ G3/G7 门控 | 11 |
+| — | D-VX-5 内面排序契约补齐 | 4 |
+
+**测试基线：489/489 ctest 全绿，0 失败 0 跳过**（`ctest --test-dir build -j 1`）。
+其中 L4 F-VX 新增 **87** 条。L0–L3 与 UI 消费层**零改动**（`git diff` 对
+`include/magicblocks/{device,resources,scene,primitives}/` 与
+`src/{backend,resources,scene,primitives}/` 全空）。
+
+## 交付物
+
+### 头文件（`include/magicblocks/features/stack/`）
+
+| 文件 | 内容 |
+|---|---|
+| `stack_types.h` | `Cell`(int32 x,y,z) / `Block`(24B, `static_assert`) / `GridSpec` / `Stroke` / `CellOrder{Index,YZX}` / `CellOrderLess` |
+| `block_set.h` | `IBlockSet`：SOA 线性数组真源 + `unordered_map<Cell>` 派生索引（**只做查重，不参与输出序**） |
+| `block_brush.h` | `IBlockBrush`：`ray→snap→DDA→dedupe`，层锁 |
+| `color_mode.h` | 颜色模式（by-layer / 黄金分割默认色板 / 单色） |
+| `shape_template.h` | `IShapeTemplate`（柱 / 台阶 / 空心框等） |
+| `grid_overlay.h` | 网格叠层，走 `IOverlay2D` 通用能力 |
+| `stack_render.h` | `StackRenderDesc` / `StackFrameDesc`（持 `float view_proj[16]`）/ 双 pass 描述 |
+
+### 源文件（`src/features/stack/`）
+
+`block_set.cpp` / `block_brush.cpp` / `color_mode.cpp` / `shape_template.cpp` /
+`grid_overlay.cpp` / `stack_render.cpp`
+
+### 测试
+
+- `tests/magicblocks_l4_stack_test.cpp` — 数据模型 / 笔刷 / 渲染 / 叠层 / 颜色 / 模板
+- `tests/magicblocks_l4_stack_command_test.cpp` — 命令模式三态 + 门控
+
+### CLI
+
+`magicblocks-l3-cli stack`，参数：`--width --height --layers --strokes --column-height
+--color-mode --grid --out`。
+例：`stack --width 480 --height 360 --layers 6 --strokes 4 --column-height 2 --color-mode by-layer`
+→ `[stack] 笔画 4 | 方块 210 → 合批 2 (pass 2) | drawcall 2 管线切换 2 | doc_hash=0d98ebb1723ef103 inst=210`
+
+## 关键设计裁定（落地时必须守着）
+
+| 编号 | 裁定 | 依据 |
+|---|---|---|
+| D-VX-4′ | `depthConstWrite` **全面禁用** —— 不设、不开 CLI 参数、不作为验收项。内面正确性靠 `depthTest=false` + `cull=None` + **排在表面 pass 之后** + `depthWrite=true` | 实测该字段语义与设计假设不符（`depth_const=0.0` 与 `1.0` 两个用例互相矛盾），不能作为正确性依赖 |
+| D-VX-5 | 内面实例按 `(y,z,x)` 升序 = `CellOrder::YZX`；表面按 `Index` | 内面 pass 关深度测试，绘制顺序即遮挡顺序；不排序则内面像素取决于落笔历史 |
+| D-VX-8′ | L4 **禁止**调用 `create_pipeline_for_shape`（backend 私有）；两条 pass 都走公共 `create_pipeline(desc)` | 避免为玩法开专用通道 |
+| E-VX-3 | `Block` 独立定义 24B（`Cell`4×3 + `color`4 + `stroke_id`4 + `flags`4），**不复用** L3 类型 | L3 根本没有 `Block` 类型 |
+
+## 踩过的坑（本轮新增，均已留痕）
+
+### E. 同一秒、同一 exit=0、文件存在，但图是空的 ⚠️
+
+三张 320×200 的 PNG **字节数完全相同**（256283）、`exit=0`、文件都在，
+但几何被压成 251×6 的扁条 —— 相机 `(4.2,3.6,5.0)→(0,0.9,0)` 把物体推出了视锥底部。
+**教训：同字节数 ≠ 同内容。** 验收必须比内容（包围盒 / 前景像素占比 / 颜色数），
+不能只看文件大小和退出码。改相机到 `(9,7,9)→(0,1.2,0)` 后 bbox 变为 102×58。
+
+### F. 单实例 per-instance buffer 绑定会静默丢数据
+
+`primitives/primitive_renderer.cpp:102` 只在 `instance_count > 1` 时绑 binding 1。
+一个只有 1 个方块的柱体 → 实例数据根本不进管线，**无报错、出空图**。
+L4 处理：`kMinInstanceCount` pad 到 ≥2，并二次校验；`instance_count()` 内两份长度
+不一致时直接 `assert`（`stack_render.cpp:332-340`）。
+
+### G. `commit()` 是整笔原子，批量堆叠不能用它
+
+`IBlockBrush::commit` 遇已占格**整笔失败**（给交互落笔设计的语义）。CLI 批量堆叠
+跨笔重叠是正常形态，所以 CLI 自己过滤已占格后走 `add_stroke`，**没有改 `commit` 语义**。
+
+### H. 序列化 `%u` 写 / `strtol` 读会把高位吃掉
+
+`0xAABBCCDD = 2864434397 > INT32_MAX`，`strtol` 置 `ERANGE` 截断 → 往返后流哈希变化。
+改用 `num_u32()`（`strtoull`）。
+
+### I. 门禁用例自己会“假通过”
+
+三种假通过：GBK 中文输出被吞（加 `PYTHONIOENCODING=utf-8`）、`cmd /c` 内联引号导致
+脚本没跑（改临时 `.py` 文件）、**扫描根本没跑起来也算 exit 0**（加 `N > 0` 反向断言）。
+
+### J. G7 门禁分词漏检（L0–L3 既有门禁缺陷，本轮修复）
+
+`tools/check_l3_no_gameplay_names.py:68` 原 `ALNUM_RE = r"[A-Za-z0-9]+"` 只按字母数字切词，
+`VoxelCamera` 是一个整词，`voxel` 永远匹配不到 → 玩法名从驼峰标识符泄漏出去不被发现。
+已补 `CAMEL_RE = r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+"` 二次切分（commit `ddc483c`），
+selftest 43/43 通过，真实 L3 代码 32 文件无误报。
+
+## 遗留技术债（L0–L3 既有问题，非本轮引入）
+
+| 编号 | 问题 | 影响 |
+|---|---|---|
+| **T1** | `src/primitives/mesh.cpp:96-97` `create_mesh()` 用 `write()` 而非 `upload()+flush_pending()`，设备页缓冲上必然返回 `nullptr` | **真实功能缺陷**。目前全仓零调用者（仅定义在 `mesh.cpp:84` / `mesh.h:119`），尚未暴露；一旦有人用就必崩 |
+| T2 | `Vertex/Index/Uniform/Storage` 在 device 页、CPU 不可映射，`write()` 返回 `Unsupported`，必须 `upload()`+`flush_pending()` | 漏 flush → GPU 读全 0 → 静默空白图，无报错 |
+| T3 | `memory_allocator` 不自动扩页 | 须先 `reserve_pages(kind, N)`，否则上传失败 |
+| T4 | `CameraSnapshot` 取不出 view-proj 矩阵 | L4 `StackFrameDesc` 只能直接携带 `float view_proj[16]` |
+| T5 | 命令流只记 buffer handle，buffer 必须活到 `submit_command_list` 之后 | 提前析构 → Access violation。L4 改为出参 `OverlayBuffers*` 持有 |
+| T6 | `IBlockBrush::commit` 原子语义（见坑 G） | 交互落笔可用，批量场景需绕开 |
+| T7 | `pick_layer_for_ray` 恒给顶层（已修选层判据方向，但“恒顶层”的取交逻辑仍在） | CLI 改为逐笔显式 `layer_lock().lock()` |
+| T8 | `IBlockSet` 无 `grid()` 访问器 | 需显式传递：`attach(set, grid)` / `replay(stream, set, grid)` |
+| T9 | `magicblocks-l3-cli` 无 CTest 注册条目 | CLI 行为只靠独立用例覆盖，不进 ctest 矩阵 |
+
+## 环境级事故记录
+
+- **`3b06df0` 分支本身不可构建**：该提交在 `CMakeLists.txt:431` 注册了
+  `tests/magicblocks_l4_stack_command_test.cpp`，但文件要到 `f71d54d` 才存在 →
+  `CMake Error: Cannot find source file`。`af8b526` 补入后 main 才恢复可配置。
+- **陈旧目标文件造成 66 条 SEH 假失败**：`MagicBlocks/build/` 被 C++（Ninja/CMake）与
+  并发会话的 Android Gradle **共用**，混入陈旧目标文件后 L0 出现大批
+  `0xc0000005` / `Access violation - no RTTI data!`。只删 C++ 子项
+  （`build/CMakeFiles`、`CMakeCache.txt`、`build.ninja`、`.ninja_*`、
+  `cmake_install.cmake`、`CTestTestfile.cmake`，**不能删 `build/tmp/`**）后全量重建，
+  489/489 恢复全绿。教训：`build/` 共用目录时不要 `rm -rf build`，也不要相信增量重建的测试结果。

@@ -26,8 +26,8 @@
 | **L1** | `resources/` 资源层 + VMA 分页分配器 + ICommandList | ✅ **已完成**（20 用例全绿） |
 | **L2** | scene / 渲染图 / 命令流录制回放 | ✅ **已完成**（123 用例，1 例已知失败） |
 | **UI 消费层** | Presenter 状态机 / HUD / 输入路由 / 离屏出图 | ✅ **已完成**（3 张 golden） |
-| L3 | primitives（相机/ECS/材质/合批/画笔/覆盖层/拾取/Gizmo/图元/OBJ/BVH） | ✅ **M1~M5 全部完成**（389/389 用例全绿，含 L4 新增）→ [L3_DELIVERY.md](L3_DELIVERY.md) |
-| L4 | features（玩法层，**唯一允许出现玩法名**的地方） | 🟡 **F-SK 涂鸦基座已完成**（389/389 全绿）→ [F-SK 设计](../../docs/superpowers/specs/2026-11-05-magicblocks-l4-fsk-sketch-design.md) |
+| L3 | primitives（相机/ECS/材质/合批/画笔/覆盖层/拾取/Gizmo/图元/OBJ/BVH） | ✅ **M1~M5 全部完成** → [L3_DELIVERY.md](L3_DELIVERY.md) |
+| L4 | features（玩法层，**唯一允许出现玩法名**的地方） | ✅ **F-SK 涂鸦** + ✅ **F-VX 魔法叠叠乐**（489/489 用例全绿，0 失败 0 跳过）→ [F-SK 设计](../../docs/superpowers/specs/2026-11-05-magicblocks-l4-fsk-sketch-design.md)、[F-VX 设计](../../docs/superpowers/specs/2026-11-09-magicblocks-l4-fvx-stack-design.md) |
 
 > **定位裁定（R-1，2026-11-03）**：SDK 是 **"计算/几何库 + 离屏渲染器"**，上屏与控件 UI 移交
 > 平台壳层（Android SurfaceView + Compose）。已落地的 `ISwapchain` / `Presenter` /
