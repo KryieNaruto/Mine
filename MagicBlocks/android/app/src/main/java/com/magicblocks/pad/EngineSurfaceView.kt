@@ -269,17 +269,49 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
     }
 
     // ================================================================ 触摸
+    //
+    // 只重写 onTouchEvent 会有**死区**：手指刚按下时，Android 的触摸分发会先把
+    // ACTION_DOWN 发给这条链上的父容器（FrameLayout → 各种系统容器），只有当
+    // 位移超过系统的 touch slop 后，`onTouchEvent` 才会开始收到 MOVE。结果是
+    // "按下 → 前 8~24dp 完全没反应"，也就是用户说的"左右拖动还有阈值"。
+    //
+    // 真正能做到**零延迟**的只有 dispatchTouchEvent：它在 View 自己的
+    // dispatch 入口，先于任何 slop 判定，ACTION_DOWN 一进来就能拿到。
+    // 所以：
+    //   * ACTION_DOWN 在 dispatchTouchEvent 里**直接**处理（锚定 + 抢占）；
+    //   * 之后的 MOVE / UP 再到 onTouchEvent 里正常走；
+    //   * onTouchEvent 里保留一份 DOWN 处理，作为"父容器自己把事件转回本 View"
+    //     时的兜底，两条路径都幂等（stopFling / 重设锚点不会产生副作用）。
+
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (ev.actionMasked == MotionEvent.ACTION_DOWN) {
+            beginGesture(ev)
+        }
+        // 必须**无条件**返回 true：View 的默认实现只有在已注册触摸监听
+        // （OnTouchListener / onTouchEvent 重写且返回 true 且 clickable）时才
+        // 认领事件。这里显式认领，保证 ACTION_DOWN 之后整条手势都被本 View 独占。
+        super.dispatchTouchEvent(ev)
+        return true
+    }
+
+    /** 按下：掐断惯性、把锚点摆到手指位置。可重复调用。 */
+    private fun beginGesture(event: MotionEvent) {
+        stopFling()                       // 手指一落下就掐断惯性（"抓住"画面）
+        lastX = event.x
+        lastY = event.y
+        lastPinchDist = 0f
+        lastFocusX = event.x
+        lastFocusY = event.y
+        beginTrack(event)
+    }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                stopFling()                       // 手指一落下就掐断惯性（"抓住"画面）
-                lastX = event.x
-                lastY = event.y
-                lastPinchDist = 0f
-                lastFocusX = event.x
-                lastFocusY = event.y
-                beginTrack(event)
+                // 兜底路径：dispatchTouchEvent 已经处理过时会重复调用这里，
+                // beginGesture 幂等，所以不需要加标志位。
+                beginGesture(event)
+                return true
             }
 
             MotionEvent.ACTION_POINTER_DOWN -> {
@@ -330,11 +362,11 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
     }
 
     /**
-     * 单指：拖动 = 旋转。
+     * 单指：拖动 = **环绕摄像机检视模型**（不是转物体本身）。
      *
      * 映射约定（**屏幕**方向 → **视觉**方向，与 MainActivity 的横屏锁定配套）：
-     *   屏幕左右滑 → 左右转（yaw，绕世界 Y 轴）
-     *   屏幕上下滑 → 上下转（pitch，绕世界 X 轴）
+     *   屏幕左右滑 → 相机绕世界 Y 轴绕行（yaw）
+     *   屏幕上下滑 → 相机绕世界 X 轴俯仰（pitch）
      *
      * 为什么方向按"物理屏幕"算而不是直接拿 MotionEvent 的 x/y：
      * 这台 pad 是横屏应用但面板物理竖置（SurfaceFlinger 会做 ROTATE_90）。
@@ -342,6 +374,10 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
      * 坐标系，而用户看到的画面是**物理竖屏**排布 —— 手指在物理屏上左右滑，
      * 事件里给出的却是一截 dY。不做换算，就会出现"左右拖像上下转"。
      * 换算表由 [displayRotation] 给出（Activity 用 [setRotationListener] 同步）。
+     *
+     * 这里**没有**任何阈值/死区：按下即锚定，之后每一像素位移都立刻换算成角度。
+     * （曾经靠 ACTION_MOVE 是否到达来"意外"产生一段死区，已在 distributeEvent
+     *  里修掉，见那里的说明。）
      */
     private fun handleOneFinger(event: MotionEvent) {
         val dx = event.x - lastX
@@ -355,21 +391,23 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
     }
 
     /**
-     * 把一截**逻辑坐标**下的位移换算成视觉上的旋转量。
+     * 把一截**逻辑坐标**下的位移换算成视觉上的相机环绕量。
      *
      * displayRotation 是 Display.getRotation()：
      *   0/180（逻辑横屏，与物理排布一致）→ 直接用
      *   90/270（图片被转了 90°，事件仍按逻辑横屏上报）→ 交换 x/y
      *
-     * 交换的理由见 [handleOneFinger]。这里只交换坐标，**不**在 C++ 侧做任何轴互换
-     * —— 轴向映射只写一处，写两遍迟早会互相抵消出一个新 bug。
+     * 符号：两个方向都写成"元素往哪边推，画面就往哪边动"（跟手）。
+     *   vx > 0（往右推）→ yaw -= ：相机往左绕，物体看起来跟着手指往右转
+     *   vy > 0（往下推）→ pitch +=：相机抬高，从上方俯视，顶面露出、物体下移
+     * 物体本身在世界里不动，动的永远是摄像机（见 scene_renderer.cpp record_into）。
      */
     private fun applyRotationDelta(dx: Float, dy: Float) {
         val swapped = displayRotation == Surface.ROTATION_90 || displayRotation == Surface.ROTATION_270
         val vx = if (swapped) dy else dx   // 视觉水平位移
         val vy = if (swapped) dx else dy   // 视觉垂直位移
-        // ROT_PER_PX 是弧度/像素：拖过整个屏幕宽度大约转半圈
-        yaw += vx * ROT_PER_PX
+        // ROT_PER_PX 是弧度/像素：拖过整个屏幕高度大约转 130°
+        yaw -= vx * ROT_PER_PX
         pitch += vy * ROT_PER_PX
         pitch = pitch.coerceIn(-PITCH_LIMIT, PITCH_LIMIT)
     }
@@ -682,9 +720,11 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         const val CAM_DIST = 2.6f
         const val FOV_Y_RAD = (60.0 * Math.PI / 180.0).toFloat()
 
-        // 旋转：0.006 rad/px，拖过整个屏幕宽度大约转 130°
+        // 相机环绕灵敏度：0.006 rad/px ≈ 0.34°/px。
+        // 拖过 1440 逻辑像素（= 屏幕上 2160 物理像素的高度）约转 130°，
+        // 拖过 900 像素约转 80° —— 一个模型转一圈在 2~3 次拖动的量级。
         const val ROT_PER_PX = 0.006f
-        const val PITCH_LIMIT = 1.4835f   // ±85°
+        const val PITCH_LIMIT = 1.4835f   // ±85°：再往上 up 向量会退化
 
         // 缩放
         const val MIN_SCALE = 0.35f

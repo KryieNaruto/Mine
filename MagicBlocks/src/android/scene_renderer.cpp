@@ -350,16 +350,47 @@ bool SceneRenderer::record_into(dev::IRenderTarget* target, float yaw, float pit
   if (!cr.ok()) return fail("创建命令列表失败: " + cr.message());
   res::ICommandList* cmd = cr.value().get();
 
-  // 相机：eye 随 scale 拉远/拉近（双指缩放就是改这个距离）。
+  // ==========================================================================
+  // 相机环绕（orbit）：转的是**摄像机**，物体在世界里一动不动
+  // ==========================================================================
   //
-  // 平移（pan）通过**移动相机**实现，而不是移动模型：相机和物体一起偏移，
-  // 画面就往反方向滑，手感与"拖动画面"一致。pan_x/pan_y 是世界空间偏移，
-  // Kotlin 侧已按当前可视宽度换算好，所以不同缩放下"跟手"程度一致。
+  // 之前这里是"模型矩阵 = rot_yaw * rot_pitch"，也就是转物体本身。两者在
+  // 单个静止物体上看着几乎一样，但在手感上是两回事：
+  //   * 转物体：先绕 Y 再绕 X，两次旋转不交换，两个轴会互相污染 ——
+  //     上下拖到底之后，左右拖看起来就不是干净的水平转了；
+  //   * 转相机：把视线方向做成 (yaw, pitch) 的球面参数，横竖两个方向
+  //     互相独立，拖动方向永远等于画面转动的方向，这才是"检视一个模型"。
+  //
+  // 球面参数（y 轴向上，相机在 z>0 一侧看向原点）：
+  //   eye = target + dist * (cos(pitch)sin(yaw), sin(pitch), cos(pitch)cos(yaw))
+  // yaw = 0、pitch = 0 时 eye = (0,0,dist)，就是正视图。
+  //
+  // 拖动方向（屏幕像素 → 世界角）：
+  //   向下拖 → pitch 增大 → eye 抬高、从上方俯视   （"抓画面"方向：画面跟手）
+  //   向右拖 → yaw 增大   → eye 绕到物体右侧        （见下）
+  //
+  // 关于左右：eye 在 +x 侧时看到的是物体的**右侧面**，球面上的 yaw 正方向
+  // 对应"手也往右推"。这一条与纵轴相反（纵轴要让可见面"跟手"必须写成
+  // eye 抬高），不是笔误：竖直方向按"旋转方向跟手"，水平方向按"位置跟手"。
+  //
+  // 双指缩放改的是 dist；双指平移改的是 target（pan_x/pan_y 是世界空间偏移，
+  // Kotlin 侧已按当前可视宽度换算，所以不同缩放下"跟手"程度一致）。
+  //
+  // up 向量必须**逐帧**用 cam_up 算，不能写死 (0,1,0)：pitch 到 ±90° 时
+  // 视线与 (0,1,0) 平行，look_at 里的叉乘会退化成零向量，画面直接消失。
+  // 这里的 cam_up 是"每帧把世界 Y 投影到垂直于视线的平面"，俯视/仰视都稳。
   const float dist = 2.6f / (scale > 0.05f ? scale : 0.05f);
-  const prim::Vec3 eye{pan_x, pan_y, dist};
-  const prim::Vec3 center{pan_x, pan_y, 0.f};
-  const prim::Vec3 up{0.f, 1.f, 0.f};
-  const prim::Mat4 view = prim::make_look_at(eye, center, up);
+  const prim::Vec3 orbit_center{pan_x, pan_y, 0.f};
+  // to_eye：从环绕中心指向相机的**单位**向量。eye = orbit_center + dist * to_eye。
+  const float sp = std::sin(pitch), cp = std::cos(pitch);
+  const prim::Vec3 to_eye{cp * std::sin(yaw), sp, cp * std::cos(yaw)};
+  const prim::Vec3 eye{orbit_center.x + dist * to_eye.x, orbit_center.y + dist * to_eye.y,
+                       orbit_center.z + dist * to_eye.z};
+  // up = Y - (Y·to_eye) * to_eye：世界 Y 去掉沿视线的分量，与视线正交。
+  // pitch 夹在 ±85°，cp ≥ 0.087，所以这个向量绝不会退化成零。
+  const float k = to_eye.y;
+  const prim::Vec3 cam_up{-k * to_eye.x, 1.f - k * to_eye.y, -k * to_eye.z};
+  const prim::Mat4 view = prim::make_look_at(eye, orbit_center, cam_up);
 
   // 投影宽高比必须用**屏幕上实际呈现**的尺寸，而不是 swapchain image 的尺寸。
   //
@@ -376,38 +407,18 @@ bool SceneRenderer::record_into(dev::IRenderTarget* target, float yaw, float pit
   const prim::Mat4 proj = prim::make_perspective(60.f * kPi / 180.f, aspect, 0.1f, 100.f);
   const prim::Mat4 view_proj = proj * view;
 
-  // 模型矩阵：先 pitch（绕 X）再 yaw（绕 Y）—— 即"拖动旋转"。
+  // 模型矩阵：**恒等**。物体待在世界原点不动，旋转全部由上面的相机实现。
   //
-  // ==========================================================================
-  // 轴映射：yaw **恒**绕 Y（左右转），pitch **恒**绕 X（上下转），不随屏幕旋转互换
-  // ==========================================================================
+  // 这里曾经是 `world = rot_yaw * rot_pitch`（转物体）。改掉的两个理由：
+  //   1. 转物体时两次旋转不交换 —— pitch 一大幅度，yaw 的表现就不再是干净的
+  //      水平转，横竖两个方向互相污染；
+  //   2. 用户要的是"摄像机检视模型"，不是"把模型拎起来转"：转相机时拖动方向
+  //      恒等于画面转动方向，这才是看模型该有的手感。
   //
-  // 这里曾经按 `rot90 ? 互换 : 不互换` 做映射，注释的理由是"image 空间被转了 90°，
-  // 屏幕的 dX 在 image 里是纵向"。那个推理是错的，实测（真机 MDP1221，ROTATE_90）
-  // 表现为**左右拖 → 上下转、上下拖 → 左右转**，正好是用户反馈的那个 bug：
-  //
-  //   * 渲染始终发生在**未旋转的 image 空间**里：yaw 绕世界 Y 轴转，画面上就是绕
-  //     竖直轴转，呈现出来就是"左右转"；pitch 绕世界 X 轴转，就是"上下翻"。
-  //   * 设备把 image 旋转 90° 后铺到屏幕上，旋转矩阵是 [0,0,1; 0,-1,0] —— 它只
-  //     作用于**最终像素**，对"哪根轴在画面上显得竖直"没有影响。
-  //   * 手指的 dX/dY 是**屏幕空间**的，而 Kotlin 侧已经把屏幕坐标换算成了"绕世界 Y
-  //     多少弧度 / 绕世界 X 多少弧度"（EngineSurfaceView.rotateByScreenPixels），
-  //     这里拿到的 yaw/pitch 已经是**世界轴**的量。
-  //
-  //   因此这里若再交换一次，就是在已经正确的量上又转了一次 → 两个方向同时错位。
-  //   宽高比那里仍然要用 rot90（那是关于"屏幕像素密度"的，与轴向无关，见上）。
-  //
-  // 若以后要支持"投射方向固定"（Activity 改成 sensorLandscape），需要的是把屏幕
-  // 上的物理方向换算成逻辑方向（Kotlin 侧按 Display.rotation 做），而不是在这里
-  // 交换轴 —— 因为输出空间可能被翻转（ROTATE_180 也是 FLIP_H|FLIP_V）。
-  const float rot_x = pitch;  // 绕 X 轴：上下翻
-  const float rot_y = yaw;    // 绕 Y 轴：左右转
-
-  const prim::Mat4 rot_pitch =
-      prim::make_rotation_quat(std::sin(rot_x * 0.5f), 0.f, 0.f, std::cos(rot_x * 0.5f));
-  const prim::Mat4 rot_yaw =
-      prim::make_rotation_quat(0.f, std::sin(rot_y * 0.5f), 0.f, std::cos(rot_y * 0.5f));
-  const prim::Mat4 world = rot_yaw * rot_pitch;
+  // 别把 yaw/pitch 又搬回这里 —— 那会让轴向依赖重新分散到两个文件里。
+  // OBJ 加载时已经做过归一化（ModelNormalize），模型本身就落在原点附近、
+  // 尺寸约等于单位球，所以恒等矩阵下的取景与内置立方体一致。
+  const prim::Mat4 world = prim::Mat4::identity();
 
   PushConstants pc{};
   std::memcpy(pc.view_proj, view_proj.m, sizeof(pc.view_proj));
