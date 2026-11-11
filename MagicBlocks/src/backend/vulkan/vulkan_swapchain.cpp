@@ -367,18 +367,25 @@ ISwapchain::ImageResult VulkanSwapchain::acquire_next_image() {
   }
 
   // 用 fence 保证 GPU 已经把旧帧用完再覆盖这张图。
-  // 超时给 1 秒:UI 线程不允许永久阻塞,超时就如实报失败让上层决定。
   //
   // ⚠️ 传进 vkAcquireNextImageKHR 的 fence 在调用时必须处于 **unsignaled**
   // 状态(VUID-vkAcquireNextImageKHR-fence-01287)。上一次 acquire 会把它置为
   // signaled,所以每次 acquire 前必须先 wait 再 reset,否则校验层每轮报错。
-  if (acquire_fence_ != VK_NULL_HANDLE) {
-    vkWaitForFences(ctx_.device, 1, &acquire_fence_, VK_TRUE, 1'000'000'000ull);
-    vkResetFences(ctx_.device, 1, &acquire_fence_);
-  }
+  //
+  // 真机卡 1 秒的根因就在下面这两个等待上(2026-11-11):
+  //   fence 建时带 SIGNALED(首帧不该等),于是第一轮 wait 立刻过、reset 后
+  //   交给 vkAcquireNextImageKHR。但该调用在"有图可拿"时是**立即返回**的,
+  //   并不保证把 fence 置为 signaled —— 驱动把信号化留给了真正完成的那一刻。
+  //   下一轮再 wait 就等满 1000ms 超时。表现为稳定 1fps,且 CPU 几乎不耗
+  //   (全在 vkWaitForFences 里睡),极易被误判成"渲染慢"。
+  // 正解:图可用性本来就不需要 fence 守 —— vkAcquireNextImageKHR 返回成功
+  //   就意味着这张图已经归我们独占并且 GPU 早已用完它。真正要等的是
+  //   **上一帧的呈现**完成,那由 present 的 fence 负责,不该塞进 acquire。
+  //   所以这里**不传 fence**(传 VK_NULL_HANDLE),下面的两个 wait 一并删掉。
+  //   acquire 内部实现同步,调用方拿到的图即可直接写。
   std::uint32_t idx = 0;
   const VkResult r = vkAcquireNextImageKHR(ctx_.device, swapchain_, 1'000'000'000ull,
-                                           VK_NULL_HANDLE, acquire_fence_, &idx);
+                                           VK_NULL_HANDLE, VK_NULL_HANDLE, &idx);
   if (r == VK_ERROR_OUT_OF_DATE_KHR) {
     out.status = ImageStatus::OutOfDate;
     out.message = "acquire: OUT_OF_DATE";
@@ -401,11 +408,8 @@ ISwapchain::ImageResult VulkanSwapchain::acquire_next_image() {
     return out;
   }
 
-  // 等上一帧的 GPU 工作结束,这样这张 image 可以立刻被覆盖写。
-  if (acquire_fence_ != VK_NULL_HANDLE) {
-    vkWaitForFences(ctx_.device, 1, &acquire_fence_, VK_TRUE, 1'000'000'000ull);
-    vkResetFences(ctx_.device, 1, &acquire_fence_);
-  }
+  // 不再需要 post-acquire 的 fence 等待:vkAcquireNextImageKHR 成功返回
+  // 即代表这张图已独占且 GPU 用完,可以直接覆盖写(理由见上面的长注释)。
 
   if (idx >= views_.size()) {
     out.status = ImageStatus::Failed;
