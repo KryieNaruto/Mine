@@ -68,8 +68,7 @@ VkIndexType to_vk_index(IndexFormat f) {
   return f == IndexFormat::UInt16 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
 }
 
-// begin_pass 的附件形状(与 vulkan_pipeline.cpp 的 create_render_pass 同口径:
-// color 恒 RGBA8;有深度附件时第二张附件挂 D16;MSAA 时再追加一张 resolve)。
+// begin_pass 的附件形状(与 vulkan_pipeline.cpp 的 create_render_pass 同口径:// color 恒 RGBA8;有深度附件时第二张附件挂 D16;MSAA 时再追加一张 resolve)。
 struct PassShape {
   VkFormat color_format = VK_FORMAT_R8G8B8A8_UNORM;
   bool has_depth = false;
@@ -81,6 +80,19 @@ struct PassShape {
   // PRESENT_SRC_KHR 布局，present 之前也必须回到 PRESENT_SRC_KHR，
   // 否则 vkQueuePresentKHR 会因为布局不符而丢帧（哪怕图已经画好了）。
   bool from_swapchain = false;
+  // 颜色附件是否在 begin_pass 时 clear。
+  //
+  // ⚠️ 这**不是**装饰性字段:它直接决定 loadOp。
+  // 同一帧内多个 pass 画到**同一个 target**(F-VX 的表面 pass → 内面 pass → 网格
+  // 指示 pass)时,只有第一个 pass 该 clear,后面两个必须 LOAD —— 否则第二个
+  // pass 一 begin 就把第一个 pass 画好的积木擦成清屏色。
+  //
+  // 曾经的 bug:这里没有该字段,att[0].loadOp 硬编码 CLEAR,于是无论调用方传
+  // clear_color=false 与否都清屏。表现为 `magicblocks-l3-cli stack` 默认参数
+  // 下背景恒为 #000000(网格指示 pass 把前两个 pass 的结果擦掉),
+  // 而 `--grid-overlay off` 时背景正常 #0f121a —— 因为少了一个 pass 就没人擦。
+  bool clear_color = true;
+  bool clear_depth = true;
 };
 
 VkRenderPass create_pass(VkDevice device, const PassShape& shape, std::string* err) {
@@ -89,16 +101,20 @@ VkRenderPass create_pass(VkDevice device, const PassShape& shape, std::string* e
   VkAttachmentDescription att[3] = {};
   att[0].format = shape.color_format;
   att[0].samples = static_cast<VkSampleCountFlagBits>(shape.samples);
-  att[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;  // begin 时按实际 clear 值覆盖
+  att[0].loadOp = load_op(shape.clear_color);
   att[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
   att[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
   att[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
   if (shape.from_swapchain) {
     // 交换链图像：从 PRESENT_SRC_KHR 来、回到 PRESENT_SRC_KHR 去。
-    att[0].initialLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    // loadOp=LOAD 时初态**不得**为 UNDEFINED(VUID-VkAttachmentDescription-format-06699)，
+    // 只有 CLEAR 时才可以（清屏不读旧内容）。
+    att[0].initialLayout = shape.clear_color ? VK_IMAGE_LAYOUT_UNDEFINED
+                                             : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     att[0].finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
   } else {
-    att[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    att[0].initialLayout = shape.clear_color ? VK_IMAGE_LAYOUT_UNDEFINED
+                                             : VK_IMAGE_LAYOUT_GENERAL;
     att[0].finalLayout = VK_IMAGE_LAYOUT_GENERAL;  // 读回的约定末态(见 vulkan_target.cpp)
   }
 
@@ -106,11 +122,17 @@ VkRenderPass create_pass(VkDevice device, const PassShape& shape, std::string* e
   if (shape.has_depth) {
     att[1].format = shape.depth_format;
     att[1].samples = static_cast<VkSampleCountFlagBits>(shape.samples);
-    att[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    att[1].loadOp = load_op(shape.clear_depth);
     att[1].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     att[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     att[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    att[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    // loadOp 与 initialLayout 必须成对自洽（VUID-VkAttachmentDescription-format-06699）：
+    //   CLEAR → initialLayout 可以 UNDEFINED（清屏不读旧内容）
+    //   LOAD  → initialLayout **不得**为 UNDEFINED，必须说明深度当前在哪个布局
+    // 同帧第二个及以后的 pass 要保留前序 pass 的深度（clear_depth=false → LOAD），
+    // 此时深度图就是处在上一 pass 的末态 GENERAL。
+    att[1].initialLayout = shape.clear_depth ? VK_IMAGE_LAYOUT_UNDEFINED
+                                             : VK_IMAGE_LAYOUT_GENERAL;
     att[1].finalLayout = VK_IMAGE_LAYOUT_GENERAL;
     count = 2;
   }
@@ -235,8 +257,37 @@ Status submit_device_frame(const VulkanContext& ctx, const VulkanCommandList& li
 
   Status s = Status::Ok_();
   bool in_pass = false;
+  // 本帧是否已经有 pass 真正写过深度。
+  //
+  // 深度附件的"清/不清"与颜色**不同**:颜色不清时旧内容是上一 pass 留下的
+  // 有效像素;而深度若本帧还没有任何 pass 写过,缓冲内容就是**未定义**的 ——
+  // 此时 clear_depth=false 会让深度测试随机丢弃所有片元(实测覆盖率直接变 0)。
+  // 所以首个带深度的 pass 必须强制 CLEAR,之后的 pass 才能按标志走 LOAD。
+  bool depth_written_this_frame = false;
+  // 当前 pass 是否挂了深度附件（供 EndPass 更新上面的标志）。
+  bool current_pass_has_depth = false;
   float viewport_w = 0.0f;
   float viewport_h = 0.0f;
+
+  // 取"第 idx 条命令处**生效的**管线"——从 idx 往前扫最后一条 BindPipeline。
+  //
+  // 为什么不能用 list.bound_pipeline():那返回的是**录制结束时**的绑定,
+  // 不是该条命令处的绑定。典型场景:先画天空(sampled_texture_slots=0)再画
+  // 模型(slots=1),两条不同管线;回放 draw 到天空那段时若拿"结束时"的模型
+  // 管线,layout/描述符集全错。pipeline_at(idx) 也不行——command_pipeline_
+  // 只在 bind_pipeline 自己那一格回填,其余命令(含 BindSampledTexture)恒为
+  // nullptr(见 vulkan_command.cpp append() 的 push_back(nullptr))。
+  //
+  // 与 begin_pass 里的**向后**扫描是对称做法:那里要"这次 pass 将用哪条管线",
+  // 这里要"此刻已经用着哪条管线"。
+  auto pipeline_before = [&cmds, &list](std::uint32_t idx) -> VulkanPipeline* {
+    for (std::uint32_t j = idx; j-- > 0;) {
+      if (cmds[j].op == CommandOp::BindPipeline) {
+        return dynamic_cast<VulkanPipeline*>(list.pipeline_at(j));
+      }
+    }
+    return nullptr;
+  };
 
   for (std::size_t k = 0; k < cmds.size(); ++k) {
     const RecordedCommand& c = cmds[k];
@@ -277,6 +328,20 @@ Status submit_device_frame(const VulkanContext& ctx, const VulkanCommandList& li
         shape.depth_format = VK_FORMAT_D16_UNORM;
         shape.samples = target->samples() == 0 ? 1u : target->samples();
         shape.from_swapchain = from_swapchain;
+        // clear 标志来自录制流的 f[5] / f[6]（见下方 clears 注释里的编码口径）。
+        //
+        // 这是"同帧多 pass 画同一 target"能正确的关键：L3 的 F-VX 一帧开三个 pass
+        // （表面 → 内面 → 网格指示），只有第一个 clear，后两个必须 LOAD。
+        // 不接这两个标志的话，第三个 pass 会把前两个 pass 画的积木整帧擦成清屏色。
+        shape.clear_color = c.f[5] > 0.5f;
+        current_pass_has_depth = shape.has_depth;
+        // 深度:首个带深度附件的 pass 强制清（内容未定义，不清就没法做深度测试）；
+        // 之后才真正按调用方的 clear_depth 标志决定 LOAD。
+        if (shape.has_depth && !depth_written_this_frame) {
+          shape.clear_depth = true;
+        } else {
+          shape.clear_depth = c.f[6] > 0.5f;
+        }
         // 【关键一】render pass 必须与将要用它来画的管线**兼容**,否则 Vulkan 会
         // 静默丢弃 vkCmdDraw(不报错、不崩溃,只留一张干净的清屏色)。
         //
@@ -309,7 +374,14 @@ Status submit_device_frame(const VulkanContext& ctx, const VulkanCommandList& li
                             ps.samples == shape.samples &&
                             ps_resolve == shape_resolve &&
                             ps.color_format == static_cast<Format>(target->color_format()) &&
-                            vk_format_of(ps.color_format) == shape.color_format;
+                            vk_format_of(ps.color_format) == shape.color_format &&
+                            // clear 标志必须参与比较：管线自带 pass 恒为 CLEAR，
+                            // 而复用它的 pass 可能要求 LOAD（同帧第二个及以后的 pass）。
+                            // 漏掉这两项 → "不清"被静默忽略 → F-VX 的网格指示 pass
+                            // 会把前两个 pass 的积木整帧擦成清屏色。
+                            // 见 resources/pipeline.h 的 AttachmentShape::clear_color 注释。
+                            ps.clear_color == shape.clear_color &&
+                            ps.clear_depth == shape.clear_depth;
         }
         if (pass_compatible) {
           pr.rp = pass_pipeline->vk_render_pass();
@@ -437,6 +509,9 @@ Status submit_device_frame(const VulkanContext& ctx, const VulkanCommandList& li
         }
         vkCmdEndRenderPass(cmd);
         in_pass = false;
+        // 该 pass 已对深度附件做过 loadOp（CLEAR 或 LOAD）并 storeOp=STORE，
+        // 从此本帧的深度内容就是"定义过的"了，后续 pass 可以安全地 LOAD。
+        if (current_pass_has_depth) depth_written_this_frame = true;
         break;
       }
       case CommandOp::BindPipeline: {
@@ -534,6 +609,50 @@ Status submit_device_frame(const VulkanContext& ctx, const VulkanCommandList& li
         // 与 VkRect2D 的上边缘语义一致,直接使用)。
         VkRect2D r{{static_cast<int32_t>(c.a), static_cast<int32_t>(c.b)}, {c.width, c.height}};
         vkCmdSetScissor(cmd, 0, 1, &r);
+        break;
+      }
+      case CommandOp::BindSampledTexture: {
+        // 2026-11-11(回放补齐):这个 case **从来没有被实现过**。
+        // 录制侧 bind_sampled_texture 一直会产出本 op(vulkan_command.cpp:792),
+        // 但回放 switch 既没有它、也没有 default —— 命令被**静默吞掉**。
+        // 结果:凡走 bind_sampled_texture 的管线,提交路径上从不重放
+        // vkCmdBindDescriptorSets → 校验层报
+        //   "VkPipeline ... statically uses descriptor set 0, but a descriptor
+        //    was never bound" → 天空盒路径崩溃/黑屏。
+        //
+        // 这是 D8(fail-loud)的严重违反:加了新 CommandOp 却忘了回放,没人报错。
+        // 所以下面同时补了 default 分支,让同类遗漏以后立刻炸出来。
+        if (!in_pass) {
+          s = fail_cmd(idx, "bind_sampled_texture", ": 不在 pass 内");
+          break;
+        }
+        // 管线归属必须是**该条命令处**生效的管线,不是录制结束时的绑定。
+        // 典型场景:先画天空(slots=0)再画模型(slots=1)是两条不同管线,
+        // 用 bound_pipeline() 会拿到"最后那条",layout 与描述符集全错。
+        VulkanPipeline* pipe = pipeline_before(idx);
+        if (pipe == nullptr || !pipe->has_vk_pipeline()) {
+          s = fail_cmd(idx, "bind_sampled_texture", ": 此前没有绑定本设备的 VulkanPipeline");
+          break;
+        }
+        if (!pipe->has_descriptor_set()) {
+          s = fail_cmd(idx, "bind_sampled_texture",
+                       ": 该管线没有描述符集(sampled_texture_slots==0?),无法重放绑定");
+          break;
+        }
+        // 录制侧把槽位存在 cmd.a(见 vulkan_command.cpp:794)。
+        const VkDescriptorSet ds = pipe->vk_descriptor_set();
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe->vk_pipeline_layout(), 0,
+                                1, &ds, 0, nullptr);
+        break;
+      }
+      default: {
+        // D8:未知 op **硬失败**,绝不静默跳过。
+        //
+        // 之前这里没有 default,于是"录制侧产出了新 CommandOp、回放侧忘了实现"
+        // 这类错误会完全无声 —— 天空盒黑屏一整天没人知道原因。
+        // 有了这条,任何人新增 CommandOp 忘了回放,第一次提交就会拿到明确错误。
+        s = fail_cmd(idx, "unknown_op",
+                     ": 回放没有实现该 CommandOp(见 vulkan_command.h 的枚举)");
         break;
       }
     }

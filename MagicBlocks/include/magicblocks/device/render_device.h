@@ -21,8 +21,29 @@ class IRenderDevice {
  public:
   virtual ~IRenderDevice() = default;
 
+  // 按目标附件形状派生管线的工厂(G8 / t13,2026-11-11)。
+  //
+  // 为什么放在 L0 抽象上:IShaderLibrary 属于 L3,必须能按目标形状(离屏带深度 /
+  // 交换链 BGRA8 / MSAA 采样数)派生管线;但注册工厂表与设备生命周期一体,
+  // 只有设备自己知道"当前 device 对应哪个实现对"。
+  // 约定:**不支持按形状派生的后端返回 nullptr**,调用方必须显式回落到
+  // create_pipeline(desc),不得静默假定形状已生效。
+  virtual resources::IPipelineFactory* pipeline_factory() { return nullptr; }
+
   virtual BackendType backend() const = 0;
   virtual const DeviceCaps& caps() const = 0;
+
+  // ------------------------------------------------------ 校验层消息(L0)
+  //
+  // 校验层消息是默认能力:DeviceDesc::enable_validation 默认 true,
+  // 层挂上后 ERROR/WARNING 会打印到 stderr。
+  //
+  // 判据用 validation_enabled():它直接回答「层在不在」。
+  // 不要用 message_count>0 做判据 —— 那回答的是「现在有没有问题」,
+  // 代码干净时一条消息都没有,用 >0 会反过来逐次拒掉正确的修复。
+  virtual bool validation_enabled() const = 0;
+  virtual u32 validation_message_count() const = 0;   // 回调总次数
+  virtual u32 validation_error_count() const = 0;     // ERROR 级次数,健康跑批应为 0
 
   // 创建离屏渲染目标(CI/golden/录制回放都走这条,无需窗口)。
   virtual Result<std::unique_ptr<IRenderTarget>> create_offscreen_target(const TargetDesc& desc) = 0;
@@ -47,6 +68,10 @@ class IRenderDevice {
       const resources::TextureDesc& desc) = 0;
   virtual Result<std::unique_ptr<resources::ISampler>> create_sampler(
       const resources::SamplerDesc& desc) = 0;
+  // 立方体贴图(6 个面的方向查表纹理)。与 create_texture 分开见 texture.h 的说明:
+  // 立方体只需要"建 + 整面上传",没有 readback / mip / 采样数这些 2D 才有的形状。
+  virtual Result<std::unique_ptr<resources::ICubeMap>> create_cube_map(
+      const resources::CubeMapDesc& desc) = 0;
   // R4:图元管线不暴露几何着色阶段(ShaderStage 枚举只有 VS/FS/CS)。
   virtual Result<std::unique_ptr<resources::IPipeline>> create_pipeline(
       const resources::PipelineDesc& desc) = 0;

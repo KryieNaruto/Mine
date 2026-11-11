@@ -1,23 +1,54 @@
 // MagicBlocks —— Vulkan 后端:实例与校验层
 #include "backend/vulkan/vulkan_instance.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace magicblocks::backend {
 
 namespace {
 
+// 校验层消息输出开关。
+// MAGICBLOCKS_VALIDATION_QUIET=1 静音 INFO/VERBOSE(ERROR/WARNING 照常输出)，
+// CI 里良性告警刷屏时可用；静音不影响计数。
+bool validation_quiet() {
+  const char* v = std::getenv("MAGICBLOCKS_VALIDATION_QUIET");
+  return v != nullptr && v[0] == '1' && v[1] == '\0';
+}
+
+const char* severity_name(VkDebugUtilsMessageSeverityFlagBitsEXT s) {
+  if (s & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) return "ERROR";
+  if (s & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) return "WARN";
+  if (s & VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT) return "INFO";
+  return "VERBOSE";
+}
+
 VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(
     VkDebugUtilsMessageSeverityFlagBitsEXT severity,
-    VkDebugUtilsMessageTypeFlagsEXT /*types*/,
+    VkDebugUtilsMessageTypeFlagsEXT types,
     const VkDebugUtilsMessengerCallbackDataEXT* data, void* user_data) {
   auto* b = static_cast<InstanceBundle*>(user_data);
   if (!b) return VK_FALSE;
   b->message_count++;
-  if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
+  const bool is_error = (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) != 0;
+  const bool is_warning = (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) != 0;
+  if (is_error) {
     b->error_count++;
   }
-  (void)data;
+
+  // ERROR/WARNING 一律输出(这两档是判据)；INFO/VERBOSE 只在没静音时输出。
+  if ((is_error || is_warning || !validation_quiet()) && data != nullptr) {
+    const char* type = "GENERAL";
+    if (types & VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT) {
+      type = "VALIDATION";
+    } else if (types & VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT) {
+      type = "PERFORMANCE";
+    }
+    std::fprintf(stderr, "[vk-%s][%s] %s\n", severity_name(severity), type,
+                 data->pMessage != nullptr ? data->pMessage : "(no message)");
+    std::fflush(stderr);
+  }
   return VK_FALSE;  // 不中止
 }
 
@@ -124,6 +155,9 @@ bool create_instance(bool enable_validation, std::uint32_t api_version, Instance
         vkGetInstanceProcAddr(out->instance, "vkCreateDebugUtilsMessengerEXT"));
     if (create_fn) create_fn(out->instance, &mci, nullptr, &out->messenger);
   }
+  // 直接证据:层确实被交给 vkCreateInstance 了。
+  // 不能用 message_count>0 做判据 —— 代码干净的时候就一条消息都没有。
+  out->validation_enabled = validation;
   return true;
 }
 

@@ -140,6 +140,21 @@ class ICommandList {
   virtual Status bind_sampled_texture(const ResourceId& texture, const ResourceId& sampler,
                                       u32 slot) = 0;
 
+  // P0 命令 12 的**重新同步**(R1 扩展,立方体贴图落地时补上)。
+  //
+  // 为什么要这条:句柄 → 指针的反查表在命令列表创建时就固化了,而资源可能是
+  // **之后**才创建的(典型顺序:create_command_list() → create_texture() →
+  // bind_sampled_texture)或者由别的会话归属。没有这条,设备态只能报
+  // "未登记该纹理/采样器对象",调用方被迫去调 backend 私有入口 —— 那条路
+  // L3 根本看不到。
+  //
+  // 契约:
+  //   - 只对**本设备**创建的资源生效(按设备的登记表刷新);纯软件态是空操作;
+  //   - 不改变命令流(不是一条命令,不计入 command_count),可以在任意时刻调用;
+  //   - 设备实现可以自动在 begin_pass() 时调用一次(本轮就是这样),
+  //     所以普通调用方**通常不需要**显式调它。
+  virtual Status sync_resources() = 0;
+
   // R3 命令 10 / 11:pass 边界。未在 pass 内录制绘制命令 → InvalidArgument;
   // 未 end_pass 就 submit → InvalidArgument(录制期校验,不放过半个 pass)。
   virtual Status begin_pass(const RenderPassDesc& pass) = 0;

@@ -82,7 +82,7 @@ set(MB_SHADER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/shaders")
 set(MB_SHADER_SPV)
 # cube.* 是 demo 用着色器（不属于 SDK 的任何层），证明 L0~L3 已能渲染透视 3D。
 # l3_scene_textured.* 是 P0 纹理采样通道用的一对（F-ST 印章：颜色+深度双贴图）。
-set(MB_SHADER_NAMES fullscreen.vert fullscreen.frag ui_overlay.vert ui_overlay.frag l2_scene.vert l2_scene.frag cube.vert cube.frag stroke_ribbon.vert stroke_ribbon.frag l3_scene.vert l3_scene.frag l3_scene_textured.vert l3_scene_textured.frag pixel_regression.vert pixel_regression.frag overlay2d.vert overlay2d.frag)
+set(MB_SHADER_NAMES fullscreen.vert fullscreen.frag ui_overlay.vert ui_overlay.frag l2_scene.vert l2_scene.frag cube.vert cube.frag stroke_ribbon.vert stroke_ribbon.frag l3_scene.vert l3_scene.frag l3_scene_textured.vert l3_scene_textured.frag pixel_regression.vert pixel_regression.frag overlay2d.vert overlay2d.frag sky.vert sky.frag solid.vert solid.frag)
 foreach(_s ${MB_SHADER_NAMES})
   get_filename_component(_ext ${_s} EXT)
   string(SUBSTRING ${_ext} 1 -1 _stage)
@@ -177,6 +177,9 @@ add_library(magicblocks STATIC
   src/backend/vulkan/vulkan_buffer.cpp
   src/backend/vulkan/vulkan_texture.h
   src/backend/vulkan/vulkan_texture.cpp
+  # L1 立方体贴图(R1 扩展):纹理侧能力,命名中立,不含任何使用方语义
+  src/backend/vulkan/vulkan_cubemap.h
+  src/backend/vulkan/vulkan_cubemap.cpp
   src/backend/vulkan/vulkan_pipeline.h
   src/backend/vulkan/vulkan_pipeline.cpp
   src/backend/vulkan/vulkan_command.h
@@ -237,12 +240,21 @@ add_library(magicblocks STATIC
   src/primitives/overlay2d.cpp
   src/primitives/picker.cpp
   src/primitives/gizmo.cpp
+  # L3 方向背景(sky):相机朝向相关的通用原语(不含玩法语义)
+  include/magicblocks/primitives/sky.h
+  src/primitives/sky.cpp
+  # L3 预设模型目录:扫描/加载/上传(模型名是数据,UI 不认识)
+  include/magicblocks/primitives/model_catalog.h
+  src/primitives/model_catalog.cpp
   src/core/device_factory.cpp
   src/core/image_io.h
   src/core/image_io.cpp
+  # L1: pipeline-factory indirection (G8) - plain value table, no backend/Vk symbols
+  src/core/pipeline_factory_table.cpp
   # ---- L4 玩法层：魔法涂鸦(F-SK) ----
   src/features/sketch/sketch_document.cpp
   src/features/sketch/sketch_pipeline.cpp
+  src/features/sketch/sketch_canvas.cpp
   # ---- L4 玩法层：魔法叠叠乐(F-VX) ----
   src/features/stack/block_set.cpp
   src/features/stack/block_brush.cpp
@@ -251,6 +263,7 @@ add_library(magicblocks STATIC
   src/features/stack/color_mode.cpp
   src/features/stack/shape_template.cpp
   src/features/stack/stack_command.cpp
+  src/features/stack/stack_session.cpp
   ${MB_SHADER_HEADER})
 target_include_directories(magicblocks PUBLIC include PRIVATE src ${CMAKE_CURRENT_BINARY_DIR} ${MB_VMA_INCLUDE})
 # Android：池里的 tess2 是 Windows 二进制，不能链进 arm64。直接从源码编。
@@ -348,9 +361,13 @@ elseif(UNIX AND NOT APPLE)
 endif()
 
 # --- CLI:UI 消费层离屏出图 / 统计(spec §5.5、§10 门 5 的基线产出工具) ---
-add_executable(magicblocks-ui-cli src/ui_cli/main.cpp)
+add_executable(magicblocks-ui-cli
+    src/ui_cli/main.cpp
+    src/ui_cli/render_backend.cpp
+)
 target_link_libraries(magicblocks-ui-cli PRIVATE magicblocks)
-target_include_directories(magicblocks-ui-cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# ${CMAKE_CURRENT_BINARY_DIR} 提供内嵌着色器头 magicblocks_shaders.h(UI 布局 v2 渲染缩略图要用)
+target_include_directories(magicblocks-ui-cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR})
 if(WIN32)
   target_compile_definitions(magicblocks-ui-cli PRIVATE VK_USE_PLATFORM_WIN32_KHR)
 elseif(UNIX AND NOT APPLE)
@@ -377,6 +394,26 @@ elseif(UNIX AND NOT APPLE)
   target_compile_definitions(magicblocks-l3-cli PRIVATE VK_USE_PLATFORM_XCB_KHR)
 endif()
 
+# --- CLI:L3 方向背景(sky)离屏出图 —— 审阅/CI 的像素证据工具 ---
+add_executable(magicblocks-sky-cli src/sky_cli/main.cpp)
+target_link_libraries(magicblocks-sky-cli PRIVATE magicblocks)
+target_include_directories(magicblocks-sky-cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR})
+if(WIN32)
+  target_compile_definitions(magicblocks-sky-cli PRIVATE VK_USE_PLATFORM_WIN32_KHR)
+elseif(UNIX AND NOT APPLE)
+  target_compile_definitions(magicblocks-sky-cli PRIVATE VK_USE_PLATFORM_XCB_KHR)
+endif()
+
+# --- CLI:L3 预设测试模型离屏出图(每个模型单独一张,给 png_inspect 断言)---
+add_executable(magicblocks-model-cli src/model_cli/main.cpp)
+target_link_libraries(magicblocks-model-cli PRIVATE magicblocks)
+target_include_directories(magicblocks-model-cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR})
+if(WIN32)
+  target_compile_definitions(magicblocks-model-cli PRIVATE VK_USE_PLATFORM_WIN32_KHR)
+elseif(UNIX AND NOT APPLE)
+  target_compile_definitions(magicblocks-model-cli PRIVATE VK_USE_PLATFORM_XCB_KHR)
+endif()
+
 # --- Demo: 旋转立方体（证明 L0~L3 已能渲染透视 3D；不属于 SDK 的任何层）---
 add_executable(magicblocks-cube-demo src/cube_demo/main.cpp)
 target_link_libraries(magicblocks-cube-demo PRIVATE magicblocks)
@@ -387,6 +424,21 @@ if(WIN32)
   target_compile_definitions(magicblocks-cube-demo PRIVATE VK_USE_PLATFORM_WIN32_KHR)
 elseif(UNIX AND NOT APPLE)
   target_compile_definitions(magicblocks-cube-demo PRIVATE VK_USE_PLATFORM_XCB_KHR)
+endif()
+
+# --- F-SK CLI：魔法涂鸦的离屏出图 / 录制回放(设计 §12) ---
+# 独立可执行文件而不是塞进 l3-cli 的一个子命令，理由见 docs 里 SK 设计 §12：
+#   - --camera ortho|perspective 是 A3 的判据，必须有自己的参数表；
+#   - record/replay/reproduce 是 A7/A8 的判据，l3-cli 没有；
+#   - 与 L3 的 paint/blocks/gizmo 共用参数表会让跨子命令参数被静默接受(S-8)。
+add_executable(magicblocks-fsk-cli src/fsk_cli/main.cpp)
+target_link_libraries(magicblocks-fsk-cli PRIVATE magicblocks)
+target_include_directories(magicblocks-fsk-cli PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR})
+if(WIN32)
+  target_compile_definitions(magicblocks-fsk-cli PRIVATE VK_USE_PLATFORM_WIN32_KHR)
+elseif(UNIX AND NOT APPLE)
+  target_compile_definitions(magicblocks-fsk-cli PRIVATE VK_USE_PLATFORM_XCB_KHR)
 endif()
 
 # --- 验证：Windows 上用真实 Vulkan 把一帧场景渲染到外部 surface ---
@@ -440,16 +492,35 @@ add_executable(magicblocks_test
   tests/magicblocks_l3_mesh_test.cpp
   tests/magicblocks_l3_painter_test.cpp
   tests/magicblocks_l3_renderer_test.cpp
+  # 2026-11-11：L3 稳态零分配用例（R-SK-11 / A11）。
+  # 钉住 draw_mesh_instanced 在暖机后连续 30 帧的 vma_alloc/vma_free 增量为 0。
+  tests/magicblocks_l3_steady_state_test.cpp
   tests/magicblocks_l3_pixel_regression_test.cpp
   tests/magicblocks_l3_m3_test.cpp
   tests/magicblocks_l3_loader_test.cpp
   tests/magicblocks_l3_bvh_test.cpp
   tests/magicblocks_l3_outline_test.cpp
+  tests/magicblocks_l3_pathstyle_test.cpp
   tests/magicblocks_l3_stroke_test.cpp
+  # 2026-11-11：L3 方向背景(sky)通道 + L1 立方体贴图的像素级验收
+  tests/magicblocks_l3_sky_test.cpp
+  # 2026-11-11：L3 预设测试模型目录（扫描/加载/归一化/上传/失败语义）
+  tests/magicblocks_l3_model_catalog_test.cpp
   tests/magicblocks_l4_sketch_test.cpp
+  tests/magicblocks_l4_sketch_canvas_test.cpp
   tests/magicblocks_l4_stack_test.cpp
+  tests/magicblocks_l4_stack_session_test.cpp
+  tests/magicblocks_l4_stack_golden_test.cpp
+  tests/magicblocks_l4_stack_lock_camera_test.cpp
   tests/magicblocks_l4_stack_command_test.cpp
-  tests/magicblocks_msaa_test.cpp)
+  tests/magicblocks_msaa_test.cpp
+  # 2026-11-11：像素级 MSAA 回归（真实光栅 + 真实提交 + 真实读回）。
+  # 与上面的能力自证测试分工不同：那份验"caps 报得对不对"，这份验"像素软不软"。
+  tests/magicblocks_msaa_pixel_test.cpp
+  # backend 内的 MSAA 能力自证测试:它必须直接调 vkGetPhysicalDeviceImageFormatProperties
+  # 才能验到"caps 报的采样等级是不是真的能用"(8x 静默降级的守门人),
+  # 而 Vk* 类型只允许出现在 src/backend/**(G3),所以它住在 src 下。
+  src/backend/vulkan/msaa_render_pass_test.cpp)
 target_link_libraries(magicblocks_test PRIVATE magicblocks GTest::gtest GTest::gtest_main)
 target_include_directories(magicblocks_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_BINARY_DIR})
 if(WIN32)
@@ -463,6 +534,9 @@ target_compile_definitions(magicblocks_test PRIVATE
   MB_CLI_PATH="$<TARGET_FILE:magicblocks-l0-cli>"
   MB_UI_CLI_PATH="$<TARGET_FILE:magicblocks-ui-cli>"
   MB_L3_CLI_PATH="$<TARGET_FILE:magicblocks-l3-cli>"
+  # F-SK 自己的 CLI（render/replay/reproduce/dump）。B2 的 golden 比对、
+  # A7/A8 的三态与回放像素一致都靠它，不能用 l3-cli 的 sketch 子命令替代。
+  MB_FSK_CLI_PATH="$<TARGET_FILE:magicblocks-fsk-cli>"
   # 阶段 7 的 StackGates.* 用例要在 gtest 里直接跑门禁脚本，
   # 所以把解释器与仓根一并传进去（不靠 PATH 里的 python 名字）。
   MB_PYTHON_EXE="${Python3_EXECUTABLE}"
@@ -508,6 +582,13 @@ add_test(NAME magicblocks_cli_render_png
           --output ${MB_CLI_OUT}/out.png)
 
 # --- CLI 级 CTest:UI 消费层(spec §10 门 1~5 的端到端旁证) ---
+#
+# ⚠️ 这三条必须显式给 WORKING_DIRECTORY = 源码根目录。
+# ui-cli 在没有 --asset-root 时按 "assets/res" 兜底扫模型目录(见
+# src/ui_cli/main.cpp 的资源根推导)。ctest 默认把 CWD 设在 build 目录,
+# 那里没有 assets/,于是报 "目录不存在: assets/res/models" 并失败 ——
+# 而同一个 exe 手工在仓库根跑是好的。不设 WORKING_DIRECTORY 会让这三条
+# 永远红着,且看上去像 UI 功能坏了。
 add_test(NAME magicblocks_cli_ui_render_png
   COMMAND magicblocks-ui-cli render --width 320 --height 240
           --output ${MB_CLI_OUT}/ui.png)
@@ -515,6 +596,9 @@ add_test(NAME magicblocks_cli_ui_stats
   COMMAND magicblocks-ui-cli stats --width 320 --height 240 --frames 3)
 add_test(NAME magicblocks_cli_ui_present
   COMMAND magicblocks-ui-cli present --width 320 --height 240 --frames 5)
+set_tests_properties(magicblocks_cli_ui_render_png magicblocks_cli_ui_stats
+                     magicblocks_cli_ui_present
+  PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 # CLI 旋钮必须真的起作用:未知参数 → 退出码 2(不静默忽略)
 add_test(NAME magicblocks_cli_ui_bad_arg
   COMMAND magicblocks-ui-cli render --bogus 1)
@@ -563,3 +647,5 @@ set_tests_properties(magicblocks_l2_scene_preset_rejected PROPERTIES
 add_test(NAME magicblocks_l2_cli_bad_arg
   COMMAND magicblocks-l2-cli record --bogus 1)
 set_tests_properties(magicblocks_l2_cli_bad_arg PROPERTIES WILL_FAIL TRUE)
+
+

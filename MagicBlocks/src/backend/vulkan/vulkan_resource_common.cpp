@@ -135,6 +135,49 @@ Status bind_image_memory(VkDevice device, VkImage image, const resources::Resour
 
 VkFormat vk_format_of(device::Format f) { return to_vk_format(f); }
 
+// ---------------------------------------------------------------- 采样数按格式复核
+
+const VkFormat kMsaaProbeColorFormats[4] = {
+    VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM,
+    VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_R8G8B8A8_SRGB,
+};
+
+VkSampleCountFlags query_color_sample_counts(VkPhysicalDevice phys, VkFormat format) {
+  if (phys == VK_NULL_HANDLE) return 0;
+  VkImageFormatProperties ifp{};
+  // usage 与 MS 图的实际建图条件对齐:MS 图只做 COLOR_ATTACHMENT。
+  // (多重采样图像不能当 TransferSrc,所以不请求;请求多余 usage 只会让某些
+  //  驱动的查询更悲观,反而与实际可建图条件对不上。)
+  //
+  // ⚠️ 为什么**不**加 VK_IMAGE_USAGE_SAMPLED_BIT(别"顺手补全"):
+  //   1) MS 图在本项目里只当颜色附件;resolve 时它是 resolve 的源附件(resolve src),
+  //      那是子通道引用关系,不是采样器采样,不需要 SAMPLED 用法位。
+  //   2) vkGetPhysicalDeviceImageFormatProperties 的 usage 多给一位,支持矩阵只会更窄
+  //      或不变,绝不会更宽。多声明 SAMPLED 会让支持的采样档位被无端排除,
+  //      造成"设备其实能建这张 MS 图,却被我们判成不支持"的误杀。
+  //   本项目曾按"COLOR_ATTACHMENT|SAMPLED"写过一版,已被实测推翻,详见提交记录。
+  const VkResult r = vkGetPhysicalDeviceImageFormatProperties(
+      phys, format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, 0, &ifp);
+  if (r != VK_SUCCESS) return 0;
+  return ifp.sampleCounts;
+}
+
+bool color_format_supports_samples(VkPhysicalDevice phys, VkFormat format, std::uint32_t samples) {
+  if (samples <= 1) return true;
+  // 先做合法性判定,再查驱动:to_vk_samples 对非法值会回落成 1x,
+  // 而 1x 永远"支持",于是 3/64 这类非法值会被误判为可用。
+  switch (samples) {
+    case 2:
+    case 4:
+    case 8:
+    case 16: break;
+    default: return false;
+  }
+  const VkSampleCountFlags counts = query_color_sample_counts(phys, format);
+  return (counts & static_cast<VkSampleCountFlags>(to_vk_samples(samples))) != 0;
+}
+
 VkSampleCountFlagBits to_vk_samples(std::uint32_t n) {
   // 取值集合与 collect_msaa()(vulkan_device.cpp)对齐:1/2/4/8/16。
   // 16 也列上是因为桌面 GPU 普遍支持;移动端通常只到 4。

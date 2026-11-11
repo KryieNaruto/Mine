@@ -1,14 +1,121 @@
 # MSAA 抗锯齿 —— 接线任务书（已裁定）
 
-日期：2026-11-09
-状态：**✅ 已交付（395/395 全绿）**
+日期：2026-11-09（2026-11-10 重大修订）
+状态：**✅ 已交付（497/497 全绿，含 Android 真机根因修复）**
 裁定人：用户（大肥鱼），2026-11-09
 实施：msaa-worker
 验收：Lead 独立复核（clean 全量重建 + 逐项实测）
 
 ---
 
-## 交付结果（2026-11-09 16:4x）
+## 交付结果（2026-11-10 最终版）
+
+| 项 | 结果 |
+|---|---|
+| 全量回归 | **497/497 全绿**（1 skip 为已批准的环境限制） |
+| 构建方式 | `ninja -t clean` 后**全量重建**，`BUILD_EXIT=0` |
+| 3 张 golden | **逐字节不变**：`ca05a552a0223c4e` / `a181bf7595ceccf1` / `dd9c57b82f93b5dd` |
+| AA 效果 | `blocks --blocks 8`：**12 色 → 113 色**（320×240，Lead 独立实测） |
+| G3 分层纯度 | `[G3] OK backend 共扫到 137 个文件、backend 内 41 个文件，分层纯净` |
+
+### ⚠️ 2026-11-09 的「395/395 已交付」是**不完整**的交付
+
+那一版只验证了**离屏路径**，就说"抗锯齿完成了"。用户在 Android 真机上开了 MSAA X4
+**完全没效果**。教训见下面「验收标准」一节。
+
+验收标准应当是：**用户实际使用的路径出效果**，不是"我能跑通的那条路"。
+
+---
+
+## Android 真机 MSAA 无效果：五个根因
+
+| # | 根因 | 位置 |
+|---|---|---|
+| 1 | `create_render_pass()` 不知道 `from_swapchain`，交换链上 `finalLayout` 恒为 `GENERAL`（应为 `PRESENT_SRC_KHR`）→ present 因布局不符丢帧 | `vulkan_pipeline.cpp` |
+| 2 | `clearValueCount` 在 `has_depth=false` + `samples>1` 时报 3，实际附件 2 → 校验层抓到 `clearValueCount > attachmentCount (3 > 2)` | `vulkan_device_frame.cpp:418` |
+| 3 | 所有 swapchain view 共用**一张** MSAA 图 → 多帧 in-flight 串扰 | `vulkan_swapchain.cpp` |
+| 4 | `current_target()` 硬编码 `views_[0]`，而 `acquire_next_image()` 返回 `views_[idx]` | `vulkan_swapchain.cpp` |
+| 5 | **最致命**：`shape.samples` **写死 1** —— MS 图建了，但**没有任何 pass 用它** | `src/android/scene_renderer.cpp` `rebuild_pipeline_for_swapchain()` |
+
+### 修法
+
+- 抽出共用纯函数到 `src/backend/vulkan/vulkan_resource_common.{h,cpp}`：
+  `PassShapeCore`、`build_attachment_descriptions()`、`pass_clear_value_count()`，
+  让 `VulkanPipeline::create_render_pass()` 与 `device_frame::create_pass()`
+  走**同一份**附件描述逻辑（此前两份各自硬编码，必然漂移）。
+- `AttachmentShape` 加 `bool from_swapchain`，`pass_compatible()` 比较它。
+- `ISwapchain` 新增 `virtual IRenderTarget* target_at(std::uint32_t index)`
+  带默认实现（返回 `current_target()`），注释写明「单图后端可接受；多图后端
+  **必须覆写**」。`VulkanSwapchain` 覆写为 `views_[index]`（越界 nullptr）。
+- 交换链改 **per-image MSAA**：`std::vector<VkImage> msaa_images_` +
+  `std::vector<std::uint32_t> msaa_pages_`，逐张走分页分配器、逐张 release。
+- 建 MS 图**之前**用 `color_format_supports_samples()` 复核，不支持则退回 1x + 打日志。
+
+---
+
+## 8x 静默降级（2026-11-10 修复）
+
+**现象**：请求 `samples=8` → `effective msaa = 8`、`msaa_images=2`，但
+`vkCreateImage` 被验证层报错（`VK_SAMPLE_COUNT_8_BIT is not supported by
+format VK_FORMAT_B8G8R8A8_UNORM`）→ **拿到一张无效 MS 图，锯齿照旧且零日志**。
+这是"静默降级"，只是从 1x 搬到了 8x。
+
+**修法（两层防线，只有 B 是真正的修复）**：
+
+- **方案 B（真正的修复，本机有判别力）**：`vulkan_swapchain.cpp` 建图**之前**调用
+  `color_format_supports_samples(ctx_.phys, chosen.format, requested_msaa_)`，
+  不支持就 `Status::Unsupported` → 走已有退回路径 + 日志。
+  **不依赖验证层**——验证层在正式版和用户手机上根本不启用。
+- **方案 A（纵深防御，本机零行为变化）**：`vulkan_device.cpp collect_msaa` 改为
+  `全局限制 ∩ 各候选颜色格式的 vkGetPhysicalDeviceImageFormatProperties 交集`。
+  **本机 SwiftShader 的全局 `framebufferColorSampleCounts` 本来就不含 8**，
+  故本层在这台机器上零行为变化、注入不可能红。它的作用是在"全局允许但某格式
+  不允许"的设备上守门。**如果将来有人问"8x 是怎么修的"，答案是方案 B，不是方案 A。**
+
+**顺手修的真 bug**：`color_format_supports_samples` 对 3 和 64 判为"支持"
+（因为 `to_vk_samples` 对非法值回退到 `VK_SAMPLE_COUNT_1_BIT`，而 1 永远存在）。
+已改成显式 `switch` 只放 2/4/8/16，`default: return false`。
+
+**唯一硬证据**（把 `color_format_supports_samples` 注入为恒 `return true`）：
+```
+magicblocks_msaa_test.cpp(720): error: Expected equality of these values:
+  chain->msaa_samples()     Which is: 8   vs  1u
+magicblocks_msaa_test.cpp(727): error: Expected equality of these values:
+  chain->msaa_image_count() Which is: 2   vs  0u
+```
+红的形状与用户症状完全一致：**建了 2 张无效 MS 图、零提示**。
+
+**用户视角最终确认**（Lead 独立实测）：
+```
+$ magicblocks-l3-cli blocks --msaa 8
+--msaa 8 不被设备支持（SwiftShader Device (LLVM 10.0.0)）。支持列表: 1 4
+$ magicblocks-l3-cli blocks --msaa 4
+[blocks] 8 个体素 | ... | 已写出 (320x240)
+```
+
+---
+
+## 验收标准（最重要的一条教训）
+
+**"我能跑通的那条路"不等于"用户使用的那条路"。**
+
+第一轮交付只验了离屏路径就宣布完成，用户在 Android 真机上看到完全没效果。
+此后每轮验收都要求：**用户实际操作的那条路径出效果**，否则不算完成。
+
+---
+
+## 构建脚本假绿（2026-11-10 修复）
+
+`_mb_build.bat` 原写作 `if (...) ( ... echo BUILD_EXIT=%ERRORLEVEL% )` ——
+**`%VAR%` 在括号块里是解析期展开**，打印的是 `call vcvars64.bat` 的退出码（恒 0），
+不是 `cmake` 的。已改为 `setlocal enabledelayedexpansion` + `!RC!`。
+
+**判断构建成败的正确姿势**：以 `ctest` 能否跑起来 + 通过数变化为准，
+`BUILD_EXIT` 只做参考。
+
+---
+
+## 交付结果（2026-11-09 16:4x，已被上文取代，留档）
 
 | 项 | 结果 |
 |---|---|

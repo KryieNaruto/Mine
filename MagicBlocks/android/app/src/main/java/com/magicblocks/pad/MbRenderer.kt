@@ -37,6 +37,15 @@ object MbRenderer {
     external fun nativeStatus(handle: Long): String
     external fun nativeDestroy(handle: Long)
 
+    /** 设定 MSAA 采样数。必须在 [EngineSession.attachSurface] **之前**调用。 */
+    external fun nativeSetMsaa(handle: Long, samples: Int)
+
+    /** 实际生效的采样数（设备不支持时会低于请求值）。 */
+    external fun nativeMsaaSamples(handle: Long): Int
+
+    /** 设备支持的采样数，逗号分隔（如 "1,4,8"）。 */
+    external fun nativeSupportedMsaa(handle: Long): String
+
     /** Surface -> ANativeWindow*。这个指针由引擎持有，不需要也不允许 Kotlin 释放。 */
     external fun nativeWindowFromSurface(surface: Surface): Long
 }
@@ -97,6 +106,29 @@ class EngineSession {
     }
 
     fun status(): String = if (handle == 0L) "no-handle" else MbRenderer.nativeStatus(handle)
+
+    /**
+     * 设定 MSAA 采样数，返回**实际生效**的值。
+     *
+     * 采样数是交换链的属性（决定建几张多采样图），不能在 attach 之后改，
+     * 所以这里要求调用方先 detachSurface() —— 由 [EngineSurfaceView.applyMsaa]
+     * 负责整个 detach → set → attach 的时序。
+     */
+    fun setMsaa(samples: Int) {
+        if (handle == 0L) return
+        MbRenderer.nativeSetMsaa(handle, samples)
+    }
+
+    fun msaaSamples(): Int = if (handle == 0L) 1 else MbRenderer.nativeMsaaSamples(handle)
+
+    /** 设备支持的采样数档位（升序，至少含 1）。 */
+    fun supportedMsaa(): List<Int> =
+        if (handle == 0L) listOf(1)
+        else MbRenderer.nativeSupportedMsaa(handle)
+            .split(',')
+            .mapNotNull { it.trim().toIntOrNull() }
+            .sorted()
+            .ifEmpty { listOf(1) }
 
     fun destroy() {
         if (handle == 0L) return

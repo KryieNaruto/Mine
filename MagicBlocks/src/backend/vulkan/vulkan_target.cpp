@@ -309,10 +309,17 @@ Status OffscreenTarget::readback_rgba8(std::uint8_t* out, std::size_t size_bytes
   back.image = src_image;
   back.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
   back.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+  // dstAccessMask 里有 SHADER_READ(采样阶段可见)与 COLOR_ATTACHMENT_READ(继续当附件),
+  // 因此 dstStageMask 必须**同时**覆盖 FRAGMENT_SHADER 与 COLOR_ATTACHMENT_OUTPUT。
+  // 只写其一会被校验层拒:
+  //   VUID-vkCmdPipelineBarrier-pImageMemoryBarriers-02820
+  //   (dstAccessMask SHADER_READ 不被 COLOR_ATTACHMENT_OUTPUT 阶段支持)
+  // 这类错的后果不是崩溃而是**同步失效**:下一帧读这张图时没有正确的可见性保证。
   back.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
   vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                       VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1,
-                       &back);
+                       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                       0, 0, nullptr, 0, nullptr, 1, &back);
   r = vkEndCommandBuffer(cmd);
   if (r == VK_SUCCESS) {
     VkSubmitInfo si{};

@@ -474,8 +474,7 @@ class StackRenderer final : public IStackRenderer {
       da.instance_count = n_inst;
       if (auto s = cmd.draw_indexed(da); !s.ok()) {
         return StackStatus::Fail(StackCode::OutOfGrid, "draw_indexed 失败: " + s.message);
-      }
-      ++stats_.draw_calls;
+      }      ++stats_.draw_calls;
 
       if (auto s = cmd.end_pass(); !s.ok()) {
         return StackStatus::Fail(StackCode::OutOfGrid,
@@ -486,6 +485,38 @@ class StackRenderer final : public IStackRenderer {
     stats_.instances = n_inst;
     stats_.instance_buffer_bound = true;
     stats_.inner_order = desc.inner_order;
+
+    // ---- 网格指示（需求「带网格指示」）----
+    //
+    // 录制顺序：表面 pass → 内面 pass → **覆盖层收集**。收集本身不录任何命令
+    // （覆盖层自己的一次 draw 由调用方 build + record，见 stack_render.h 的
+    // StackFrameOverlay 注释），所以这里的双 pass 预算（恰好 2 次 drawcall）
+    // 不受影响：覆盖层是自己的第 3 次 draw，不计入积木几何。
+    //
+    // 失败即报错：collect 失败（例如矩阵不可逆导致全部点被裁掉）不许静默"当成没配"，
+    // 否则"网格指示没出现"会退化成一个无法归因的现象。
+    if (desc.overlay.overlay != nullptr) {
+      if (desc.overlay.collector == nullptr) {
+        return StackStatus::Fail(StackCode::OutOfGrid,
+                                 "overlay.overlay 给了但 overlay.collector 为空：网格指示无处收集");
+      }
+      GridProjector projector;
+      if (desc.overlay.project_with_frame_matrix) {
+        std::memcpy(projector.view_proj, desc.view_proj, sizeof(float) * 16);
+      }
+      projector.width = w;
+      projector.height = h;
+      if (auto s = desc.overlay.overlay->collect(*desc.overlay.collector, desc.overlay.grid,
+                                                 projector, desc.overlay.desc);
+          !s.ok()) {
+        return StackStatus::Fail(s.error_code(), "网格指示收集失败: " + s.text());
+      }
+      const StackOverlayStats& os = desc.overlay.overlay->stats();
+      stats_.overlay_collected = true;
+      stats_.overlay_lines = os.line_count;
+      stats_.overlay_rects = os.rect_count;
+    }
+
     // **不 submit** —— 一帧一次由调用方做。
     return StackStatus::Ok_();
   }

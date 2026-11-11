@@ -4,6 +4,7 @@
 #include <cstring>
 #include <string>
 
+#include "backend/vulkan/vulkan_cubemap.h"
 #include "backend/vulkan/vulkan_pipeline.h"
 #include "backend/vulkan/vulkan_resource_common.h"
 #include "backend/vulkan/vulkan_texture.h"
@@ -109,6 +110,26 @@ void VulkanCommandList::destroy_vk_command_buffer() {
     vk_recording_ = false;
     return;
   }
+  // 【顺序很重要】必须先结束录制,再销毁被它引用的对象。
+  //
+  // 这里过去是这个顺序:销毁 framebuffer → image view → render pass →
+  // **最后**才 vkEndCommandBuffer。而 Vulkan 规定:命令缓冲引用的 framebuffer /
+  // render pass 一旦被销毁,该命令缓冲立即进入 invalid 状态,此后
+  // vkEndCommandBuffer 就是非法调用。校验层会报:
+  //   VUID-vkEndCommandBuffer-commandBuffer-00059:
+  //     commandBuffer must be in the recording state
+  //   ... "was called in VkCommandBuffer ... which is now in an invalid state
+  //        (instead of recording state) because the following objects bound to
+  //        the command buffer were invalidated: VkFramebuffer ... destroyed"
+  // 这是全仓 vk-ERROR 里最大的一类(38 条)。
+  //
+  // 注意 submit_and_wait() 的顺序本来就是对的(先 end 再 cleanup),
+  // 所以只有走"析构兜底"这条路的用例会中招 —— 这也是它长期没被发现的原因。
+  if (vk_cmd_ != VK_NULL_HANDLE && vk_recording_) {
+    // 半截录制的命令缓冲不能直接释放:先结束再释放(内容丢弃)。
+    (void)vkEndCommandBuffer(vk_cmd_);
+    vk_recording_ = false;
+  }
   if (vk_framebuffer_ != VK_NULL_HANDLE) {
     vkDestroyFramebuffer(ctx_.device, vk_framebuffer_, nullptr);
     vk_framebuffer_ = VK_NULL_HANDLE;
@@ -126,11 +147,6 @@ void VulkanCommandList::destroy_vk_command_buffer() {
     vk_render_pass_ = VK_NULL_HANDLE;
   }
   if (vk_cmd_ != VK_NULL_HANDLE) {
-    if (vk_recording_) {
-      // 半截录制的命令缓冲不能直接释放:先结束再释放(内容丢弃)。
-      (void)vkEndCommandBuffer(vk_cmd_);
-      vk_recording_ = false;
-    }
     vkFreeCommandBuffers(ctx_.device, ctx_.cmd_pool, 1, &vk_cmd_);
     vk_cmd_ = VK_NULL_HANDLE;
   }
@@ -212,7 +228,11 @@ Status VulkanCommandList::bind_pipeline(IPipeline* pipeline, u64 pipeline_hash) 
   cmd.op = CommandOp::BindPipeline;
   cmd.pipeline_hash = h;
   append(cmd);
-  command_pipeline_.back() = pipeline;  // 旁路表:设备帧提交要取 VkPipeline*
+  // 旁路表:设备帧提交要取 VkPipeline*,而命令流刻意只存值(M3)。
+  // 必须放在 append() **之后**(append 会 push 一个占位),否则下标错位一位,
+  // 设备帧提交会拿到 nullptr 或上一条命令的指针 —— 表现是
+  // "bind_pipeline: 管线不是本设备的 VulkanPipeline"。
+  command_pipeline_.back() = pipeline;
   return Status::Ok_();
 }
 
@@ -227,6 +247,16 @@ Status VulkanCommandList::bind_vertex_buffer(const ResourceId& buffer, u32 bindi
   // 设备态:VkBuffer 实体由设备层按 ResourceId 管理(见 vulkan_buffer.h 的说明);
   // 本轮录制层只记句柄,真实绑定在设备帧提交路径(vulkan_device_frame.cpp)上解析。
   // 因此这里不做 vkCmdBindVertexBuffers。
+
+  // 反查表同步(与 bind_sampled_texture 同一理由,见该函数内注释)。
+  //
+  // 设备层的 bind_known_buffers() 只登记"已录制命令引用到"的句柄 —— 这是为了
+  // 避免历史句柄悬垂(ResourceId 复用后命中已释放内存)。但顶点/索引缓冲最典型
+  // 的用法就是在 begin_pass 之后才绑,此时表里还没有它。若不同步,查表失败,
+  // 调用方拿不到 Status 就往下一路失败(表现为 draw_indexed: 不在 pass 内)。
+  if (vk_recording_ && has_ctx_) {
+    (void)sync_resources();
+  }
 
   RecordedCommand cmd;
   cmd.op = CommandOp::BindVertexBuffer;
@@ -246,6 +276,11 @@ Status VulkanCommandList::bind_index_buffer(const ResourceId& buffer, IndexForma
     return Status::Invalid("ICommandList::bind_index_buffer: offset " + std::to_string(offset) +
                            " 越出缓冲大小 " + std::to_string(buffer.size));
   }
+  // 反查表同步:理由同 bind_vertex_buffer。索引缓冲同样常在 begin_pass 之后绑定。
+  if (vk_recording_ && has_ctx_) {
+    (void)sync_resources();
+  }
+
   RecordedCommand cmd;
   cmd.op = CommandOp::BindIndexBuffer;
   set_resource(&cmd, buffer);
@@ -270,9 +305,17 @@ ITexture* VulkanCommandList::texture_at(const ResourceId& id) const {
 }
 
 ISampler* VulkanCommandList::sampler_at(const ResourceId& id) const {
-  if (!id.valid()) return nullptr;
+  // 采样器**没有**可用的 ResourceId:VulkanSampler::id_ 恒为 invalid(采样器不占
+  // 内存子块,见 vulkan_texture.h),所有采样器的 (page_id, offset) 也完全相同。
+  // 所以这里绝不能用 id.valid() 当门槛 —— 那会让采样器反查永远返回 nullptr,
+  // 描述符里写进 VK_NULL_HANDLE,表现为
+  // "variable uSkyCube is using sampler VkSampler 0x0 that is invalid"。
+  //
+  // 采样器的稳定身份是 slot_index_(进程级单调递增,见 allocate_sampler_slot)。
+  // id.packed 里存的就是它(bind_sampled_texture 写进 cmd.i / packed_sampler)。
+  const u32 slot = static_cast<u32>(id.id & 0x7FFFFFFFu);
   for (const auto& kv : samplers_) {
-    if (kv.first.page_id == id.page_id && kv.first.offset == id.offset) return kv.second;
+    if (kv.first.id == slot) return kv.second;
   }
   return nullptr;
 }
@@ -294,7 +337,9 @@ Status VulkanCommandList::remember_texture_sampler(const ResourceId& texture,
   if (sampler.valid() && smp != nullptr) {
     bool found = false;
     for (auto& kv : samplers_) {
-      if (kv.first.page_id == sampler.page_id && kv.first.offset == sampler.offset) {
+      // 采样器身份是槽位号(id)。注意:这里**不能**用 sampler.valid() 之外的
+      // 任何 (page_id, offset) 判断 —— 所有采样器这两个字段都相同。
+      if (kv.first.id == sampler.id) {
         kv.second = smp;
         found = true;
         break;
@@ -303,6 +348,28 @@ Status VulkanCommandList::remember_texture_sampler(const ResourceId& texture,
     if (!found) samplers_.emplace_back(sampler, smp);
   }
   return Status::Ok_();
+}
+
+Status VulkanCommandList::remember_cube_map(const ResourceId& cube, ICubeMap* cube_obj) {
+  // 立方体贴图的句柄 page_id 是保留值 0xFFFFFFFC(不是 kInvalidPage),valid() 为真;
+  // 这里要求显式非空页号,免得把"无效句柄"登记成一张表项。
+  if (cube.page_id == ResourceId::kInvalidPage || cube_obj == nullptr) return Status::Ok_();
+  for (auto& kv : cube_maps_) {
+    if (kv.first.page_id == cube.page_id && kv.first.offset == cube.offset) {
+      kv.second = cube_obj;
+      return Status::Ok_();
+    }
+  }
+  cube_maps_.emplace_back(cube, cube_obj);
+  return Status::Ok_();
+}
+
+ICubeMap* VulkanCommandList::cube_map_at(const ResourceId& id) const {
+  if (!id.valid()) return nullptr;
+  for (const auto& kv : cube_maps_) {
+    if (kv.first.page_id == id.page_id && kv.first.offset == id.offset) return kv.second;
+  }
+  return nullptr;
 }
 
 // ---------------------------------------------------------------- R3 命令 4 / 5 / 6
@@ -459,11 +526,21 @@ Status VulkanCommandList::set_scissor(const ScissorRect& rect) {
 
 // ---------------------------------------------------------------- R3 命令 10 / 11
 
+Status VulkanCommandList::sync_resources() {
+  if (on_sync_resources_) on_sync_resources_(*this);
+  return Status::Ok_();
+}
+
 Status VulkanCommandList::begin_pass(const RenderPassDesc& pass) {
   if (pass.target == nullptr) {
     return Status::Invalid("ICommandList::begin_pass: target 为空");
   }
   if (in_pass_) return Status::Invalid("ICommandList::begin_pass: 上一个 pass 还没 end_pass");
+
+  // 每个 pass 开始时刷新一次"句柄 → 对象"反查表。资源可能是在命令列表**之后**
+  // 才创建的(create_command_list → create_texture → bind_sampled_texture 是
+  // 最自然的顺序),不刷新就会在 bind_sampled_texture 里报"未登记"。
+  (void)sync_resources();
 
   const Extent2D ext = pass.target->extent();
   const u32 ax = pass.area_x;
@@ -501,7 +578,21 @@ Status VulkanCommandList::begin_pass(const RenderPassDesc& pass) {
       // 在 init() 里置它,设备态会一直报 "未在录制",与 in_pass_ 自相矛盾。
       recording_ = true;
     }
-    VkImage color = target_color_image(pass.target);
+    // 2026-11-11（t6 / t2-R5）：本函数"录制时就跟着开一个真 render pass"的旁路，
+    // 必须**与目标真实形状一致**，否则它会变成第二个"MSAA 静默失效"的入口：
+    //   - 采样数：以前写死 VK_SAMPLE_COUNT_1_BIT。目标 samples=4 时，
+    //     framebuffer 里挂的是 4 采样的 MS 图、pass 却声明 1 采样 → 采样数不匹配。
+    //   - 附件数：以前只挂颜色附件。目标带深度/带 resolve 时同样不匹配。
+    //
+    // 现在的取舍（能力纪律）：这条旁路只负责"纯录制/演示"场景，所以
+    // **只有形状足够简单时**才在这里开真 pass：颜色单采样、无深度、非交换链。
+    // 一旦形状复杂（MSAA / 深度 / 交换链），这里就**只录像**，把真正的出图
+    // 交给 submit_device_frame() —— 它按目标形状完整建 pass（含 resolve、
+    // 深度、PRESENT_SRC_KHR 末态）。绝不在这里偷偷用 1 采样把图"画成"。
+    const u32 target_samples = pass.target->samples() == 0 ? 1u : pass.target->samples();
+    const bool target_has_depth = pass.target->depth_attachment().valid;
+    const bool simple_shape = target_samples == 1 && !target_has_depth;
+    VkImage color = simple_shape ? target_color_image(pass.target) : VK_NULL_HANDLE;
     if (color != VK_NULL_HANDLE) {
       const VkFormat fmt = vk_format_of(target_color_format(pass.target));
       VkAttachmentDescription att[1] = {};
@@ -621,6 +712,8 @@ Status VulkanCommandList::end_pass() {
 
 Status VulkanCommandList::bind_sampled_texture(const ResourceId& texture,
                                                const ResourceId& sampler, u32 slot) {
+  // `texture` 也可以是**立方体贴图**的句柄(R1 扩展)。立方体贴图的 page_id 是
+  // 保留值 0xFFFFFFFC,不是 kInvalidPage → valid() 通过,这里无需特判。
   // 录制期校验:未开 pass / 未绑管线 → InvalidArgument(与 draw 同口径)。
   if (!in_pass_) {
     return Status::Invalid("ICommandList::bind_sampled_texture: 不在 pass 内");
@@ -659,28 +752,51 @@ Status VulkanCommandList::bind_sampled_texture(const ResourceId& texture,
       return Status::Unsupported(
           "ICommandList::bind_sampled_texture: 该管线没有设备态描述符集");
     }
+    // 反查表可能在本次 bind 之前又新增了资源(最常见:begin_pass 之后才
+    // create_sampler/create_texture)。这里再同步一次,保证"用到时是最新的"。
+    (void)sync_resources();
     ITexture* tex = texture_at(texture);
-    if (tex == nullptr) {
-      return Status::Unsupported(
-          "ICommandList::bind_sampled_texture: 未登记该纹理对象(设备态需要真实 ITexture*)");
-    }
     ISampler* smp = sampler_at(sampler);
     if (smp == nullptr) {
       return Status::Unsupported(
           "ICommandList::bind_sampled_texture: 未登记该采样器对象(设备态需要真实 ISampler*)");
     }
-    auto* vk_tex = dynamic_cast<VulkanTexture*>(tex);
     auto* vk_smp = dynamic_cast<VulkanSampler*>(smp);
-    if (vk_tex == nullptr || !vk_tex->has_vk_view()) {
-      return Status::Unsupported(
-          "ICommandList::bind_sampled_texture: 纹理不是设备态创建的(无 VkImageView)");
-    }
     if (vk_smp == nullptr || !vk_smp->has_vk_sampler()) {
       return Status::Unsupported(
           "ICommandList::bind_sampled_texture: 采样器不是设备态创建的(无 VkSampler)");
     }
-    const Status ws = vk_pipeline->write_sampled_texture(slot, vk_tex->vk_view(),
-                                                         vk_smp->vk_sampler());
+
+    // 立方体贴图(R1 扩展):句柄在 cube 表里 → view 是 VIEW_TYPE_CUBE,
+    // 描述符里的采样器必须带 CUBE_COMPATIBLE 位。ISampler 是全局复用对象
+    // (按 SamplerDesc 去重),不能为 cube 改它的创建参数,所以在这里用**同一份
+    // SamplerDesc** 另建一个带该位的 VkSampler(带缓存的工厂,同 desc 只建一次)。
+    VkImageView view = VK_NULL_HANDLE;
+    VkSampler sample_obj = vk_smp->vk_sampler();
+    bool cube_compatible = false;
+    if (auto* cube = cube_map_at(texture)) {
+      auto* vk_cube = dynamic_cast<VulkanCubeMap*>(cube);
+      if (vk_cube == nullptr || !vk_cube->has_vk_image() || vk_cube->vk_view() == VK_NULL_HANDLE) {
+        return Status::Unsupported(
+            "ICommandList::bind_sampled_texture: 立方体贴图不是设备态创建的(无 VkImageView)");
+      }
+      const Status cs = cube_sampler_for(ctx_, vk_smp->desc(), &sample_obj);
+      if (!cs.ok()) return cs;
+      view = vk_cube->vk_view();
+      cube_compatible = true;
+    } else if (tex != nullptr) {
+      auto* vk_tex = dynamic_cast<VulkanTexture*>(tex);
+      if (vk_tex == nullptr || !vk_tex->has_vk_view()) {
+        return Status::Unsupported(
+            "ICommandList::bind_sampled_texture: 纹理不是设备态创建的(无 VkImageView)");
+      }
+      view = vk_tex->vk_view();
+    } else {
+      return Status::Unsupported(
+          "ICommandList::bind_sampled_texture: 未登记该纹理/立方体贴图对象"
+          "(设备态需要真实 ITexture*/ICubeMap*)");
+    }
+    const Status ws = vk_pipeline->write_sampled_texture(slot, view, sample_obj, cube_compatible);
     if (!ws.ok()) return ws;
     const VkDescriptorSet ds = vk_pipeline->vk_descriptor_set();
     vkCmdBindDescriptorSets(vk_cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -696,6 +812,9 @@ Status VulkanCommandList::bind_sampled_texture(const ResourceId& texture,
   // 宽度,所以**不要求**打包成功;采样器的稳定身份就是 id(= slot_index),
   // 单独记进 packed_sampler 供 L2 去重/复现用。
   cmd.packed_sampler = sampler.id;
+  // 采样器身份 = id(槽位号)。page_id/offset 对所有采样器都相同,所以设备帧提交
+  // 需要它来做精确反查;记在 i 里(命令流格式不变,只是复用了未使用的字段)。
+  cmd.i = static_cast<std::int32_t>(sampler.id & 0x7FFFFFFF);
   append(cmd);
   return Status::Ok_();
 }
@@ -707,8 +826,18 @@ void VulkanCommandList::reset() {
   recorded_.clear();
   command_pipeline_.clear();
   buffers_.clear();
-  // P0(X1):textures_/samplers_ 同样保留(见 submit_and_wait 的说明)——
-  // 它们是弱引用映射,不随命令流清空而失效。
+  // 句柄 → 对象指针的反查表**必须一起清掉**。
+  //
+  // 这里曾经写着"它们是弱引用映射,不随命令流清空而失效" —— 那句话是错的:
+  // 这三张表存的是**裸指针**,而资源的所有权在调用方的 unique_ptr。
+  // 用例之间反复建/销纹理与采样器时,旧指针留在表里 → 下一次反查命中已析构对象
+  // → 提交期崩在 dynamic_cast(SEH 0xc0000005),或描述符写进已释放的 VkImageView。
+  //
+  // 清掉是安全的:下一次 begin_pass / bind_sampled_texture 会走 sync_resources()
+  // 从设备表重新灌一遍(设备表由 create_* 维护,是唯一的真相来源)。
+  textures_.clear();
+  samplers_.clear();
+  cube_maps_.clear();
   command_count_ = 0;
   in_pass_ = false;
   bound_ = Bound{};

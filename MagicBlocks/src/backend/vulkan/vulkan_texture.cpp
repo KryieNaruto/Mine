@@ -648,6 +648,13 @@ VulkanSampler::VulkanSampler(const VulkanContext& ctx, const SamplerDesc& desc)
 }
 
 VulkanSampler::~VulkanSampler() {
+  // 先摘表再销毁句柄:钩子会从设备的 known_samplers_ 里删掉指向 this 的那一行,
+  // 保证此后任何反查都拿不到这个对象(而不是拿到一个已析构的壳)。
+  if (destroy_hook_) {
+    auto hook = std::move(destroy_hook_);
+    destroy_hook_ = nullptr;
+    hook(this);
+  }
   if (vk_sampler_ != VK_NULL_HANDLE && ctx_.device != VK_NULL_HANDLE) {
     vkDestroySampler(ctx_.device, vk_sampler_, nullptr);
   }
@@ -710,6 +717,130 @@ Status VulkanSampler::init() {
   const VkResult r = vkCreateSampler(ctx_.device, &sci, nullptr, &vk_sampler_);
   if (r != VK_SUCCESS) return Status::InitFailed(fmt_err("vkCreateSampler", r));
   return Status::Ok_();
+}
+
+// ---------------------------------------------------------------- cube 采样器
+
+namespace {
+
+// 本后端建过的"带 CUBE_COMPATIBLE 位"的 VkSampler(按 SamplerDesc 去重)。
+// 用有序 vector 而不是 unordered_map:采样器总数是个位数,线性查找比哈希更简单,
+// 也不需要给 SamplerDesc 写哈希。
+struct CubeSamplerEntry {
+  // ⚠️ 必须带 device:缓存是**进程级静态**的,而 VkSampler 属于某一个 VkDevice。
+  // 前一个设备(vkDestroyDevice 之后)的句柄会失效,但缓存条目还在;下一个设备
+  // 若命中同一条(desc 相同)就会拿到**已销毁的句柄**,表现为
+  //   vkUpdateDescriptorSets: invalid VkSampler ...
+  //   vkCmdDraw: variable "uSkyCube" is using sampler VkSampler 0x0
+  // 以及 SwiftShader 下的 SEH 0xc0000005。实测:单条 Sky.* 用例跑绿,
+  // 串跑时第二条必崩。按 device 分桶即根治。
+  VkDevice device = VK_NULL_HANDLE;
+  SamplerDesc desc{};
+  VkSampler sampler = VK_NULL_HANDLE;
+};
+
+std::vector<CubeSamplerEntry>& cube_sampler_cache() {
+  static std::vector<CubeSamplerEntry> cache;
+  return cache;
+}
+
+bool same_desc(const SamplerDesc& a, const SamplerDesc& b) {
+  return a.min_filter == b.min_filter && a.mag_filter == b.mag_filter &&
+         a.mip_filter == b.mip_filter && a.wrap_u == b.wrap_u && a.wrap_v == b.wrap_v &&
+         a.compare == b.compare;
+}
+
+}  // namespace
+
+Status cube_sampler_for(const VulkanContext& ctx, const SamplerDesc& desc, VkSampler* out) {
+  if (out == nullptr) return Status::Invalid("cube_sampler_for: out 为空");
+  // 参数校验与普通采样器同一份实现(非法 filter/wrap/compare 绝不"就近取合法值")。
+  Status s = VulkanSampler::validate_desc(desc);
+  if (!s.ok()) return s;
+  for (const CubeSamplerEntry& e : cube_sampler_cache()) {
+    if (e.device == ctx.device && same_desc(e.desc, desc)) {
+      *out = e.sampler;
+      return Status::Ok_();
+    }
+  }
+  *out = VK_NULL_HANDLE;
+  // 缓存里没有 → 必须真的建一个。没有设备就是明确的 Unsupported:
+  // 绝不返回 Ok + 空句柄(那会让描述符写入拿到 NULL 采样器而"看起来绑上了")。
+  if (ctx.device == VK_NULL_HANDLE) {
+    return Status::Unsupported(
+        "cube_sampler_for: 没有 VkDevice,无法创建带 CUBE_COMPATIBLE 位的采样器");
+  }
+
+  VkSamplerCreateInfo sci{};
+  sci.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+  // 立方体贴图"可以采样 6 层 cube 视图"这件事在 Vulkan 里**没有采样器侧标志**:
+  // 那个位只存在于 IMAGE 侧(VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT,见
+  // vulkan_cubemap.cpp),取样器是否走 cube 路径由**视图类型**决定。
+  //
+  // 历史:这里一度设 flags=0x10 —— 规范里那是
+  // VK_SAMPLER_CREATE_IMAGE_PROCESSING_BIT_QCOM(一个 ARM 专有位),SwiftShader
+  // 直接报 "UNSUPPORTED: pCreateInfo->flags 0x00000010"。本仓的 Vulkan 头来自
+  // SwiftShader 裁剪版,缺 VK_SAMPLER_CREATE_FLAG_CUBE_COMPATIBLE_BIT 正是因为
+  // **规范里根本没有这个枚举**。结论:flags 恒 0,cube 语义完全由视图承担。
+  sci.flags = 0;
+  sci.magFilter = to_vk_filter(desc.mag_filter);
+  sci.minFilter = to_vk_filter(desc.min_filter);
+  sci.mipmapMode = desc.mip_filter == FilterMode::Nearest ? VK_SAMPLER_MIPMAP_MODE_NEAREST
+                                                          : VK_SAMPLER_MIPMAP_MODE_LINEAR;
+  // 立方体贴图的面内寻址必须是 ClampToEdge:跨面接缝由硬件按面选择处理,
+  // 但**面内**越界回绕在 cube 采样里等于把边缘像素拉成条纹。调用方给的 wrap
+  // 若为其它值,这里按 cube 的语义**显式报错**而不是静默改写。
+  if (desc.wrap_u != WrapMode::ClampToEdge || desc.wrap_v != WrapMode::ClampToEdge) {
+    return Status::Invalid(
+        "cube_sampler_for: 立方体贴图要求 wrap_u/wrap_v = ClampToEdge(面内回绕会把边缘拉成条纹)");
+  }
+  sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  sci.mipLodBias = 0.0f;
+  sci.anisotropyEnable = VK_FALSE;
+  sci.maxAnisotropy = 1.0f;
+  // cube 采样不做比较(阴影比较采样器是另一类用法,本轮不支持)。
+  if (desc.compare != CompareOp::Disabled) {
+    return Status::Invalid("cube_sampler_for: 立方体贴图不支持比较采样(compare 必须 Disabled)");
+  }
+  sci.compareEnable = VK_FALSE;
+  sci.compareOp = VK_COMPARE_OP_NEVER;
+  sci.minLod = 0.0f;
+  sci.maxLod = VK_LOD_CLAMP_NONE;
+  sci.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+  sci.unnormalizedCoordinates = VK_FALSE;
+  VkSampler vk = VK_NULL_HANDLE;
+  const VkResult r = vkCreateSampler(ctx.device, &sci, nullptr, &vk);
+  if (r != VK_SUCCESS) return Status::InitFailed(fmt_err("vkCreateSampler(cube)", r));
+  cube_sampler_cache().push_back(CubeSamplerEntry{ctx.device, desc, vk});
+  *out = vk;
+  return Status::Ok_();
+}
+
+bool sampler_has_cube_flag(VkSampler sampler) {
+  if (sampler == VK_NULL_HANDLE) return false;
+  for (const CubeSamplerEntry& e : cube_sampler_cache()) {
+    if (e.sampler == sampler) return true;
+  }
+  return false;
+}
+
+void destroy_cube_samplers(VkDevice device) {
+  if (device == VK_NULL_HANDLE) return;
+  // 只销毁**本设备**名下的采样器并移除对应条目:缓存是进程级的,可能有多个
+  // VkDevice 共存(测试里每个用例建一个),整表 clear() 会把别的设备的条目也抹掉,
+  // 那些设备的 VkSampler 就永远没人销毁 → 反而制造新的 05137 泄漏。
+  auto& cache = cube_sampler_cache();
+  for (CubeSamplerEntry& e : cache) {
+    if (e.device == device && e.sampler != VK_NULL_HANDLE) {
+      vkDestroySampler(device, e.sampler, nullptr);
+      e.sampler = VK_NULL_HANDLE;
+    }
+  }
+  cache.erase(std::remove_if(cache.begin(), cache.end(),
+                             [device](const CubeSamplerEntry& e) { return e.device == device; }),
+              cache.end());
 }
 
 }  // namespace magicblocks::backend

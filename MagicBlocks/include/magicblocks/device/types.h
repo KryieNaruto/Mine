@@ -64,7 +64,7 @@ enum class DepthFormat : std::uint8_t {
 struct DeviceDesc {
   BackendType backend = BackendType::Vulkan;
   std::string app_name = "MagicBlocks";
-  bool enable_validation = false;      // 打开校验层
+  bool enable_validation = true;       // 打开校验层(默认开:验证层消息是默认能力)
   bool request_rev_z = false;          // 请求 reverse-Z(能力不足即 Unsupported)
   u32 requested_msaa = 1;              // 请求 MSAA 采样数(不在 supported_msaa_levels 即 Unsupported)
   u32 in_flight_frames = 2;            // 帧环大小,必须 ∈ {2,3}

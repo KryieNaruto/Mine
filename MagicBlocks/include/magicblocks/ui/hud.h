@@ -30,6 +30,10 @@ enum class ControlKind : std::uint8_t {
   Label = 2,     // 不可交互,只画文本
   Slider = 3,    // 水平滑条(值域 [0,1] 或自定义)
   Swatch = 4,    // 色板单格(点选即回调颜色)
+  // 列表条目:可点击、可选中。**通用控件**,不知道自己列的是什么条目 ——
+  // 条目文案/数据由外部注入(`Control::label` / `impl data`),UI 层不出现任何
+  // 具体业务名(spec §2 命名纪律)。
+  ListItem = 5,
 };
 
 const char* to_string(ControlKind kind);
@@ -53,7 +57,12 @@ struct Control {
   // 交互状态(由 Hud 在输入阶段写入,绘制阶段只读 —— 单帧内无二义)
   bool pressed = false;
   bool hovered = false;
-  f32 value = 0.f;  // Slider 当前值 [0,1]
+  bool selected = false;  // ListItem 用:选中态由调用方按业务决定并写入
+  f32 value = 0.f;        // Slider 当前值 [0,1]
+  // ListItem 用:条目在列表里的序号(与 `selected` 一起构成"可见的高亮"视觉;
+  // 具体语义由外部决定,UI 层只负责画)
+  std::uint32_t index = 0;
+  std::uint32_t index_total = 0;  // 列表总条数(用于绘制滚动提示条)
 
   std::function<void()> on_click;
   std::function<void(f32)> on_value_changed;
@@ -66,6 +75,30 @@ struct HudLayoutConfig {
   f32 button_width_dp = 96.f;
   f32 gap_dp = 8.f;
   f32 panel_padding_dp = 8.f;
+  // 左右列表面板的宽度(占屏宽的比例)。两块面板 + 中间留白 + 两侧边距必须
+  // 能同时放下;放不下时 layout_sidebar_lists() 会按比例收缩(不越界)。
+  f32 list_panel_width_ratio = 0.22f;
+  // 列表条目行高(dp)。
+  f32 list_row_height_dp = 26.f;
+};
+
+// 列表面板的一次布局结果。**刻度坐标系统一用"行"(row)**,便于判断
+// "哪些条目落在可见区内"和"滚动偏移是否合法"。
+struct ListColumnLayout {
+  Rect panel{};             // 面板外框(像素)
+  Rect viewport{};          // 可见区(面板内边距之后,像素)
+  f32 row_height_px = 0.f;  // 单行像素高
+  std::uint32_t first_visible_row = 0;  // viewport 顶部对应的行号
+  std::uint32_t visible_rows = 0;       // viewport 一次能放下几行
+  std::uint32_t total_rows = 0;         // 列表总行数(含不可见的)
+  bool scrollable = false;              // total_rows > visible_rows
+  bool has_scrollbar = false;           // 有滚动条图元(见 Hud::scrollbar_rect)
+  Rect scrollbar_track{};
+  Rect scrollbar_thumb{};
+  std::uint32_t clamped_first_row = 0;  // 实际生效的起始行(已夹住)
+  // 本面板拥有的条目 id(按加入顺序,**不是**按行截断后)。命中裁剪与
+  // visible_list_items() 都靠它区分"这块面板的条目"和"另一块面板的条目"。
+  std::vector<std::uint32_t> item_ids;
 };
 
 // HUD:控件树 + 命中查询 + 绘制。
@@ -98,6 +131,34 @@ class Hud {
   void relayout(const HudLayoutConfig& cfg, DisplayInfo display, f32 top_bar_dp,
                 f32 bottom_panel_dp);
 
+  // ---------------------------------------------------------- 左右列表面板(spec: UI 布局 v1)
+  // 把面板 `panel_id` 的所有 `ListItem` 子控件排成**竖列表**:
+  //   * 条目从 `first_row` 行开始,按 `list_row_height_dp` 逐行往下排;
+  //   * 每行高度固定,超出 viewport 的条目不画、不可命中(裁剪,不越界);
+  //   * 条目 `label` 由调用方注入(UI 层不出现任何业务/玩法名);
+  //   * `first_row` 会被夹到 [0, total-visible],越界的滚动值不会把列表滚出面板;
+  //   * `scrollable`(total > visible)时输出滚动条轨道 + 滑块几何,供绘制可见性提示。
+  //
+  // **行是离散的**:`first_row` 按整行滚动。做连续滚动需要在本函数外再乘一个
+  // 像素偏移;本轮只做"最小处理",所以保持整行 —— 这样"滚动后可见条目集合"
+  // 在数值上是确定的,测试才能断言。
+  ListColumnLayout layout_list_panel(std::uint32_t panel_id, std::uint32_t first_row,
+                                     const HudLayoutConfig& cfg);
+
+  // 取上一次 layout_list_panel 的结果(找不到该面板时返回空结果)。
+  ListColumnLayout list_layout(std::uint32_t panel_id) const;
+  // 面板内当前**可见**的 ListItem id(自上而下)。用于测试与命中核对。
+  std::vector<std::uint32_t> visible_list_items(std::uint32_t panel_id) const;
+
+  // 列表条目 id 的分配辅助:把 n 个 ListItem 作为面板子控件追加进去,
+  // labels 由调用方给出,返回新建的 id(按顺序)。
+  std::vector<std::uint32_t> add_list_items(std::uint32_t panel_id,
+                                            const std::vector<std::string>& labels);
+
+  // 选中态:把该面板内 index == selected_index 的条目标为 selected,其余清除。
+  // 返回是否真的找到了这样一条(找不到返回 false,不静默)。
+  bool select_list_item(std::uint32_t panel_id, std::uint32_t selected_index);
+
   // ---------------------------------------------------------- 输入(①层)
   // HUD 命中:命中返回 true 并更新 pressed/value,调用方据此**消费事件,不再下发**。
   // 只处理 PointerDown/Move/Up/Cancel + 其它事件一律返回 false(不消费)。
@@ -122,5 +183,50 @@ class Hud {
 
 // 把控件列表灌进 HUD 的便捷构建器(返回下一个可用 id 供测试断言确定性)。
 std::uint32_t build_minimal_hud(Hud* hud, const HudLayoutConfig& cfg, DisplayInfo display);
+
+// 侧栏列表配置:**条目数据由外部注入**(spec §2:UI 层不出现玩法/模型名)。
+//
+//   left_items  —— 左侧列表的条目文案(测试模型等;文案原样绘制,不参与逻辑)
+//   right_items —— 右侧列表的条目文案
+//
+// UI 层只把它们当字符串画出来并回调 "第几条被点了";点完之后做什么(路由到哪个
+// 玩法、切哪个模型)**全部由调用方通过回调决定**,Hud 不认识任何业务概念。
+struct SidebarConfig {
+  std::vector<std::string> left_items;
+  std::vector<std::string> right_items;
+  std::string left_title;
+  std::string right_title;
+  // 顶部返回按钮文案(空 = back;文案由外部注入)
+  std::string back_button_label;
+  // 点中左侧第 index 条 / 右侧第 index 条。index 是"列表内下标"(不是控件 id)。
+  std::function<void(std::uint32_t)> on_left_item;
+  std::function<void(std::uint32_t)> on_right_item;
+  // 两侧列表当前选中下标(默认 0 = 第一条;空列表时不生效)
+  std::uint32_t left_selected = 0;
+  std::uint32_t right_selected = 0;
+  // 初始滚动起始行(0 = 从头)。越界会被夹住。
+  std::uint32_t left_first_row = 0;
+  std::uint32_t right_first_row = 0;
+};
+
+// 侧栏构图结果:HUD 内部用 id 表示的两块面板 + 顶部返回按钮。
+struct SidebarIds {
+  std::uint32_t left_panel = 0;
+  std::uint32_t right_panel = 0;
+  std::uint32_t back_button = 0;
+  std::vector<std::uint32_t> left_items;
+  std::vector<std::uint32_t> right_items;
+};
+
+// 在已清空的 HUD 上构建"左列表 + 右列表 + 顶部返回按钮"。
+//
+// 布局约束(硬):
+//   * 两块面板左右分列,中间留 gap,两侧留 margin —— 任何 dpr/尺寸下都不越界;
+//   * 面板高度取顶部按钮行(含 gap)以下到屏幕底部减去 margin;
+//   * 屏幕太窄时按 `list_panel_width_ratio` 收缩,宽度不足一行文字也不越界。
+//
+// 返回各控件 id(便于测试与外部改回调)。`hud` 为空则返回全 0。
+SidebarIds build_sidebar_hud(Hud* hud, const HudLayoutConfig& cfg, DisplayInfo display,
+                             const SidebarConfig& sidebar);
 
 }  // namespace magicblocks::ui

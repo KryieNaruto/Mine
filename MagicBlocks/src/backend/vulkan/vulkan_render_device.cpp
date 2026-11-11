@@ -1,13 +1,16 @@
 // MagicBlocks —— Vulkan 后端:设备实现 + 工厂
 #include "backend/vulkan/vulkan_render_device.h"
 
+#include <algorithm>
 #include <cstring>
 
 #include "backend/vulkan/vulkan_draw.h"
+#include "backend/vulkan/vulkan_cubemap.h"
 #include "backend/vulkan/vulkan_buffer.h"
 #include "backend/vulkan/vulkan_command.h"
 #include "backend/vulkan/vulkan_device_frame.h"
 #include "backend/vulkan/vulkan_pipeline.h"
+#include "backend/vulkan/vulkan_resource_common.h"  // is_power_of_two_u32 / is_depth_format_of
 #include "backend/vulkan/vulkan_swapchain.h"
 #include "backend/vulkan/vulkan_texture.h"
 
@@ -22,15 +25,69 @@ std::string g_device_override;
 void set_physical_device_override(const std::string& name) { g_device_override = name; }
 const std::string& physical_device_override() { return g_device_override; }
 
+// ---------------------------------------------------------------- G8 / t13
+//
+// Shaped-pipeline factory handed to L1 as an opaque interface, so L3
+// (primitives/shader_library.cpp) can derive a pipeline for a target shape
+// without including any backend header.
+//
+// Dependency direction is strictly implementation -> abstraction:
+//   INIT: the backend registers a resolver built on L1 public types;
+//   RUN : IRenderDevice::pipeline_factory() resolves it for that device;
+//   L3  : calls resources::IPipelineFactory::create_shaped_pipeline().
+namespace {
+
+class VulkanPipelineFactory final : public resources::IPipelineFactory {
+ public:
+  device::Result<std::unique_ptr<resources::IPipeline>> create_shaped_pipeline(
+      device::IRenderDevice& device, const resources::PipelineDesc& desc,
+      const resources::AttachmentShape& shape) override {
+    VulkanRenderDevice* vk = dynamic_cast<VulkanRenderDevice*>(&device);
+    if (vk == nullptr) {
+      return device::Status::Unsupported(
+          "create_shaped_pipeline: device is not the Vulkan backend");
+    }
+    return vk->create_pipeline_for_shape(desc, shape);
+  }
+};
+
+VulkanPipelineFactory g_pipeline_factory;
+
+resources::IPipelineFactory* resolve_vulkan_pipeline_factory(device::IRenderDevice* device) {
+  if (device == nullptr) return nullptr;
+  if (device->backend() != device::BackendType::Vulkan) return nullptr;
+  return &g_pipeline_factory;
+}
+
+}  // namespace
+
+
 VulkanRenderDevice::~VulkanRenderDevice() {
   if (ctx_.device) vkDeviceWaitIdle(ctx_.device);
+  // 清空已知资源表:表里存的是裸指针,这里先清掉,避免之后(或在 vkDestroyDevice
+  // 之后)仍持有采样器的析构钩子 —— 那个钩子的 lambda 捕获了 this,设备析构完成
+  // 后再回调就是 use-after-free。
+  known_samplers_.clear();
+  known_textures_.clear();
+  known_cubes_.clear();
+  known_buffers_.clear();
   // 顺序关键:fence 必须在 VkDevice 之前销毁;
   // 分配器要在 VkDevice 之前销毁(VMA 持有 VkDevice),但晚于所有资源。
   frame_sync_.reset();
   if (ctx_.cmd_pool) vkDestroyCommandPool(ctx_.device, ctx_.cmd_pool, nullptr);
   allocator_.reset();
   ctx_.allocator = nullptr;
-  if (ctx_.device) vkDestroyDevice(ctx_.device, nullptr);
+  if (ctx_.device) {
+    // 进程级的 CUBE 采样器缓存按 VkDevice 持有句柄,设备销毁前必须**真正销毁**
+    // 这些 VkSampler,否则每一帧(每个带天空盒的进程)都会漏掉它们:
+    //   VUID-vkDestroyDevice-device-05137: ... 1 leaked objects ... VkSampler
+    // 注意这里必须用 destroy_cube_samplers(销毁句柄 + 清表),不能只用
+    // cube_sampler_cache_forget(只清表、句柄泄漏)。实测:仅 forget 时
+    // Sky 套件 8 条用例各漏 1 个,正好 8 条 vk-ERROR。
+    // 顺序仍在 vkDestroyDevice 之前:VkSampler 是 VkDevice 的子对象。
+    destroy_cube_samplers(ctx_.device);
+    vkDestroyDevice(ctx_.device, nullptr);
+  }
   destroy_instance(&inst_);
 }
 
@@ -147,7 +204,19 @@ Status VulkanRenderDevice::init(const DeviceDesc& desc, const std::string& devic
     }
   }
 
+  // 先查询物理设备特性再创建逻辑设备。
+  // 直接构造全零 VkPhysicalDeviceFeatures 当 pEnabledFeatures 传入是违规的
+  // (校验层报: called before getting physical device features from
+  //  vkGetPhysicalDeviceFeatures or vkGetPhysicalDeviceFeatures2)。
+  VkPhysicalDeviceFeatures supported_feats{};
+  vkGetPhysicalDeviceFeatures(chosen, &supported_feats);
   VkPhysicalDeviceFeatures feats{};
+  feats.samplerAnisotropy = supported_feats.samplerAnisotropy;
+  feats.shaderStorageImageWriteWithoutFormat =
+      supported_feats.shaderStorageImageWriteWithoutFormat;
+  feats.independentBlend = supported_feats.independentBlend;
+  feats.fillModeNonSolid = supported_feats.fillModeNonSolid;
+
   VkDeviceCreateInfo dci{};
   dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
   dci.queueCreateInfoCount = 1;
@@ -222,6 +291,17 @@ Result<std::unique_ptr<ISwapchain>> VulkanRenderDevice::create_swapchain(const N
   return std::unique_ptr<ISwapchain>(std::move(sc));
 }
 
+Result<std::unique_ptr<ISwapchain>> VulkanRenderDevice::create_swapchain_with_msaa(
+    const NativeSurface& surface, Extent2D extent, std::uint32_t msaa_samples) {
+  if (!logical_ready_) return Status::InitFailed("设备未初始化");
+  auto sc = std::make_unique<VulkanSwapchain>(ctx_, surface);
+  // 顺序不能反：采样数决定 init() 里要建几张什么规格的 MS 图。
+  sc->set_requested_msaa(msaa_samples);
+  Status s = sc->init(extent);
+  if (!s.ok()) return s;
+  return std::unique_ptr<ISwapchain>(std::move(sc));
+}
+
 Status VulkanRenderDevice::notify_lifecycle(const AppLifecycleEvent& ev) {
   (void)ev;
   return Status::Ok_();
@@ -243,7 +323,24 @@ Result<std::unique_ptr<resources::IBuffer>> VulkanRenderDevice::create_buffer(
   Status s = b->init();
   if (!s.ok()) return s;
   // 登记句柄 → 指针,供 submit_command_list() 反查(见 bind_known_buffers)。
-  if (b->id().valid()) known_buffers_.emplace_back(b->id(), b.get());
+  //
+  // 用"覆盖同 id"而不是 emplace_back:表里存的是裸指针,而资源析构后没有任何
+  // 摘表钩子。ResourceId 会被复用(分页分配器回收页 → 新资源拿到同一个 id),
+  // 若只追加不覆盖,反查会命中**已释放的旧指针** → 0xC0000005 /
+  // vkEndCommandBuffer: invalid state,且表现为"单跑绿、全量红"。
+  // 覆盖保证了"同一个 id 永远只指向最新一次登记的对象"。
+  if (b->id().valid()) {
+    const auto id = b->id();
+    bool replaced = false;
+    for (auto& kv : known_buffers_) {
+      if (kv.first == id) {
+        kv.second = b.get();
+        replaced = true;
+        break;
+      }
+    }
+    if (!replaced) known_buffers_.emplace_back(id, b.get());
+  }
   return std::unique_ptr<resources::IBuffer>(std::move(b));
 }
 
@@ -253,7 +350,44 @@ Result<std::unique_ptr<resources::ITexture>> VulkanRenderDevice::create_texture(
   auto t = std::make_unique<VulkanTexture>(ctx_, allocator_.get(), desc);
   Status s = t->init();
   if (!s.ok()) return s;
+  // 登记句柄 → 指针,供 submit_command_list() 反查(bind_sampled_texture 需要)。
+  // 覆盖同 id,理由见 create_buffer。
+  if (t->id().valid()) {
+    const auto id = t->id();
+    bool replaced = false;
+    for (auto& kv : known_textures_) {
+      if (kv.first == id) {
+        kv.second = t.get();
+        replaced = true;
+        break;
+      }
+    }
+    if (!replaced) known_textures_.emplace_back(id, t.get());
+  }
   return std::unique_ptr<resources::ITexture>(std::move(t));
+}
+
+Result<std::unique_ptr<resources::ICubeMap>> VulkanRenderDevice::create_cube_map(
+    const resources::CubeMapDesc& desc) {
+  if (!logical_ready_ || allocator_ == nullptr) return Status::InitFailed("设备未初始化");
+  auto c = std::make_unique<VulkanCubeMap>(ctx_, allocator_.get(), desc);
+  Status s = c->init();
+  if (!s.ok()) return s;
+  // 立方体贴图与 ITexture 是两个接口(ICubeMap 不是 ITexture),单独一张表。
+  // 覆盖同 id,理由见 create_buffer。
+  if (c->id().valid()) {
+    const auto cid = c->id();
+    bool replaced = false;
+    for (auto& kv : known_cubes_) {
+      if (kv.first == cid) {
+        kv.second = c.get();
+        replaced = true;
+        break;
+      }
+    }
+    if (!replaced) known_cubes_.emplace_back(cid, c.get());
+  }
+  return std::unique_ptr<resources::ICubeMap>(std::move(c));
 }
 
 Result<std::unique_ptr<resources::ISampler>> VulkanRenderDevice::create_sampler(
@@ -262,21 +396,128 @@ Result<std::unique_ptr<resources::ISampler>> VulkanRenderDevice::create_sampler(
   auto s = std::make_unique<VulkanSampler>(ctx_, desc);
   Status st = s->init();
   if (!st.ok()) return st;
+  // 采样器的句柄页号是 kSamplerPage、offset 恒 0(见 VulkanSampler 构造),
+  // 因此**所有采样器的 (page_id, offset) 完全相同** —— 反查表不能靠 id 区分它们。
+  //
+  // 这意味着:若用 emplace_back 只追加,表里会堆满历史上创建过的每一个 VulkanSampler
+  // 裸指针,而反查(sampler_at)命中**第一条**,即最陈旧的那个 —— 前面的用例
+  // 结束后对象已析构,下一个用例一用就是 SEH 0xc0000005。
+  // 实测表现:单条 Sky.* 用例跑绿,但在全量串跑里("前一条用例刚销毁采样器")
+  // 变红/崩溃。所以这里必须**覆盖式登记**:同一个 (page,offset) 键永远只保留最新
+  // 一次创建的对象,旧对象被覆盖后被反查彻底遗忘。
+  //
+  // 表键用 s->id()(VulkanSampler 构造时已设为 kSamplerPage / offset 0 / size 1 /
+  // id = slot_index,见 vulkan_texture.cpp)。**槽位号 id 是唯一身份**:
+  // 所有采样器的 (page_id, offset) 完全相同,只有 id 不同。
+  // 覆盖语义按 id 匹配 —— 同一槽位号重建时覆盖,不同槽位号各占一行。
+  {
+    const auto key = s->id();
+    bool replaced = false;
+    for (auto& kv : known_samplers_) {
+      if (kv.first.id == key.id) {
+        kv.second = s.get();
+        replaced = true;
+        break;
+      }
+    }
+    if (!replaced) known_samplers_.emplace_back(key, s.get());
+    // 析构摘表:known_samplers_ 存的是裸指针,对象一析构这里就成了悬垂指针。
+    // 下一个用例/下一帧反查就会读到已销毁的 VkSampler —— 校验层报
+    // "invalid VkSampler ... or has been destroyed",SwiftShader 下直接 SEH。
+    // 所以必须由对象在析构时把自己从表里摘掉(按指针身份匹配,和键无关)。
+    s->set_destroy_hook([this](VulkanSampler* dying) {
+      auto it = std::find_if(known_samplers_.begin(), known_samplers_.end(),
+                             [dying](const auto& kv) { return kv.second == dying; });
+      if (it != known_samplers_.end()) known_samplers_.erase(it);
+    });
+  }
   return std::unique_ptr<resources::ISampler>(std::move(s));
 }
 
 Result<std::unique_ptr<resources::IPipeline>> VulkanRenderDevice::create_pipeline(
     const resources::PipelineDesc& desc) {
   if (!logical_ready_) return Status::InitFailed("设备未初始化");
-  auto p = std::make_unique<VulkanPipeline>(ctx_, desc);
+  // ⚠️ 公共面 create_pipeline(desc) **不携带附件形状** —— 这是 IPipeline 的既定契约,
+  // 改它会打断 L1/L3 的全部调用点。所以这条入口建出来的管线自带 pass 固定是
+  // 「RGBA8 + 1 采样 + 无深度 + 非交换链」,只能画到恰好同形的离屏目标上。
+  //
+  // 2026-11-11 修:以前这里**依赖默认构造**得到一个 has_depth=false 的形状,而没有任何
+  // 地方把这件事说出来,于是 L3 的所有管线(带深度目标 + samples=4)都静默退回到
+  // create_pass() 回退分支 —— t6 的案例表明这会让 `PipelineDesc.samples` 对 render pass
+  // 完全无效、`clear_depth` 被丢弃。
+  //
+  // 现在改成**显式推导**:颜色格式取 RGBA8(与离屏默认一致),深度取自 desc.depth —— 
+  // 只要管线声明了深度测试/深度写/常量深度写,它的自带 pass 就必须有深度附件,
+  // 否则该管线永远不可能与"带深度的目标"兼容。samples 取自 desc.samples。
+  // 这样 `create_pipeline(scene_pipeline_desc(4))`(depthTest+depthWrite=true)得到的
+  // 就是 {RGBA8, 1 采样? 不 —— 4 采样, 有深度},与 l3-cli / F-SK 的真实目标形状一致。
+  // 颜色格式:公共面只能表达"离屏默认形状"(RGBA8)。
+  // 必须与 **L0 建离屏目标时的取法**同源,而不是"设备首选颜色格式"。
+  //
+  // 为什么改(2026-11-11):以前这里取 `caps_.texture_formats[0]`(SwiftShader 上是
+  // BGRA8,枚举值 2),而 `OffscreenTarget` 用的是 `TargetDesc::format`,
+  // 其默认值是 `RGBA8_UNORM`(`device/render_target.h`,枚举值 1)。
+  // 两处从不同的来源取同一个字段 —— 这是"派生与目标分叉"的结构性隐患:
+  // SwiftShader 恰好把 RGBA8 排在 texture_formats[0] 之外,只要换实现或换顺序就会翻车。
+  //
+  // ⚠️ 但请注意:这不是天空盒那 8 条像素用例全清的根因。实测改完之后
+  // `[pipeline] ... color_format=1` 与改之前完全一样(1 本来就是 RGBA8_UNORM,
+  // `Format` 的 Unknown=0 之后第一个枚举),即**颜色格式一直是对的**。
+  // 天空盒真正的失败点是"管线不是本设备的 VulkanPipeline"——见 sky.cpp 的
+  // 设备归属问题。这里只是一次正确的去隐患,不是那个 bug 的修复。
+  AttachmentShape shape;
+  shape.color_format = device::Format::RGBA8_UNORM;
+  // 显式输出一次:这条派生规则是"静默失效"的高发区(MSAA/深度都曾经死在这里)。
+  std::fprintf(stderr,
+               "[pipeline] create_pipeline 派生形状: color_format=%u has_depth=%d samples=%u\n",
+               static_cast<unsigned>(shape.color_format),
+               (desc.depth.depthTest || desc.depth.depthWrite || desc.depth.depthConstWrite) ? 1 : 0,
+               static_cast<unsigned>(desc.samples == 0 ? 1u : desc.samples));
+  shape.has_depth = desc.samples > 0 && (desc.depth.depthTest || desc.depth.depthWrite ||
+                                         desc.depth.depthConstWrite);
+  shape.depth_format = device::Format::D16_UNORM;  // 与 OffscreenTarget 建图格式一致
+  shape.samples = desc.samples == 0 ? 1u : desc.samples;
+  shape.from_swapchain = false;  // 公共面不建交换链管线,见 create_pipeline_for_shape
+
+  // 能力纪律(t6 硬约束):按形状派生的每一个字段都必须自洽,不自洽就明确报错。
+  if (shape.samples > 1 && !is_power_of_two_u32(shape.samples)) {
+    return Status::Invalid("create_pipeline: samples=" + std::to_string(shape.samples) +
+                           " 不是 2 的幂,无法派生附件形状");
+  }
+  auto p = std::make_unique<VulkanPipeline>(ctx_, desc, shape);
   Status s = p->init();
   if (!s.ok()) return s;
   return std::unique_ptr<resources::IPipeline>(std::move(p));
 }
 
 Result<std::unique_ptr<resources::IPipeline>> VulkanRenderDevice::create_pipeline_for_shape(
-    const resources::PipelineDesc& desc, const AttachmentShape& shape) {
+    const resources::PipelineDesc& desc, const resources::AttachmentShape& shape) {
   if (!logical_ready_) return Status::InitFailed("设备未初始化");
+  // 能力纪律:形状的三个关键字段必须被调用方**明确给出**且自洽。
+  //   - color_format 不能是 Unknown(否则 vk_format_of 得到 UNDEFINED,建 pass 必失败);
+  //   - samples 必须是 2 的幂;
+  //   - 有深度时深度格式必须是深度格式。
+  if (shape.color_format == device::Format::Unknown) {
+    return Status::Invalid("create_pipeline_for_shape: color_format=Unknown —— "
+                           "必须按目标真实颜色格式派生(见 IRenderTarget::color_format)");
+  }
+  if (shape.samples == 0 || !is_power_of_two_u32(shape.samples)) {
+    return Status::Invalid("create_pipeline_for_shape: samples=" +
+                           std::to_string(shape.samples) + " 必须是 >=1 的 2 的幂");
+  }
+  if (shape.has_depth && !is_depth_format_of(shape.depth_format)) {
+    return Status::Invalid("create_pipeline_for_shape: has_depth=true 但 depth_format 不是深度格式"
+                           " —— 必须按目标真实深度格式派生");
+  }
+  // samples 必须与 desc 一致:管线按 N 采样光栅、pass 按 M 采样声明时,
+  // vkCmdDraw 会被静默丢弃(只留清屏色)。在创建期就说清楚,比在屏幕上查黑屏便宜。
+  const u32 desc_samples = desc.samples == 0 ? 1u : desc.samples;
+  if (shape.samples != desc_samples) {
+    return Status::Invalid("create_pipeline_for_shape: 形状 samples=" +
+                           std::to_string(shape.samples) + " 与 PipelineDesc.samples=" +
+                           std::to_string(desc_samples) +
+                           " 不一致 —— render pass 与管线的采样数必须逐项相同");
+  }
   auto p = std::make_unique<VulkanPipeline>(ctx_, desc, shape);
   Status s = p->init();
   if (!s.ok()) return s;
@@ -288,6 +529,19 @@ Result<std::unique_ptr<resources::ICommandList>> VulkanRenderDevice::create_comm
   auto c = std::make_unique<VulkanCommandList>(ctx_);
   Status s = c->init();
   if (!s.ok()) return s;
+  // **把设备的资源表挂成"随用随刷"的回调**,而不是创建时快照一次。
+  //
+  // 为什么必须是这样:句柄 → 指针 的反查表若在创建时固化,那么"先建命令列表、
+  // 后建纹理/采样器"这条最自然的顺序就会在 bind_sampled_texture 里报
+  // "未登记该纹理/采样器对象"(实测:天空盒在 CLI 与测试里都栽在这一步),
+  // 而唯一的补救是调 backend 私有入口 —— L3 看不到。
+  // 挂回调之后,任何一个命令列表在 begin_pass 时都能看到**当时**已存在的全部资源,
+  // 调用方不必关心创建顺序。
+  VulkanCommandList* raw = c.get();
+  raw->set_sync_resources_callback([this](VulkanCommandList& list) {
+    bind_known_buffers(list);
+    bind_known_textures(list);
+  });
   return std::unique_ptr<resources::ICommandList>(std::move(c));
 }
 
@@ -295,9 +549,56 @@ Result<std::unique_ptr<resources::ICommandList>> VulkanRenderDevice::create_comm
 
 // 命令列表里只有 ResourceId,设备帧提交需要 IBuffer*。这里按设备自己登记过的
 // 句柄表把指针补进命令列表(命令列表内部维护 ResourceId → IBuffer* 的反查表)。
+//
+// ⚠️ 只登记**本次命令流实际引用到的句柄**(2026-11-11 修跨用例崩溃)。
+// 以前这里无条件遍历 `known_buffers_` 全表登记,而那张表**只增不减**:
+// 资源析构后指针仍留在表里,命令列表拿到的就是悬垂指针。
+// 单条用例跑看不出来(进程里只有一个资源),但全量串跑时大量资源反复创建/销毁,
+// ResourceId 会被复用 → 反查命中已释放内存 → `0xC0000005` /
+// `vkEndCommandBuffer(): command buffer is in an invalid state`,
+// 而且表现为"单跑绿、全量红"的幽灵失败。
 void VulkanRenderDevice::bind_known_buffers(VulkanCommandList& list) const {
+  // ⚠️ **必须全量登记,不能只登记"命令流里已出现的句柄"** —— 与 bind_known_textures
+  // 是同一个鸡生蛋问题(见那里的长注释)。
+  //
+  // bind_vertex_buffer / bind_index_buffer 会在 **append(cmd) 之前**调用
+  // sync_resources()(为了在录制期就能查到句柄),此刻这条 bind 命令还没进
+  // recorded_ —— 于是"按 recorded() 过滤"的条件永远为假,缓冲永远登记不上,
+  // 录制期报 "bind_vertex_buffer: ..." 失败,进而 begin_pass 半途返回错误、
+  // in_pass_ 停在 false,后续 draw 被拦成 "draw_indexed: 不在 pass 内"。
+  // 这正是 F-SK / F-VX 出不了图的直接原因。
+  //
+  // 陈旧句柄的正确解法不是"过滤",而是**资源析构时把自己从表里摘掉**
+  // (与 known_textures_ 同口径,见 VulkanRenderDevice 的说明)。
   for (const auto& kv : known_buffers_) {
     (void)list.remember_buffer_binding(kv.first, kv.second);
+  }
+}
+
+void VulkanRenderDevice::bind_known_textures(VulkanCommandList& list) const {
+  // 纹理 / 立方体贴图 / 采样器是三张独立的表,而 remember_texture_sampler 一次登记
+  // 一对(纹理 + 采样器)。这里按表分别登记。
+  //
+  // ⚠️ **必须全量登记,不能只登记"命令流里已出现的句柄"**。
+  //
+  // 这里曾经按 `list.recorded()` 里出现过的 ResourceId 过滤(本意是"别把指向已析构
+  // 资源的陈旧句柄灌进去"),结果造成一个鸡生蛋问题:
+  //   bind_sampled_texture 在**录制期**就要查这张表(R1/X1 契约要求槽位越界之类的
+  //   错误在录制时报出来),而那时这条命令**还没有进 recorded_** ——
+  //   于是过滤条件永远为假,采样器永远登记不上,录制期直接报
+  //   "未登记该采样器对象"。表现为 8 条 Sky.* 用例全红(单独跑也红)。
+  //
+  // 陈旧句柄的正确解法不是"过滤",而是**资源析构时把自己从表里摘掉**
+  // (与 known_buffers_ 的弱引用同口径;见 VulkanRenderDevice 的说明)。
+  // 表本身只增不减的话会留下悬垂指针 —— 那正是上一轮的崩溃来源。
+  for (const auto& kv : known_textures_) {
+    (void)list.remember_texture_sampler(kv.first, kv.second, resources::ResourceId{}, nullptr);
+  }
+  for (const auto& kv : known_cubes_) {
+    (void)list.remember_cube_map(kv.first, kv.second);
+  }
+  for (const auto& kv : known_samplers_) {
+    (void)list.remember_texture_sampler(resources::ResourceId{}, nullptr, kv.first, kv.second);
   }
 }
 
@@ -319,12 +620,21 @@ Status VulkanRenderDevice::submit_command_list(resources::ICommandList& list) {
 
   // 补全句柄 → 指针的反查表,否则设备帧提交会报"缓冲不是本设备的 VulkanBuffer"。
   bind_known_buffers(*cmd);
+  // 纹理/采样器同理(bind_sampled_texture 的设备态需要 ITexture*/ISampler*)。
+  bind_known_textures(*cmd);
 
   // 走已经实现完整的设备帧提交通路(11 类命令 → vkCmd* → fence 等待)。
   // 统计只用于本地断言:录了命令却一个 draw 都没下发属于配置错误,要报出来,
   // 而不是返回成功让上层去翻一张空图。
   DeviceFrameStats stats{};
   Status s = submit_device_frame(ctx_, *cmd, &stats);
+  // 提交(fence 已等到)后,立刻丢弃本列表在 begin_pass 期间顺带建的
+  // VkCommandBuffer / framebuffer / render pass / image view:
+  // submit_device_frame 用的是它自己的命令缓冲,这一套从未被使用,
+  // 却一直处于录制态并引用调用方 target 的 VkImage。留到析构就会在
+  // image 已被调用方销毁后调 vkEndCommandBuffer → VUID-...-00059。
+  // 返回值只用于决定是否继续,丢弃动作本身必须无条件执行。
+  cmd->discard_vk_side_channel();
   if (!s.ok()) return s;
   if (stats.draw_calls == 0) {
     return Status::Invalid("submit_command_list: 提交成功但没有任何 draw 被下发");
@@ -340,7 +650,11 @@ Result<std::unique_ptr<IRenderDevice>> create_vulkan_device(const DeviceDesc& de
   if (!s.ok()) {
     return s;
   }
+  // G8 / t13: publish the shaped-pipeline resolver to L1 exactly once.
+  // Idempotent: register_pipeline_factory() just stores the function pointer.
+  resources::register_pipeline_factory(&resolve_vulkan_pipeline_factory);
   return std::unique_ptr<IRenderDevice>(std::move(dev));
 }
 
 }  // namespace magicblocks::backend
+

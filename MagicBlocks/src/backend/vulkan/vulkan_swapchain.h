@@ -54,9 +54,67 @@ class VulkanSwapchain final : public device::ISwapchain, public SwapchainImagePr
   // 宽高比失真与手势方向错位。0 表示没取到（视同 IDENTITY）。
   std::uint32_t pre_transform() const { return pre_transform_; }
 
+  // ---- MSAA ----
+  //
+  // 为什么不能直接给 VkSwapchainKHR 开多重采样：Vulkan 规范里交换链的
+  // VkSwapchainCreateInfoKHR **没有** sampleCount 这一项，交换链图永远是单采样。
+  //
+  // 所以多采样只能走"另开一张共享 MS 图"：
+  //   1) 用分页分配器建一张 samples=N 的 color image（G4：零裸分配）；
+  //   2) frame_color_image() 返回这张 MS 图 → render pass 把它当颜色附件画；
+  //   3) frame_resolve_image() 返回交换链图 → pass 末尾由 GPU resolve 回去。
+  // 全程在 GPU 上完成，**零 CPU 回读**（UIG1），也仍然只有一次 submit（UIG2）。
+  //
+  // 必须在 init() 之前调用 set_requested_msaa()：采样数决定 MS 图怎么建。
+  void set_requested_msaa(std::uint32_t n) { requested_msaa_ = n == 0 ? 1u : n; }
+  std::uint32_t requested_msaa() const { return requested_msaa_; }
+  // 实际生效的采样数。设备不支持或建 MS 图失败时**静默退回 1**，
+  // 绝不因为 MSAA 不可用而挡住上屏。
+  std::uint32_t msaa_samples() const { return msaa_samples_; }
+
+  // ---- 给测试用的无 Vk 探针（G3：backend 之外不许出现 Vk* 类型名）----
+  //
+  // 为什么需要它们：per-image MSAA 的正确性就是"每张交换链图配一张自己的 MS 图"，
+  // 这件事只能靠"数量相等"和"句柄互不相同"两个可观测事实来断言。
+  // 直接让测试去看 VkImage 会被 tools/check_layer_purity.py 挡下，所以在这里
+  // 把它们投影成 std::size_t / std::uint64_t / bool。
+  std::size_t swapchain_image_count() const { return views_.size(); }
+  std::size_t msaa_image_count() const { return msaa_images_.size(); }
+  // 越界返回 0（0 不是合法的 VkImage 句柄值）。
+  std::uint64_t msaa_image_value(std::size_t i) const {
+    if (i >= msaa_images_.size()) return 0;
+    return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(msaa_images_[i]));
+  }
+  // 任意两张 MS 图句柄相同即返回 false。
+  bool msaa_images_are_distinct() const {
+    for (std::size_t i = 0; i < msaa_images_.size(); ++i) {
+      if (msaa_images_[i] == VK_NULL_HANDLE) return false;
+      for (std::size_t j = i + 1; j < msaa_images_.size(); ++j) {
+        if (msaa_images_[i] == msaa_images_[j]) return false;
+      }
+    }
+    return true;
+  }
+  // 分页分配器页号：必须与 msaa_images_ 等长且没有重复、没有 0xFFFFFFFF。
+  bool msaa_pages_are_distinct() const {
+    for (std::size_t i = 0; i < msaa_pages_.size(); ++i) {
+      if (msaa_pages_[i] == 0xFFFFFFFFu) return false;
+      for (std::size_t j = i + 1; j < msaa_pages_.size(); ++j) {
+        if (msaa_pages_[i] == msaa_pages_[j]) return false;
+      }
+    }
+    return true;
+  }
+
+
   // 上屏三件事(见 device/swapchain.h)
   device::ISwapchain::ImageResult acquire_next_image() override;
   device::ISwapchain::ImageStatus present_current() override;
+
+  // 索引 → 目标视图。越界返回 nullptr(**不**回退到 0 号图：把索引算错伪装成正常结果，
+  // 正是 current_target() 硬编码 views_[0] 那个 bug 能潜伏这么久的原因)。
+  // current_target() 就是 target_at(current_index_)。
+  device::IRenderTarget* target_at(std::uint32_t index) override;
 
  private:
   device::Status destroy_swapchain();
@@ -78,6 +136,19 @@ class VulkanSwapchain final : public device::ISwapchain, public SwapchainImagePr
   VkFence acquire_fence_ = VK_NULL_HANDLE;
   bool surface_lost_ = false;
   std::uint32_t pre_transform_ = 0;
+
+  // MS 颜色图。归分页分配器所有：这里只持句柄 + 页号，销毁时必须
+  // 把页号还回去（G4 要求图像内存一律走 VulkanPagingAllocator）。
+  //
+  // ⚠️ **每张交换链图一张**，不是共用一张。
+  //   共用一张时，3~4 张交换链图轮流出帧，(N-1) 帧的 GPU 还在往同一块 MS 缓冲里写，
+  //   下一帧就把它 clear 了 —— 表现为"一个不生效、多个出鬼影"。
+  //   in-flight 帧之间必须各有各的 MS 附件。
+  std::uint32_t requested_msaa_ = 1;
+  std::uint32_t msaa_samples_ = 1;
+  std::vector<VkImage> msaa_images_;
+  std::vector<std::uint32_t> msaa_pages_;
+  void destroy_msaa_images();
 };
 
 }  // namespace magicblocks::backend

@@ -102,6 +102,9 @@ enum class StackCode : std::int32_t {
   TemplateOutOfGrid,   // 模板偏移把方块推到网格外
   EmptyStroke,         // 笔迹没有任何有效格
   ColorOutOfRange,     // 颜色模式参数越界
+  // ---- 以下为会话层（stack_session.h）补充，**追加在末尾**，不重排上面的编号 ----
+  InvalidTransition,   // 状态机拒绝了该事件（例如抬笔之后再 Move）
+  PendingStroke,       // 上一次落笔失败尚未补救（StrokeFailed 状态），拒绝新落笔
 };
 
 // 人类可读的错误码名（诊断/日志用，不参与哈希）。

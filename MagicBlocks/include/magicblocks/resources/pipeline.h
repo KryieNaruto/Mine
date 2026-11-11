@@ -23,11 +23,18 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "magicblocks/device/result.h"
 #include "magicblocks/device/types.h"
 #include "magicblocks/resources/handles.h"
+
+// IPipelineFactory 用到 device::IRenderDevice&,这里只声明指针/引用,前向声明即可,
+// 避免 resources/* → device/render_device.h → resources/* 的循环包含。
+namespace magicblocks::device {
+class IRenderDevice;
+}
 
 namespace magicblocks::resources {
 
@@ -183,6 +190,42 @@ enum class PrimitiveType : std::uint8_t {
   LineList = 1,
 };
 
+// ---------------------------------------------------------------- 附件形状(G8)
+//
+// 2026-11-11 (t13/g8): the attachment shape now lives here as a plain value.
+// 为什么形状要住进公共头:
+//   L3 的 IShaderLibrary 需要**按目标形状**派生管线(离屏带深度 / 交换链 BGRA8 /
+//   MSAA 采样数),否则"带深度的目标永远与管线 pass 不兼容"。此前 L3 的做法是
+//   #include "backend/vulkan/vulkan_pipeline.h" 拿 backend::AttachmentShape ——
+//   那是 L3 反向依赖 L0 实现,G8 门控直接判红。
+//   解法:形状降级成**纯值**(device::Format + bool + u32,零 Vk*),住在公共头;
+//   真正建管线的后端入口经 resources::PipelineFactoryTag 间接调用(由后端注册)。
+struct AttachmentShape {
+  // 默认 = 不带深度的 RGBA8 单采样:与公共 create_pipeline(desc) 的既有行为一致,
+  // 因此 PipelineDesc 默认构造出来的 desc.attachment 不会改变任何既有管线的形状。
+  Format color_format = Format::RGBA8_UNORM;
+  bool has_depth = false;
+  Format depth_format = Format::D16_UNORM;
+  u32 samples = 1;
+  // true = 颜色附件是交换链图像:pass 的 initial/finalLayout 必须是 PRESENT_SRC_KHR。
+  bool from_swapchain = false;
+  // 本次 pass 是否清颜色 / 清深度。管线自带 pass 恒为 CLEAR —— 它们**参与**
+  // 形状兼容性比较(vulkan_device_frame.cpp 的 pass_compatible),否则"不清"会被
+  // 静默忽略(F-VX 的双 pass 就是靠这个)。
+  bool clear_color = true;
+  bool clear_depth = true;
+
+  // 值语义比较:后端按形状做 pass 兼容性判定(逐项比较),所以必须可等值比较。
+  // 字段顺序与 backend 侧的同名结构**逐项一致**,便于两侧直接互相转换。
+  bool operator==(const AttachmentShape& o) const {
+    return color_format == o.color_format && has_depth == o.has_depth &&
+           depth_format == o.depth_format && samples == o.samples &&
+           from_swapchain == o.from_swapchain && clear_color == o.clear_color &&
+           clear_depth == o.clear_depth;
+  }
+  bool operator!=(const AttachmentShape& o) const { return !(*this == o); }
+};
+
 // ---------------------------------------------------------------- 描述(R2)
 
 struct PipelineDesc {
@@ -205,7 +248,60 @@ struct PipelineDesc {
   //             固定 set=0, binding=0..slots-1。**不做** bindless / 纹理数组 / 多集。
   // 绑定入口是 ICommandList::bind_sampled_texture(texture, sampler, slot)。
   u32 sampled_texture_slots = 0;
+  // 目标附件形状(G8,2026-11-11)。由调用方按"管线将被录进哪个目标"填;
+  // L3 的 IShaderLibrary 会把它原样透传给按形状派生的后端入口。
+  // 默认值 = 不带深度的 RGBA8 单采样 ⇒ 既有行为零变化。
+  AttachmentShape attachment{};
 };
+
+// ---------------------------------------------------------------- 按形状派生(G8)
+
+// 后端"按形状建管线"能力的**不透明标签**。
+//
+// 分层方向:L1 头里**只**声明这些入口,后端在初始化时把函数指针注册进来
+// (L0 实现 → L1 抽象,单向)。L3 只认 resources::IPipelineFactory 与公共值类型
+// AttachmentShape,永远看不到任何 backend:: / Vk* 类型。
+//
+// IPipeline 的完整定义在本文件更靠后(见下方 class IPipeline),工厂接口只需要
+// unique_ptr 的参数类型,前向声明即可 —— 不能为了它把整个类提前,那会和
+// PipelineDesc 的依赖顺序打架。
+class IPipeline;
+
+class IPipelineFactory {
+ public:
+  IPipelineFactory(const IPipelineFactory&) = delete;
+  IPipelineFactory& operator=(const IPipelineFactory&) = delete;
+  virtual ~IPipelineFactory() = default;
+
+  // 按目标附件形状建管线。失败必须显式返回(不降级为"忽略形状")。
+  virtual device::Result<std::unique_ptr<IPipeline>> create_shaped_pipeline(
+      device::IRenderDevice& device, const PipelineDesc& desc,
+      const AttachmentShape& shape) = 0;
+
+ protected:
+  IPipelineFactory() = default;
+};
+
+// 后端工厂表的两个入口(无状态,按 device 动态解析)。
+//
+//   - PipelineFactoryResolveFn:接收 device,返回该 device 对应的工厂(或 nullptr)。
+//   - register_pipeline_factory:把上面这个**解析器函数**交给 L1。
+//
+// 注意:早先 PipelineFactoryRegisterFn 被写成 `void(*)(PipelineFactoryResolveFn)`,
+// 即"接收注册器的函数",这多了一层毫无必要的间接,且导致实现侧
+// `g_resolver_fn(device)` 编译期 C2664(把 IRenderDevice* 当成解析器传进去)。
+// 现在直接按"注册=交出一个解析器"的语义定义,只有一层。
+using PipelineFactoryResolveFn = IPipelineFactory* (*)(device::IRenderDevice*);
+using PipelineFactoryRegisterFn = PipelineFactoryResolveFn;
+
+// 注册后端工厂解析器。只在后端初始化时调用一次(L0 → L1 的单向注入)。
+// 传 nullptr 表示撤销(设备销毁前)。
+void register_pipeline_factory(PipelineFactoryRegisterFn fn);
+
+// 按当前已注册的后端解析器取工厂;没有后端接管 → nullptr。
+// 调用方拿到 nullptr 时必须显式回落(走 create_pipeline(desc)),
+// 不得静默假定形状已生效。
+IPipelineFactory* resolve_pipeline_factory(device::IRenderDevice* device);
 
 // 校验规则(由 backend 实现,创建时调用):
 //   - stages 为空 → InvalidArgument(Pipeline.RejectsEmptyStages)

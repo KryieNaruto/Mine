@@ -117,6 +117,34 @@ Status submit_once_sync(const VulkanContext& ctx, const char* what, Fn&& fn) {
 // 这里只给 L1 资源用,避免为了一个函数改 L0 头的函数签名)。
 VkFormat vk_format_of(device::Format f);
 
+// ---------------------------------------------------------------- 采样数按格式复核
+//
+// 为什么需要这一组函数(2026-11-10 的真实事故,别再删掉):
+//
+//   设备报告的 caps.supported_msaa_levels 原先只来自
+//   VkPhysicalDeviceLimits::framebufferColorSampleCounts / framebufferDepthSampleCounts,
+//   那是**设备全局上限**,与具体格式无关。SwiftShader 上实测:
+//     全局限制含 8x,但 VK_FORMAT_B8G8R8A8_UNORM 只支持 1x|4x。
+//   于是 caps 报"支持 8x" → UI 让用户选 8x → vkCreateImage 失败(验证层只打印
+//   不拦,vkCreateImage 仍返回 VK_SUCCESS) → 用户以为开了 8x,棱边照旧锯齿,
+//   且没有任何日志。这正是"开了 MSAA 没效果"这个原始 bug 的另一个入口。
+//
+//   所以凡是"这个采样数到底能不能用在某种颜色格式上"的判断,一律走这里:
+//   用 vkGetPhysicalDeviceImageFormatProperties 按**格式**查询,而不是猜全局限制。
+//   两层防线共用同一份实现:caps 探测(开发期就报准) + 建图前兜底(任何设备都生效)。
+
+// 本项目实际会用作颜色的格式集合(B8G8R8A8 / R8G8B8A8,含 SRGB 变体)。
+// caps 探测对它们取**交集**:只有所有格式都支持的采样数才算支持;报并集等于
+// 又回到"报 8x 但某些格式不支持 8x"的老毛病。
+extern const VkFormat kMsaaProbeColorFormats[4];
+
+// 查询某颜色格式在"2D + OPTIMAL + COLOR_ATTACHMENT"用途下支持的采样数位掩码。
+// 查询失败(格式不支持 / 驱动拒绝)返回 0,调用方必须把 0 当成"这个格式不能用"。
+VkSampleCountFlags query_color_sample_counts(VkPhysicalDevice phys, VkFormat format);
+
+// 某颜色格式是否真的支持 samples 指定的采样数(samples<=1 恒为 true)。
+bool color_format_supports_samples(VkPhysicalDevice phys, VkFormat format, std::uint32_t samples);
+
 // 采样数(N) → VkSampleCountFlagBits。
 //
 // 起初它是 vulkan_pipeline.cpp 匿名 namespace 里的私有函数,MSAA 接线时
@@ -130,8 +158,16 @@ VkSampleCountFlagBits to_vk_samples(std::uint32_t n);
 // 未知格式返回 0(调用方必须当成 InvalidArgument)。
 std::uint32_t format_pixel_bytes(device::Format f);
 
+// samples 是否是合法的 Vulkan 采样数(1 或 2 的幂)。
+// 「按目标形状派生管线」的所有入口都必须先过这一关(能力纪律,2026-11-11 t6)。
+inline bool is_power_of_two_u32(std::uint32_t v) { return v != 0 && (v & (v - 1)) == 0; }
+
 // 是否深度(或深度+模板)格式。L1 的 ITexture::readback_rgba8 对这类格式返回 Unsupported。
 bool is_depth_format(device::Format f);
+
+// 与 is_depth_format 同义,C++ 里 `device::Format` 已在该头可见;
+// 单独给一个名字只是让 device 层的调用点读起来不歧义。
+inline bool is_depth_format_of(device::Format f) { return is_depth_format(f); }
 
 // 该格式能否按 RGBA8 口径读回(TransferDst / Sampled 的 RGBA8 与 BGRA8 都可以;
 // R8 与深度格式不行)。读回时若需要通道重排会在 readback 里做一次显式转换。

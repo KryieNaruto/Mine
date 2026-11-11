@@ -671,10 +671,25 @@ struct VulkanPagingAllocator::Impl {
     // spec §6.2-7「不建 dedicated allocation」:显式关掉 KHR_dedicated_allocation,
     // 而不是指望"扩展没探测到" —— 后者是环境相关的偶然,不是保证。
     aci.flags = VMA_ALLOCATOR_CREATE_KHR_DEDICATED_ALLOCATION_BIT;
-    // spec §6.2-7:设备支持时打开 bufferDeviceAddress(为后续 buffer reference 提速)。
-    // bufferDeviceAddress 不在 VkPhysicalDeviceFeatures(Vulkan 1.0 结构)里,
-    // 它是 Vulkan 1.2 核心能力位 / VK_KHR_buffer_device_address 扩展位 →
-    // 必须用 VkPhysicalDeviceFeatures2 链式查询。
+    // spec §6.2-7:bufferDeviceAddress 只在**设备真的启用了该特性**时才打开。
+    //
+    // 曾经的写法是"物理设备支持就置 VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT",
+    // 这是错的:VMA 一旦看到这个 flag,就会给**每一次** vkAllocateMemory 挂上
+    // VkMemoryAllocateFlagsInfo{ VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT },
+    // 而逻辑设备创建时并没有启用 bufferDeviceAddress(实例请求的是 API 1.1,
+    // 该特性要么靠 1.2 核心、要么靠显式启用 VK_KHR_buffer_device_address 扩展),
+    // 于是校验层每次分配都报:
+    //   VUID-VkMemoryAllocateFlagsInfo-flags-parameter
+    //   VUID-VkMemoryAllocateInfo-flags-03331 (bufferDeviceAddress feature is not enabled)
+    // "物理设备支持" ≠ "本设备启用了"。两者必须一致,否则就是永久刷屏的校验错误。
+    //
+    // 现在这一段**不置位**:设备侧没有启用该特性,分配侧就不该用它的 flag。
+    // 要真正用上 bda(为 buffer reference 提速),得先在
+    // vulkan_render_device.cpp 里把特性连同 VK_KHR_buffer_device_address 扩展
+    // 一起启用,再把开关传进来 —— 两边必须成对修改。
+    // (曾尝试直接在设备创建里塞 pNext 链启用,导致 vkCreateDevice 后 SEH
+    //  0xc0000005,已回退;那需要配合 API 版本升级单独验证,不属于本次范围。)
+    // API 版本仍是 1.1:见上面的 aci.vulkanApiVersion 注释。
     // Android 的 libvulkan.so 只导出 Vulkan **1.0** 符号：vkGetPhysicalDeviceFeatures2、
     // vkGetBufferMemoryRequirements2、vkBindBufferMemory2 等 1.1 核心函数在链接期是
     // undefined symbol。VMA 3.5.0 的 VMA_DYNAMIC_VULKAN_FUNCTIONS 默认为 1，但它要求
@@ -686,29 +701,9 @@ struct VulkanPagingAllocator::Impl {
     vma_funcs.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
     vma_funcs.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
     aci.pVulkanFunctions = &vma_funcs;
-    using PFN_GetFeatures2 = PFN_vkGetPhysicalDeviceFeatures2;
-    PFN_GetFeatures2 get_features2 = reinterpret_cast<PFN_GetFeatures2>(
-        vkGetInstanceProcAddr(reinterpret_cast<VkInstance>(handles.instance),
-                              "vkGetPhysicalDeviceFeatures2KHR"));
-    if (!get_features2) {
-      get_features2 = reinterpret_cast<PFN_GetFeatures2>(
-          vkGetInstanceProcAddr(reinterpret_cast<VkInstance>(handles.instance),
-                                "vkGetPhysicalDeviceFeatures2"));
-    }
 #else
-    auto get_features2 = &vkGetPhysicalDeviceFeatures2;
+    (void)vma_funcs;
 #endif
-    if (aci.physicalDevice != VK_NULL_HANDLE && get_features2 != nullptr) {
-      VkPhysicalDeviceBufferDeviceAddressFeatures bda{};
-      bda.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
-      VkPhysicalDeviceFeatures2 feats2{};
-      feats2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-      feats2.pNext = &bda;
-      get_features2(aci.physicalDevice, &feats2);
-      if (bda.bufferDeviceAddress == VK_TRUE) {
-        aci.flags |= VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
-      }
-    }
 
     const VkResult r = vmaCreateAllocator(&aci, &vma);
     if (r != VK_SUCCESS) {
@@ -1479,10 +1474,17 @@ VulkanPagingAllocator::allocate_image_page(const ImagePageRequest& req) {
     ++m.stats.vma_alloc_count;  // M5:真实 vma* 调用才 +1
     if (r != VK_SUCCESS) return Status::OOM(fmt_err("vmaAllocateMemory(图像页)", r));
     p.vma_allocation = allocation;
-    if (!req.device_local) {
-      p.host_ptr = static_cast<std::uint8_t*>(info.pMappedData);
-      p.host_mapped = p.host_ptr != nullptr;
+  // 显式映射:CUBE_MAPPED_BIT / CPU_TO_GPU 都不保证 pMappedData 非空(取决于
+  // VMA 的内存类型选择与主机可见堆布局),这里按需自己 map 一次。
+  // 若不映射,调用方(vulkan_cubemap)拿不到 CPU 侧地址,upload_face 就无法灌像素 ——
+  // 那是硬失败,不是"可以稍后再说"的事。
+  if (!p.host_ptr && m.vma_ready && m.vma != VK_NULL_HANDLE) {
+    void* vma_mapped = nullptr;
+    if (vmaMapMemory(m.vma, p.vma_allocation, &vma_mapped) == VK_SUCCESS) {
+      p.host_ptr = static_cast<std::uint8_t*>(vma_mapped);
+      p.host_mapped = vma_mapped != nullptr;
     }
+  }
   }
 
   m.pages.push_back(std::move(p));
@@ -1566,6 +1568,34 @@ void* VulkanPagingAllocator::image_page_mapped_ptr(u32 page_id) const {
   const Impl::Page* p = m.page_of(page_id);
   if (p == nullptr || !p->image_bound) return nullptr;
   return p->host_ptr;
+}
+
+void* VulkanPagingAllocator::map_image_page(u32 page_id) {
+  Impl& m = *impl_;
+  Impl::Page* p = m.page_of(page_id);
+  if (p == nullptr || !p->image_bound) return nullptr;
+  if (p->host_ptr != nullptr) return p->host_ptr;  // 幂等
+  if (p->page_kind != resources::PageKind::HostVisible) return nullptr;
+  if (!m.vma_ready || m.vma == VK_NULL_HANDLE || p->vma_allocation == VK_NULL_HANDLE) {
+    return nullptr;
+  }
+  void* mapped = nullptr;
+  if (vmaMapMemory(m.vma, p->vma_allocation, &mapped) != VK_SUCCESS) return nullptr;
+  p->host_ptr = static_cast<std::uint8_t*>(mapped);
+  p->host_mapped = mapped != nullptr;
+  return p->host_ptr;
+}
+
+void VulkanPagingAllocator::unmap_image_page(u32 page_id) {
+  Impl& m = *impl_;
+  Impl::Page* p = m.page_of(page_id);
+  if (p == nullptr || !p->image_bound) return;
+  if (p->host_ptr == nullptr) return;
+  if (m.vma_ready && m.vma != VK_NULL_HANDLE && p->vma_allocation != VK_NULL_HANDLE) {
+    vmaUnmapMemory(m.vma, p->vma_allocation);
+  }
+  p->host_ptr = nullptr;
+  p->host_mapped = false;
 }
 
 u64 VulkanPagingAllocator::image_page_size(u32 page_id) const {

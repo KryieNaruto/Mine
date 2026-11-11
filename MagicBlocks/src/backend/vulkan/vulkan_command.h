@@ -5,6 +5,11 @@
 //     draw / draw_indexed / draw_instanced / push_constants / set_viewport /
 //     set_scissor / begin_pass / end_pass。每成功录制一次 command_count() +1,
 //     失败不计数 → Command.RecordsAllOps 断言 == 11。
+//     2026-11-11 勘误:P0(X1)又追加了第 12 类 **bind_sampled_texture**(取值 11,
+//     追加在末尾、不改既有取值)。上面「11 类」是裁定 1 的**原始**口径,仍由
+//     Command.RecordsAllOps 守着;新 op 走独立用例。枚举现共 12 个值。
+//     历史上这句注释停留在 11、而枚举已是 12 —— 正是回放侧漏实现
+//     BindSampledTexture 的诱因(见 vulkan_device_frame.cpp 的 default 分支)。
 //   - **命令流记录偏移而不是指针(M3)**:内部每条命令存 ResourceId(值语义),
 //     并把可打包的句柄 pack 成 u64(packed_resource)—— 回放时同一 page_id/offset
 //     指向同一片内存,且命令流可以整块序列化(L2)。
@@ -19,6 +24,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <utility>
@@ -41,6 +47,7 @@ using resources::ICommandList;
 using resources::IndexFormat;
 using resources::IPipeline;
 using resources::ISampler;
+using resources::ICubeMap;
 using resources::ITexture;
 using resources::RenderPassDesc;
 using resources::ResourceId;
@@ -129,10 +136,29 @@ class VulkanCommandList final : public ICommandList {
   device::Status end_pass() override;
   device::Status bind_sampled_texture(const ResourceId& texture, const ResourceId& sampler,
                                       u32 slot) override;
+  // R1 扩展:从设备刷新"句柄 → 对象"反查表(设备态自动在 begin_pass 调用)。
+  device::Status sync_resources() override;
+  // 设备在创建命令列表时挂上刷新回调(资源可能晚于命令列表创建)。
+  void set_sync_resources_callback(std::function<void(VulkanCommandList&)> cb) {
+    on_sync_resources_ = std::move(cb);
+  }
 
   bool recording() const override { return recording_; }
   bool in_pass() const override { return in_pass_; }
   u32 command_count() const override { return command_count_; }
+
+  // 【设备帧提交路径专用】丢弃本列表在 begin_pass/end_pass 期间"顺带"建出来的
+  // VkCommandBuffer / VkFramebuffer / VkRenderPass / VkImageView。
+  //
+  // 背景:begin_pass() 为了让 L1 的录制在设备态也能自洽,会无条件
+  // vkBeginCommandBuffer 并建一套 pass 对象;但 submit_command_list() 走的是
+  // submit_device_frame(),**另建**命令缓冲重放 recorded_,压根不用这一套。
+  // 于是这一套变成"僵尸":命令缓冲一直在录制态、却引用着调用方 target 的 VkImage。
+  // 调用方(如 Sky 测试)的 target 先于命令列表析构 → 析构时 vkEndCommandBuffer
+  // 发现引用的 image 已销毁,校验层报
+  //   VUID-vkEndCommandBuffer-commandBuffer-00059 (invalid state)
+  // 这就是全仓 00059 剩余的来源。形态:提交完立刻丢弃,趁 image 还活着。
+  void discard_vk_side_channel() { destroy_vk_command_buffer(); }
 
   void reset() override;
 
@@ -161,6 +187,8 @@ class VulkanCommandList final : public ICommandList {
   // 没绑过 → nullptr,设备态下发时明确报错(bind_sampled_texture 的 Unsupported 分支)。
   ITexture* texture_at(const ResourceId& id) const;
   ISampler* sampler_at(const ResourceId& id) const;
+  // R1 扩展:立方体贴图**(不是 ITexture 的子类)**的同款反查表。
+  ICubeMap* cube_map_at(const ResourceId& id) const;
   // 当前绑定的管线(供 push_constants 取 pipeline layout)。
   IPipeline* bound_pipeline() const { return bound_.pipeline; }
 
@@ -173,6 +201,8 @@ class VulkanCommandList final : public ICommandList {
   // VkImageView/VkSampler。未挂的句柄在设备态下发时按 Unsupported 报错。
   Status remember_texture_sampler(const ResourceId& texture, ITexture* tex,
                                   const ResourceId& sampler, ISampler* smp);
+  // R1 扩展:登记立方体贴图句柄 → 对象(采样绑定与设备帧提交都要取它的 cube 视图)。
+  Status remember_cube_map(const ResourceId& cube, ICubeMap* cube_obj);
   // 已录制命令里 op 出现的次数。
   u32 op_count(CommandOp op) const;
   // 已录制命令流是否用了"记录偏移而不是指针"的手法(bind_* 的句柄都能 pack 成功)。
@@ -201,6 +231,9 @@ class VulkanCommandList final : public ICommandList {
   void set_resource(RecordedCommand* cmd, const ResourceId& id);
   // 旁路表:登记"这个句柄对应哪个 IBuffer*"(设备帧提交要取 VkBuffer)。
   void remember_buffer(const ResourceId& id, IBuffer* buffer);
+  // 设备在创建命令列表时挂上"刷新反查表"的回调:资源可以晚于命令列表创建,
+  // 所以 begin_pass 里再拉一次,保证"同一设备上任何命令列表都能用任何资源"。
+  std::function<void(VulkanCommandList&)> on_sync_resources_;
   device::Status check_draw_state(const char* what) const;
   device::Status ensure_vk_command_buffer();
   void destroy_vk_command_buffer();
@@ -231,6 +264,8 @@ class VulkanCommandList final : public ICommandList {
   // P0(X1):纹理/采样器同款反查表(只在设备帧提交取 Vk 句柄时用)。
   std::vector<std::pair<ResourceId, ITexture*>> textures_;
   std::vector<std::pair<ResourceId, ISampler*>> samplers_;
+  // R1 扩展:立方体贴图走独立反查表(ICubeMap 不是 ITexture 的子类)。
+  std::vector<std::pair<ResourceId, ICubeMap*>> cube_maps_;
 
   VkCommandBuffer vk_cmd_ = VK_NULL_HANDLE;
   bool vk_recording_ = false;  // 真实 VkCommandBuffer 已 vkBeginCommandBuffer

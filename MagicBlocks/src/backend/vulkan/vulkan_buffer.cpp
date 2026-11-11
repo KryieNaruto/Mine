@@ -153,7 +153,21 @@ Status VulkanBuffer::allocate_block() {
         break;
       case BufferUsage::Staging:
         // R5 的 CPU 侧暂存:既是上传源,也要能当读回目标。
-        bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        //
+        // 2026-11-11（t16 / R-SK-11）额外加 VERTEX_BUFFER_BIT:
+        // 稳态零分配要求实例属性**常驻一块 CPU 可写的缓冲**并逐帧覆盖写
+        // （L3 的 draw_mesh_instanced 就把它绑到 binding 1）。HostVisible 桶里
+        // 只有 Staging 这一种用途，若不带 VERTEX_BUFFER_BIT，vkCmdBindVertexBuffers
+        // 会报 E-00627 且 draw 被丢弃 —— 实例化绘制只能退回去"每帧 create_buffer"，
+        // 那正好是 R-SK-11 要禁止的事。多声明一个 usage 位不改变布局也不增加内存。
+        //
+        // 同理补 INDEX_BUFFER_BIT：模型目录（ModelCatalog::upload_mesh）把网格的
+        // 顶点/索引缓冲都建成 Staging 并持久映射（免去 upload()/flush 一跳），
+        // 但索引缓冲随后会被 vkCmdBindIndexBuffer 绑定。缺少该位时校验层报
+        //   VUID-vkCmdBindIndexBuffer-buffer-08784
+        // 且索引绑定无效 —— 模型渲染会静默错乱。与 VERTEX_BUFFER_BIT 同源问题。
+        bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                    VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
         break;
     }
     VkResult vr = vkCreateBuffer(ctx_.device, &bci, nullptr, &vk_buffer_);

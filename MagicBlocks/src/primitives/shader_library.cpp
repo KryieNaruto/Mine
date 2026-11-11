@@ -13,6 +13,9 @@
 
 #include "magicblocks/primitives/shader_library.h"
 
+// t6 / R9b:按形状派生管线的**公共**入口(不引入任何 backend:: / Vk* 头)。
+#include "magicblocks/resources/pipeline.h"
+
 namespace magicblocks::primitives {
 
 // ---------------------------------------------------------------- 哈希工具
@@ -183,8 +186,42 @@ class ShaderLibrary final : public IShaderLibrary {
           "ShaderLibrary: 未绑定设备(纯软件态不能派生可绑定管线;材质/哈希功能仍可用)");
     }
 
-    Result<std::unique_ptr<IPipeline>> r =
-        device_->create_pipeline(make_pipeline_desc(*tmpl, raster, shape));
+    // t6 / R9b(2026-11-11):这里过去**只**调 create_pipeline(desc),把 shape 丢了。
+    // 后果:命中本缓存键的管线自带 pass 恒为"单采样、无深度",与带深度/带 MSAA
+    // 的目标永远不兼容 → 设备帧提交只能退回自己建 pass,resolve 附件接不上。
+    //
+    // 修法是用 G8 的**单向注入**桥(不引入任何 backend:: 头):
+    //   resources::resolve_pipeline_factory(device) → IPipelineFactory
+    //                                 → create_shaped_pipeline(device, desc, shape)
+    // 形状从 L3 的 TargetShape 逐字段翻译成公共值类型 resources::AttachmentShape。
+    //
+    // 能力纪律:解析不出工厂(纯软件态 / 后端未注册)时**显式回落**到
+    // create_pipeline(desc),但仅当形状本就是"默认形状"时才允许 —— 否则
+    // 形状会静默丢失,正是上面那条 bug 的复现路径。所以复杂形状拿不到工厂
+    // 一律返回 Unsupported,绝不悄悄按 1 采样建管线。
+    PipelineDesc desc = make_pipeline_desc(*tmpl, raster, shape);
+    Result<std::unique_ptr<IPipeline>> r = Status::Unsupported("ShaderLibrary: 未走到任何派生分支");
+    if (resources::IPipelineFactory* factory = resources::resolve_pipeline_factory(device_)) {
+      resources::AttachmentShape att;
+      att.color_format = shape.color_format;
+      att.has_depth = shape.has_depth;
+      att.depth_format = device::Format::D16_UNORM;  // L3 的 TargetShape 不区分深度格式
+      att.samples = shape.samples == 0 ? 1u : shape.samples;
+      // from_swapchain / clear_* 由设备帧在提交时按真实目标重算,
+      // 这里只负责"按目标形状选对 pass",不预设末态。
+      att.from_swapchain = false;
+      r = factory->create_shaped_pipeline(*device_, desc, att);
+    } else {
+      const bool default_shape = shape.color_format == device::Format::RGBA8_UNORM &&
+                                 !shape.has_depth && (shape.samples == 0 || shape.samples == 1);
+      if (!default_shape) {
+        return Status::Unsupported(
+            "ShaderLibrary: 没有可用的按形状派生工厂,而目标形状不是默认形状"
+            "(samples=" + std::to_string(shape.samples) +
+            ") —— 拒绝按单采样建管线(会静默丢失 MSAA/深度)");
+      }
+      r = device_->create_pipeline(desc);
+    }
     if (!r.ok()) {
       return Status(r.status().code, "ShaderLibrary(" + tmpl->name + "): " + r.message());
     }

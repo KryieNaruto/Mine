@@ -25,6 +25,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -63,6 +64,10 @@ struct UiAppConfig {
   HudLayoutConfig hud{};
   InputRouterConfig input{};
   bool show_perf_panel = true;
+  // UI 布局 v1:左右两个列表面板(左 = 测试模型列表,右 = 玩法列表槽位)。
+  // **条目数据必须由外部注入**(spec §2:UI 层不出现玩法/模型名)。
+  // 条目为空时对应面板照常画出(空列表也有面板与标题),不会退化成"没有面板"。
+  SidebarConfig sidebar{};
 };
 
 class UiApp {
@@ -78,6 +83,23 @@ class UiApp {
 
   // 编译期注册一个玩法（Router 只按 ID 查表，UI 层不含玩法名）。
   void register_feature(FeatureRegistration reg);
+
+  // 重建侧栏(条目数据变化时调用:例如外部把真实模型清单换成新的)。
+  // 会被 UiApp 记下来,SurfaceChanged 重排时沿用同一份条目数据。
+  void set_sidebar(const SidebarConfig& sidebar, std::string* error);
+
+  // 侧栏控件的 id(测试与调试用;找不到时返回全 0)。
+  const SidebarIds& sidebar_ids() const;
+
+  // 往右列表注入"点第 index 条 → 经 Router 进入该玩法"的绑定。
+  //
+  // 这是 UI 布局 v1 的**唯一**玩法入口:条目文案由外部给,feature_id 由外部给,
+  // UI 层只负责"点了就把字符串交给 Router"。空字符串 = 不绑(该条点击无路由)。
+  // ids[index] 必须是右列表里的条目下标;越界返回 false,不静默。
+  bool bind_sidebar_route(std::uint32_t index, const FeatureId& feature_id);
+
+  // 点顶部返回按钮时执行的动作(默认:经 Router pop 回 HomeScreen)。
+  void set_back_action(std::function<void()> action);
 
   // 输入：原始事件先进 InputRouter（§7 仲裁），再进 HUD / Router 的对应出口。
   // HUD 按钮点击最终经由 Router::callback() 触发 push/pop —— 这是**唯一入口**。

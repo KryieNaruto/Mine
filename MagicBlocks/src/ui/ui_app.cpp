@@ -49,6 +49,12 @@ struct UiApp::Impl final : UiAppInternal {
   SceneFrameDriver scene_frame_;
   detail::Overlay2D overlay_;
 
+  // 侧栏(UI 布局 v1)。条目数据来自 cfg.sidebar / set_sidebar(),UI 层不写死。
+  SidebarIds sidebar_ids{};
+  // 右列表下标 → 玩法 ID。条目文案与 ID 都由外部给,UI 层只做"点了就交给 Router"。
+  std::vector<FeatureId> sidebar_routes;
+  std::function<void()> back_action;
+
   // 默认状态存储。所有权在 Impl,但**析构点必须留在 router.cpp** ——
   // MemoryStateStore 的 pimpl 只在那里是完整类型,别的 TU 直接持有会让
   // unique_ptr 的删除器遇到不完整类型。所以这里只留裸指针 + 一个 release()。
@@ -59,8 +65,7 @@ struct UiApp::Impl final : UiAppInternal {
   u64 frame_counter = 0;
   bool initialized = false;
 
-  // 浮层图元：每一帧产出一次。**不进**场景命令列表（UI 合成归壳层）。
-  //
+  // 浮层图元：每一帧产出一次。**不进**场景命令列表（UI 合成归壳层）。  //
   // 设计：内部累积器 `overlay_` 是**唯一**的图元产出点（离屏通道与
   // `as_internal()->overlay()` 都读它）；若壳层提供了 `IOverlay2D`，
   // 同一批图元再转发一份给壳层去合成。两者内容一致，只是消费方不同。
@@ -100,7 +105,6 @@ struct UiApp::Impl final : UiAppInternal {
   // UiAppInternal
   void draw_ui_for_current_target() override { draw_overlay(); }
   const detail::Overlay2D& overlay() const override { return overlay_; }
-
   ~Impl() { delete default_store; }
 };
 
@@ -157,6 +161,31 @@ bool UiApp::init(const UiAppConfig& cfg, const UiAppDeps& deps, std::string* err
   d.input_router_.set_config(cfg.input);
   d.input_router_.set_hud(&d.hud_);
 
+  // UI 布局 v1:用外部注入的条目构建左右侧栏。
+  // 条目为空也照常构建(空列表 + 面板 + 标题),不会退化成"没有面板"。
+  d.sidebar_routes.assign(cfg.sidebar.right_items.size(), FeatureId{});
+  SidebarConfig sidebar = cfg.sidebar;
+  // 右列表的点击先落到"下标 → 路由"上;路由表由 bind_sidebar_route() 填。
+  // 这里用捕获本 Impl 的 lambda,保证 set_sidebar 重建后依然有效。
+  sidebar.on_right_item = [&d](std::uint32_t index) {
+    if (index >= d.sidebar_routes.size()) return;
+    const FeatureId& id = d.sidebar_routes[index];
+    if (id.empty()) return;  // 没绑路由的条目:点击只做高亮,不路由
+    d.router_.push(id);
+  };
+  d.sidebar_ids = build_sidebar_hud(&d.hud_, cfg.hud, cfg.display, sidebar);
+  d.input_router_.set_hud(&d.hud_);  // 重建控件树后重新指向同一实例(指针未变,防御性)
+  // 返回按钮:默认经 Router 回 HomeScreen(唯一入口)
+  if (auto* back = d.hud_.find(d.sidebar_ids.back_button)) {
+    back->on_click = [&d]() {
+      if (d.back_action) {
+        d.back_action();
+      } else {
+        d.router_.pop();
+      }
+    };
+  }
+
   // 场景帧驱动:配置在构造期定死(in_flight 属不可变决策),
   // 所以这里用最直白的做法 —— 换一个新的实例。
   d.scene_frame_.~SceneFrameDriver();
@@ -178,6 +207,48 @@ void UiApp::register_feature(FeatureRegistration reg) {
   impl_->router_.register_feature(std::move(reg));
 }
 
+void UiApp::set_sidebar(const SidebarConfig& sidebar, std::string* error) {
+  Impl& d = *impl_;
+  if (!d.initialized) {
+    if (error) *error = "set_sidebar: UiApp 尚未 init";
+    return;
+  }
+  d.cfg.sidebar = sidebar;
+  d.sidebar_routes.assign(sidebar.right_items.size(), FeatureId{});
+
+  SidebarConfig s = sidebar;
+  s.on_right_item = [&d](std::uint32_t index) {
+    if (index >= d.sidebar_routes.size()) return;
+    const FeatureId& id = d.sidebar_routes[index];
+    if (id.empty()) return;
+    d.router_.push(id);
+  };
+  d.sidebar_ids = build_sidebar_hud(&d.hud_, d.cfg.hud, d.cfg.display, s);
+  if (auto* back = d.hud_.find(d.sidebar_ids.back_button)) {
+    back->on_click = [&d]() {
+      if (d.back_action) {
+        d.back_action();
+      } else {
+        d.router_.pop();
+      }
+    };
+  }
+}
+
+const SidebarIds& UiApp::sidebar_ids() const { return impl_->sidebar_ids; }
+
+bool UiApp::bind_sidebar_route(std::uint32_t index, const FeatureId& feature_id) {
+  Impl& d = *impl_;
+  if (index >= d.sidebar_routes.size()) return false;
+  d.sidebar_routes[index] = feature_id;
+  return true;
+}
+
+void UiApp::set_back_action(std::function<void()> action) {
+  Impl& d = *impl_;
+  d.back_action = std::move(action);
+}
+
 void UiApp::on_input(const device::InputEvent& ev) {
   Impl& d = *impl_;
   if (!d.initialized) return;
@@ -195,14 +266,17 @@ void UiApp::on_lifecycle(const device::AppLifecycleEvent& ev) {
 
   switch (ev.kind) {
     case device::LifecycleKind::SurfaceChanged:
-      // 旋转/缩放:改尺寸 + HUD 重排 + 交换链重建(不是每帧重建,spec §5.4)
+      // 旋转/缩放:改尺寸 + 侧栏按新尺寸重排 + 交换链重建(不是每帧重建,spec §5.4)
       if (ev.width && ev.height) {
         d.cfg.display.width = ev.width;
         d.cfg.display.height = ev.height;
-        d.hud_.relayout(d.cfg.hud, d.cfg.display, 44.f, 64.f);
+        // 侧栏几何依赖屏幕尺寸 → 用同一份条目数据重建(路由绑定随后恢复)
+        const std::vector<FeatureId> routes = d.sidebar_routes;
+        std::string err;
+        set_sidebar(d.cfg.sidebar, &err);
+        if (d.sidebar_routes.size() == routes.size()) d.sidebar_routes = routes;
         // 若壳层用的是我们的桌面参考 sink,顺手帮它重建;移动端壳层自己处理。
         if (auto* host = dynamic_cast<ShellSurfaceSink*>(d.deps.scene_sink)) {
-          std::string err;
           host->rebuild(device::Extent2D{ev.width, ev.height}, &err);
         }
       }

@@ -142,8 +142,28 @@ TEST(Device, ValidationCountsAreMeasured) {
   ASSERT_TRUE(r.ok()) << r.message();
   auto dev_ = r.take();
   EXPECT_EQ(dev_->wait_idle().code, dev::StatusCode::Ok);
-  // caps 可读、设备名有值 —— 说明实例真的建起来了(校验层挂在实例上)
   EXPECT_FALSE(dev_->caps().device_name.empty());
+
+  // 层就绪的直接证据:实例创建时层真的被交给 vkCreateInstance 了。
+  // 不能用 message_count>0 做判据 —— 代码干净时一条消息都没有。
+  EXPECT_TRUE(dev_->validation_enabled())
+      << "校验层没启用 —— VK_LAYER_KHRONOS_validation 可能未注册";
+  // 健康跑批:ERROR 级消息必须为 0。
+  EXPECT_EQ(dev_->validation_error_count(), 0u)
+      << "校验层报了 " << dev_->validation_error_count() << " 条 ERROR";
+}
+
+// 关闭校验层时没有任何消息，且 validation_enabled() 为 false。
+TEST(Device, ValidationOffMeansNoMessages) {
+  dev::DeviceDesc d = sw_desc();
+  d.enable_validation = false;
+  auto r = dev::create_render_device(d);
+  ASSERT_TRUE(r.ok()) << r.message();
+  auto dev_ = r.take();
+  EXPECT_EQ(dev_->wait_idle().code, dev::StatusCode::Ok);
+  EXPECT_FALSE(dev_->validation_enabled());
+  EXPECT_EQ(dev_->validation_message_count(), 0u);
+  EXPECT_EQ(dev_->validation_error_count(), 0u);
 }
 
 TEST(Device, CapsAreComplete) {

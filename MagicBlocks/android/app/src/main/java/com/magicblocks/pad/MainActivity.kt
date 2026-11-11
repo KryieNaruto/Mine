@@ -54,6 +54,11 @@ class MainActivity : ComponentActivity() {
     private var statusText by mutableStateOf("引擎启动中…")
     private var showHud by mutableStateOf(true)
 
+    // MSAA 状态。msaaLevels 在引擎 attach 后才拿得到（设备真实支持的档位），
+    // 所以初值只有 1x；msaaCurrent 存的是**实际生效**的采样数，不是请求值。
+    private var msaaLevels by mutableStateOf(listOf(1))
+    private var msaaCurrent by mutableStateOf(1)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Log.i(MbRenderer.TAG, "MainActivity.onCreate")
@@ -81,7 +86,16 @@ class MainActivity : ComponentActivity() {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
             )
-            onStatus = { s -> statusText = s }
+            onStatus = { s ->
+                statusText = s
+                // 引擎 attach 完成后才会有真实的设备档位，所以在这里同步一次。
+                // 注意要 runOnUiThread：onStatus 是从渲染路径回调进来的。
+                runOnUiThread {
+                    val lv = try { supportedMsaaLevels() } catch (e: Throwable) { listOf(1) }
+                    if (lv != msaaLevels) msaaLevels = lv
+                    msaaCurrent = try { effectiveMsaaSamples() } catch (e: Throwable) { 1 }
+                }
+            }
         }
 
         val root = FrameLayout(this).apply {
@@ -96,7 +110,20 @@ class MainActivity : ComponentActivity() {
                     onToggleHud = { showHud = !showHud },
                     onReset = { surfaceView.resetView() },
                     onZoomIn = { surfaceView.zoomBy(1.25f) },
-                    onZoomOut = { surfaceView.zoomBy(0.8f) }
+                    onZoomOut = { surfaceView.zoomBy(0.8f) },
+                    msaaLevels = msaaLevels,
+                    msaaCurrent = msaaCurrent,
+                    onCycleMsaa = {
+                        // 循环切档：1 → 4 → 8 → 1。档位来自设备上报，
+                        // 切完一定要把**实际生效值**读回来（可能被静默降级）。
+                        if (msaaLevels.size > 1) {
+                            val idx = msaaLevels.indexOf(msaaCurrent).coerceAtLeast(0)
+                            val next = msaaLevels[(idx + 1) % msaaLevels.size]
+                            Log.i(MbRenderer.TAG, "切换 MSAA -> 请求 $next x（支持: $msaaLevels）")
+                            msaaCurrent = surfaceView.applyMsaa(next)
+                            Log.i(MbRenderer.TAG, "MSAA 实际生效: ${msaaCurrent}x")
+                        }
+                    }
                 )
             }
         }
@@ -127,7 +154,10 @@ private fun OverlayUi(
     onToggleHud: () -> Unit,
     onReset: () -> Unit,
     onZoomIn: () -> Unit,
-    onZoomOut: () -> Unit
+    onZoomOut: () -> Unit,
+    msaaLevels: List<Int>,
+    msaaCurrent: Int,
+    onCycleMsaa: () -> Unit
 ) {
     Row(
         modifier = Modifier.fillMaxSize().padding(20.dp),
@@ -151,6 +181,13 @@ private fun OverlayUi(
                 Text(text = "拖拽旋转 · 双指缩放", color = Color(0xFFBBBBCC), fontSize = 13.sp)
                 Spacer(Modifier.size(4.dp))
                 Text(text = status, color = Color(0xFF8899AA), fontSize = 11.sp)
+                Spacer(Modifier.size(4.dp))
+                Text(
+                    text = "MSAA 实际 ${if (msaaCurrent > 1) "${msaaCurrent}x" else "关闭"}" +
+                        "（支持 ${msaaLevels.joinToString("/")}）",
+                    color = if (msaaCurrent > 1) Color(0xFF7FE0A0) else Color(0xFF8899AA),
+                    fontSize = 11.sp
+                )
             }
         }
 
@@ -173,6 +210,18 @@ private fun OverlayUi(
                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xE6246B8F))
             ) {
                 Text("复位", color = Color.White, fontSize = 14.sp)
+            }
+            Button(
+                onClick = onCycleMsaa,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (msaaCurrent > 1) Color(0xE23E8B5A) else Color(0xE2454A5C)
+                )
+            ) {
+                Text(
+                    text = if (msaaCurrent > 1) "MSAA ×$msaaCurrent" else "MSAA 关",
+                    color = Color.White,
+                    fontSize = 14.sp
+                )
             }
             Button(
                 onClick = onToggleHud,

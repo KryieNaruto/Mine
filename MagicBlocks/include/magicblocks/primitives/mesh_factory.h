@@ -54,13 +54,71 @@ struct ExtrudeParams {
   Color4 color{1.0f, 1.0f, 1.0f, 1.0f};
 };
 
+// ---------------------------------------------------------------- 双表示（R-SK-12）
+//
+// 一串**中心线采样点**有两种标准几何解读。这是 2D 路径几何的通用概念
+// （任何"描边 vs 填充"的内容都成立），不是某个玩法的专用通道：
+//
+//   PathStyle::Ribbon —— 描边：按笔宽 offset 成带状轮廓（`stroke_outline`）。
+//   PathStyle::Region —— 填充：路径本身作为闭合多边形的边界，**不做笔宽 offset**。
+//
+// 它们之所以放在 L3，是因为 `OutlineSet` 必须能**标注自己是怎么来的**
+// （`source_style`），否则下游（挤出 / 调试 / 测试）无法回答"这条轮廓
+// 是描边出来的还是填充出来的"。L4 只负责"选哪一种"，不写玩法分支。
+enum class PathStyle : std::uint8_t {
+  Ribbon = 0,  // 描边：折线按笔宽加粗
+  Region = 1,  // 填充：折线作为闭合多边形边界
+};
+
+// 多个闭合区域之间的布尔运算。
+//
+// **本轮只实现 Union**。其余三个存在但未实现：调用时返回明确的 Unsupported
+// 状态，而不是被静默当成 Union（D8：失败要响，不许悄悄降级）。
+// 留着它们是为了让命令流/文件格式从一开始就带上这个字段 ——
+// 否则将来加"挖空"功能又要改格式版本。
+enum class RegionOp : std::uint8_t {
+  Union = 0,       // 并集（本轮支持）
+  Difference = 1,  // 差集（未实现）
+  Intersect = 2,   // 交集（未实现）
+  Xor = 3,         // 异或（未实现）
+};
+
+// 是否支持给定的区域运算。调用方应先问再做，免得执行到一半才发现不支持。
+inline bool supports_region_op(RegionOp op) { return op == RegionOp::Union; }
+
 // 轮廓集合：外轮廓 + 孔。每条轮廓是闭合环（首尾**不**重复存同一个点）。
 // 孔与外的区分交给三角化器按绕序/填充规则处理，这里不做归属判断。
 struct OutlineSet {
   std::vector<std::vector<Vec2>> outer;
   std::vector<std::vector<Vec2>> holes;
+  // 来源标注：这片轮廓由哪种解读生成（R-SK-12 / A13 第 3 条）。
+  // 默认 Ribbon 是因为它是 `stroke_outline` 的语义；`region_outline` 会显式写 Region。
+  PathStyle source_style = PathStyle::Ribbon;
+  // 生成它的输入哈希（dirty 检测 / 复现校验用）。0 = 未计算。
+  // 口径：对**中心线采样点 + 参数**做位模式混合，不含地址/时间。
+  std::uint64_t source_hash = 0;
   bool empty() const { return outer.empty(); }
 };
+
+// 中心线 → 指定解读的轮廓。
+//
+// 失败一律返回**空的** OutlineSet（`empty()==true`，且 `error` 指向静态字符串），
+// 绝不在失败时退回另一种解读 —— 那就是静默降级。
+struct OutlineResult {
+  OutlineSet outline;
+  // 成功时为空串；失败时是静态字符串（无分配，可安全返回）。
+  const char* error = "";
+  bool ok() const { return error[0] == '\0'; }
+};
+
+// 把一条中心线按 `style` 解读成轮廓。
+//   Ribbon：等价于 `stroke_outline(points, width, round_cap, arc_steps)`。
+//   Region：路径本身就是多边形边界。要求 `points.size() >= 3` 且首尾距离
+//           <= `close_tolerance`（**不自动闭合**：把 "C" 连成 "O" 是改变用户意图）。
+//           width 不参与几何。首尾重复点会被去掉（from_outline 隐式闭合）。
+OutlineResult make_outline(const std::vector<Vec2>& points, PathStyle style, float width,
+                           bool round_cap, std::uint32_t arc_steps = 6,
+                           float close_tolerance = 1e-3f);
 
 // 把轮廓挤出成网格（纯 CPU，无设备即可单测）。
 //

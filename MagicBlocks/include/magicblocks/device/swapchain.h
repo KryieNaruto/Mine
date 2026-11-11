@@ -30,6 +30,26 @@ class ISwapchain {
   // 取下当前帧的渲染目标(由 swapchain 拥有,不可 Delete)。
   virtual IRenderTarget* current_target() = 0;
 
+  // 按索引取渲染目标(由 swapchain 拥有,不可 Delete)。
+  //
+  // 语义写成**默认实现**而不是纯虚:current_target() 的契约就是
+  // 「返回最近一次 acquire 到的那张」,所以 target_at(i) 作默认实现能让
+  // 所有后端立刻获得一致行为,也不破坏已有的第三方实现。
+  //
+  // 越界返回 nullptr(不返回 0 号图 —— 那会把"索引算错"伪装成正常结果)。
+  //
+  // 存在理由:交换链图数 > 1 时,current_target() 若硬编码 views_[0],
+  // 上屏会拿到错的那张。把"索引 → 目标"的映射单独暴露出来,测试就能在
+  // 没有真实多图交换链(软件驱动可能永远只给 0 号)的环境里验证索引语义。
+  //
+  // !! 默认实现**忽略 index**,恒返回 current_target()。
+  //    单图后端可以接受;多图后端**必须覆写**,否则 target_at(i) 对任意 i
+  //    都返回「当前那张」,调用方会以为自己读到了第 i 张。
+  virtual IRenderTarget* target_at(std::uint32_t index) {
+    (void)index;  // 默认实现不支持按索引取图,见上方说明。
+    return current_target();
+  }
+
   // ---- 上屏三件事(2026-11 补:此前 acquire/present 在后端根本没有实现)----
   //
   // acquire 从交换链取下一张可写 image;present 把已渲染的那张交给显示端。

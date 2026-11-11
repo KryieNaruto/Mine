@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstring>
 #include <limits>
 
 namespace magicblocks::primitives {
@@ -1190,6 +1191,102 @@ std::vector<Vec2> stroke_outline(const std::vector<Vec2>& points, float width, b
   }
 
   return out;
+}
+
+// ---------------------------------------------------------------- 双表示（R-SK-12）
+
+namespace {
+
+// 来源哈希：对**中心线采样点 + 参数**按位模式混合。
+// 不用数值转换（-0.0f 与 0.0f 必须不同：复现要求逐位一致）。
+std::uint64_t mix_source(std::uint64_t h, float v) {
+  std::uint32_t bits = 0;
+  std::memcpy(&bits, &v, sizeof(bits));
+  h ^= static_cast<std::uint64_t>(bits);
+  h *= 0x100000001b3ull;
+  return h;
+}
+
+}  // namespace
+
+OutlineResult make_outline(const std::vector<Vec2>& points, PathStyle style, float width,
+                           bool round_cap, std::uint32_t arc_steps, float close_tolerance) {
+  OutlineResult r;
+  r.outline.source_style = style;
+
+  // ---- 来源哈希：先算，成功与失败都能回答"这片轮廓来自哪组输入" ----
+  std::uint64_t h = 0xCBF29CE484222325ull;
+  h ^= static_cast<std::uint64_t>(style);
+  h *= 0x100000001b3ull;
+  h = mix_source(h, width);
+  h = mix_source(h, round_cap ? 1.0f : 0.0f);
+  for (const Vec2& p : points) {
+    h = mix_source(h, p.x);
+    h = mix_source(h, p.y);
+  }
+  r.outline.source_hash = h;
+
+  switch (style) {
+    case PathStyle::Ribbon: {
+      if (points.size() < 2) {
+        r.error = "Ribbon 需要至少 2 个采样点";
+        return r;
+      }
+      if (!(width > 0.0f)) {
+        r.error = "Ribbon 需要正的笔宽";
+        return r;
+      }
+      std::vector<Vec2> ring = stroke_outline(points, width, round_cap, arc_steps);
+      if (ring.size() < 3) {
+        r.error = "Ribbon 轮廓点数不足,无法成面";
+        return r;
+      }
+      r.outline.outer.push_back(std::move(ring));
+      return r;
+    }
+
+    case PathStyle::Region: {
+      // Region 要求折线真的闭合。**不自动闭合**：
+      // 自动连首尾会把用户画的 "C" 变成 "O"，那是改变用户意图，
+      // 属于静默修正 —— D8 明令禁止。
+      if (points.size() < 3) {
+        r.error = "Region 需要至少 3 个采样点";
+        return r;
+      }
+      const Vec2& a = points.front();
+      const Vec2& b = points.back();
+      const float dx = b.x - a.x;
+      const float dy = b.y - a.y;
+      if (std::sqrt(dx * dx + dy * dy) > close_tolerance) {
+        r.error = "Region 要求折线首尾闭合(超出容差)";
+        return r;
+      }
+      // 首尾极近 → 去掉末尾那个点，由 from_outline 隐式闭合。
+      // 不去掉会让 tess 看到一条零长度边。
+      std::vector<Vec2> ring = points;
+      {
+        const float sx = ring.back().x - ring.front().x;
+        const float sy = ring.back().y - ring.front().y;
+        if (sx * sx + sy * sy <= 1e-12f) ring.pop_back();
+      }
+      // 再做一次相邻去重：连续重复点同样会产生零长度边。
+      ring = clean_ring(ring);
+      if (ring.size() < 3) {
+        r.error = "Region 去重后点数不足,无法成面";
+        return r;
+      }
+      // 注意：**不做笔宽 offset**。这是 Region 与 Ribbon 的分叉点，
+      // 也是 A13 第 2 条（"闭合且无笔宽 offset"）的判据来源。
+      // 统一成逆时针（与 stroke_outline 同口径，from_outline 靠它定外法线）。
+      if (signed_area(ring) < 0.0f) std::reverse(ring.begin(), ring.end());
+      r.outline.outer.push_back(std::move(ring));
+      return r;
+    }
+  }
+
+  // 未知枚举值（将来的新 PathStyle 忘了在这里实现）。
+  r.error = "未知的 PathStyle";
+  return r;
 }
 
 std::unique_ptr<IMeshFactory> create_mesh_factory() {

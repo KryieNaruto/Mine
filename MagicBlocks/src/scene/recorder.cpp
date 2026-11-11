@@ -428,6 +428,13 @@ class RecorderImpl final : public IRecorder {
                                   resources::u32) override {
         return Status::Ok_();
       }
+      // 契约(`ICommandList::sync_resources`)明写:"纯软件态是空操作"。
+      // 这里正是纯软件态 —— 回放路径上没有设备、没有登记表,也**不需要**有:
+      // 命令流本身已经由 recorded_ 保存,资源反查由真正执行它的
+      // VulkanCommandList 在提交时完成。所以这里是 Ok 的空操作,**不是** Unsupported:
+      // Unsupported 会表示"这个实现做不到",而这里本来就无需做。
+      // 另:sync_resources() 不是一条命令,不计入 command_count()(下面恒为 0)。
+      Status sync_resources() override { return Status::Ok_(); }
       Status begin_pass(const resources::RenderPassDesc&) override { return Status::Ok_(); }
       Status end_pass() override { return Status::Ok_(); }
       bool recording() const override { return true; }

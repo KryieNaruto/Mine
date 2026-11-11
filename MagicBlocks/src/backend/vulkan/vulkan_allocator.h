@@ -199,9 +199,19 @@ class VulkanPagingAllocator final : public resources::IMemoryAllocator {
   device::Status bind_buffer_page(u32 page_id, std::uintptr_t buffer);
   // 销毁图像后调用:把该页退回 VMA(计入 vma_free_count)。
   device::Status release_image_page(u32 page_id);
-  // 该页的 Host 映射首址(读回缓冲用);设备页返回 nullptr。
+  // 该页的 Host 映射首址(读回缓冲用);设备页 / 未映射返回 nullptr。
   void* image_page_mapped_ptr(u32 page_id) const;
   u64 image_page_size(u32 page_id) const;
+  // ---- 需要 CPU 侧写入的图像页(纹理上传 / 立方体贴图六面)----
+  //
+  // allocate_image_page 的 device_local=false 分支会返回一张 **未映射** 的
+  // HOST_VISIBLE 页(host_ptr 为空):VMA 只在 VMA_ALLOCATION_CREATE_MAPPED_BIT
+  // 时才预映射。图像页的既定用法是"整块交给 VkImage 直接采样",没人写过;
+  // 而立方体贴图必须从 CPU 侧灌像素,所以这里补一对显式 map/unmap:
+  //   - map_page 幂等:已映射则直接返回同一地址;非 HostVisible 页返回 nullptr;
+  //   - unmap_page 与它成对,未映射时无操作(不算错误)。
+  void* map_image_page(u32 page_id);
+  void unmap_image_page(u32 page_id);
 
   // ------------------------------------------------------------ 桶页绑定指针(L1-C 资源对象用)
   // 桶内切出来的子块(VulkanBuffer / VulkanTexture)由 VkBuffer / VkImage 的

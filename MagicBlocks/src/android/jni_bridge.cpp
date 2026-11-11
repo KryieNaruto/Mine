@@ -103,6 +103,42 @@ Java_com_magicblocks_pad_MbRenderer_nativeDestroy(JNIEnv*, jclass, jlong handle)
   delete unpack(handle);
 }
 
+// ---- MSAA 开关 ----
+//
+// 采样数必须在 attach_surface **之前**设定（交换链要按它决定建几张 MS 图），
+// 所以这是一个"先设值、再 attach"的接口，不是 attach 之后能偷偷改的开关。
+// Kotlin 侧切换 MSAA 的做法就是 detach → set → attach，与这里配套。
+
+JNIEXPORT void JNICALL
+Java_com_magicblocks_pad_MbRenderer_nativeSetMsaa(JNIEnv*, jclass, jlong handle, jint samples) {
+  auto* r = unpack(handle);
+  if (r != nullptr) r->set_msaa_samples(samples > 0 ? static_cast<std::uint32_t>(samples) : 1u);
+}
+
+// 实际生效的采样数：设备不支持时会低于请求值，UI 要显示这个值而不是请求值。
+JNIEXPORT jint JNICALL
+Java_com_magicblocks_pad_MbRenderer_nativeMsaaSamples(JNIEnv*, jclass, jlong handle) {
+  auto* r = unpack(handle);
+  return r ? static_cast<jint>(r->effective_msaa_samples()) : 1;
+}
+
+// 设备支持的采样数，逗号分隔（如 "1,4,8"）。
+// 用字符串而不是 jintArray：省掉一次数组构造 + 逐元素读，Kotlin 侧 split 一下即可。
+JNIEXPORT jstring JNICALL
+Java_com_magicblocks_pad_MbRenderer_nativeSupportedMsaa(JNIEnv* env, jclass, jlong handle) {
+  auto* r = unpack(handle);
+  std::string s;
+  if (r != nullptr) {
+    const auto lv = r->supported_msaa_levels();
+    for (std::size_t i = 0; i < lv.size(); ++i) {
+      if (i) s += ',';
+      s += std::to_string(lv[i]);
+    }
+  }
+  if (s.empty()) s = "1";
+  return env->NewStringUTF(s.c_str());
+}
+
 // Surface -> ANativeWindow*。ANativeWindow_fromSurface 会给引用计数 +1，
 // 这**一个**引用由引擎持有：attach_surface 成功后一直在用，detach_surface 时由
 // SceneRenderer 调 ANativeWindow_release 还掉。所以这里**不能** release。

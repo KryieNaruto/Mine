@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstring>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace magicblocks::ui {
@@ -25,6 +26,7 @@ const char* to_string(ControlKind kind) {
     case ControlKind::Label: return "Label";
     case ControlKind::Slider: return "Slider";
     case ControlKind::Swatch: return "Swatch";
+    case ControlKind::ListItem: return "ListItem";
   }
   return "Unknown";
 }
@@ -56,6 +58,15 @@ struct Hud::Impl {
   std::unordered_map<std::uint32_t, std::size_t> index_by_id;
   std::uint32_t next_id = 1;
 
+  // 列表面板 → 最近一次布局结果(测试与可见性提示都读它)
+  std::unordered_map<std::uint32_t, ListColumnLayout> list_layouts;
+  // ListItem id → 所属面板 id。**必须显式记录**:只靠几何位置判断归属时,
+  // 另一个面板的条目矩形可能恰好落进本面板的 viewport(实测踩到过),
+  // 于是"右面板的列表"会把左面板的条目也算进来。
+  std::unordered_map<std::uint32_t, std::uint32_t> item_owner;
+  // 被"列表布局"接管的面板 id。这类面板只由 layout_list_panel 摆几何。
+  std::unordered_set<std::uint32_t> list_panels;
+
   // 输入会话状态
   std::uint32_t active_id = 0;   // 当前按下的控件
   bool dragging_slider = false;
@@ -72,13 +83,32 @@ struct Hud::Impl {
 
   // 命中:后加入的控件在上层(与绘制顺序相反),所以**从后往前**找第一个命中。
   // 容器 Panel 也参与命中:点在面板空白处时由面板消费,避免穿透到相机(spec §7 ①)。
+  //
+  // 列表裁剪:被"滚出 viewport"的 ListItem 几何上已经挪到面板外,但仍可能落在
+  // 别的控件上;而且**不可见的条目绝不能被点到**(否则用户点空白处会选中看不见
+  // 的那一条)。所以 ListItem 命中前要确认自身完整落在 viewport 内。
   Control* hit(Vec2 p) {
     for (std::size_t i = controls.size(); i-- > 0;) {
       Control& c = controls[i];
       if (!c.enabled) continue;
+      if (c.kind == ControlKind::ListItem && !list_item_visible(c)) continue;
       if (c.rect_px.contains(p)) return &c;
     }
     return nullptr;
+  }
+
+  // ListItem 是否落在**它所属面板**的 viewport 内(整条都在内才算)。
+  bool list_item_visible(const Control& c) const {
+    auto owner = item_owner.find(c.id);
+    if (owner == item_owner.end()) return true;  // 不隶属于任何列表:按普通控件处理
+    auto it = list_layouts.find(owner->second);
+    if (it == list_layouts.end()) return true;
+    const ListColumnLayout& lay = it->second;
+    return c.rect_px.h > 0.f &&
+           c.rect_px.x >= lay.viewport.x - 0.5f &&
+           c.rect_px.right() <= lay.viewport.right() + 0.5f &&
+           c.rect_px.y >= lay.viewport.y - 0.5f &&
+           c.rect_px.bottom() <= lay.viewport.bottom() + 0.5f;
   }
 
   void update_slider(Control& c, Vec2 p) {
@@ -98,6 +128,9 @@ Hud::~Hud() = default;
 void Hud::clear() {
   impl_->controls.clear();
   impl_->index_by_id.clear();
+  impl_->list_layouts.clear();
+  impl_->list_panels.clear();
+  impl_->item_owner.clear();
   impl_->next_id = 1;
   impl_->active_id = 0;
   impl_->dragging_slider = false;
@@ -171,6 +204,9 @@ void Hud::relayout(const HudLayoutConfig& cfg, DisplayInfo display, f32 top_bar_
   const f32 inner_h = std::max(8.f, panel_h - 2 * pad);
   for (auto& c : impl_->controls) {
     if (c.kind == ControlKind::Panel) {
+      // 被列表布局接管的面板(左右侧栏)几何由 layout_list_panel 负责,
+      // 通用通道不许再把它按到底部矩形上 —— 否则左右面板会叠成一块。
+      if (impl_->list_panels.count(c.id)) continue;
       c.rect_px = bottom;
       continue;
     }
@@ -189,6 +225,8 @@ void Hud::relayout(const HudLayoutConfig& cfg, DisplayInfo display, f32 top_bar_
       inner_x += s + gap;
       continue;
     }
+    // 列表条目由 layout_list_panel 排布,绝不进通用通道
+    if (c.kind == ControlKind::ListItem) continue;
     // 其余(按钮/标签)若已在顶栏排过就不再动;未排过的摆进底部面板
     if (c.rect_px.w <= 0.f || c.rect_px.h <= 0.f) {
       const f32 w = (c.kind == ControlKind::Button) ? std::min(btn_w, inner_w)
@@ -198,6 +236,150 @@ void Hud::relayout(const HudLayoutConfig& cfg, DisplayInfo display, f32 top_bar_
       inner_x += w + gap;
     }
   }
+  (void)top_bar_dp;
+}
+
+// ---------------------------------------------------------------- 列表面板
+
+ListColumnLayout Hud::layout_list_panel(std::uint32_t panel_id, std::uint32_t first_row,
+                                        const HudLayoutConfig& cfg) {
+  ListColumnLayout out;
+  Control* panel = find(panel_id);
+  if (!panel || panel->kind != ControlKind::Panel) return out;
+
+  impl_->list_panels.insert(panel_id);  // 从此这个面板归列表布局管
+  const f32 d = 1.f;  // 像素空间:面板几何已经是像素,行高在构建期由 dp*density 换算
+  const f32 pad = cfg.panel_padding_dp * d;
+  out.panel = panel->rect_px;
+  out.row_height_px = cfg.list_row_height_dp * d;
+
+  // viewport = 面板内边距之后;去掉顶部标题行,避免条目压住标题
+  const f32 title_h = cfg.list_row_height_dp * d;
+  out.viewport = Rect{panel->rect_px.x + pad, panel->rect_px.y + pad + title_h,
+                      std::max(0.f, panel->rect_px.w - 2.f * pad),
+                      std::max(0.f, panel->rect_px.h - 2.f * pad - title_h)};
+
+  // 收集**本面板**的 ListItem(按加入顺序 = 列表顺序)。
+  // 归属优先看 item_owner(显式登记);没登记过的条目则按"几何落在面板内"认领。
+  std::vector<std::size_t> items;
+  for (std::size_t i = 0; i < impl_->controls.size(); ++i) {
+    const Control& c = impl_->controls[i];
+    if (c.kind != ControlKind::ListItem) continue;
+    auto owner = impl_->item_owner.find(c.id);
+    if (owner != impl_->item_owner.end()) {
+      if (owner->second == panel_id) items.push_back(i);
+      continue;
+    }
+    // 未登记:由本面板认领(此后固定归属,不再漂移)
+    impl_->item_owner[c.id] = panel_id;
+    items.push_back(i);
+  }
+  out.item_ids.reserve(items.size());
+  out.total_rows = static_cast<std::uint32_t>(items.size());
+  out.visible_rows = out.row_height_px > 0.f
+                         ? static_cast<std::uint32_t>(out.viewport.h / out.row_height_px)
+                         : 0;
+  out.scrollable = out.total_rows > out.visible_rows;
+
+  // 起始行夹到合法范围:越界的滚动值不许把列表滚出面板(也不许回绕)
+  std::uint32_t max_first = out.scrollable ? (out.total_rows - out.visible_rows) : 0;
+  out.first_visible_row = std::min(first_row, max_first);
+  out.clamped_first_row = out.first_visible_row;
+
+  // 逐条排布:可见的落进 viewport 内,不可见的挪到面板外(仍不可命中)
+  for (std::uint32_t k = 0; k < items.size(); ++k) {
+    Control& c = impl_->controls[items[k]];
+    out.item_ids.push_back(c.id);
+    if (k < out.first_visible_row ||
+        k >= out.first_visible_row + out.visible_rows) {
+      // 移出可见区:几何收成 0 高,绘制阶段自然跳过(不越界画)
+      c.rect_px = Rect{out.viewport.x, out.viewport.y, out.viewport.w, 0.f};
+      continue;
+    }
+    const std::uint32_t row = k - out.first_visible_row;
+    c.rect_px = Rect{out.viewport.x, out.viewport.y + static_cast<f32>(row) * out.row_height_px,
+                     out.viewport.w, out.row_height_px};
+    c.index = k;
+    c.index_total = out.total_rows;
+  }
+
+  // 滚动条(可见性提示):面板右缘一条细轨道 + 按可见比例缩放的滑块
+  if (out.scrollable && out.visible_rows > 0) {
+    const f32 bar_w = 4.f;
+    out.scrollbar_track = Rect{panel->rect_px.right() - pad - bar_w, out.viewport.y, bar_w,
+                               out.viewport.h};
+    const f32 frac = static_cast<f32>(out.visible_rows) /
+                     static_cast<f32>(out.total_rows);
+    const f32 thumb_h = std::max(8.f, out.viewport.h * frac);
+    const f32 travel = std::max(0.f, out.viewport.h - thumb_h);
+    const f32 t = max_first > 0 ? static_cast<f32>(out.first_visible_row) /
+                                      static_cast<f32>(max_first)
+                                : 0.f;
+    out.scrollbar_thumb = Rect{out.scrollbar_track.x,
+                               out.viewport.y + travel * t, bar_w, thumb_h};
+    out.has_scrollbar = true;
+  }
+
+  impl_->list_layouts[panel_id] = out;
+  return out;
+}
+
+ListColumnLayout Hud::list_layout(std::uint32_t panel_id) const {
+  auto it = impl_->list_layouts.find(panel_id);
+  return it == impl_->list_layouts.end() ? ListColumnLayout{} : it->second;
+}
+
+std::vector<std::uint32_t> Hud::visible_list_items(std::uint32_t panel_id) const {
+  std::vector<std::uint32_t> out;
+  const ListColumnLayout lay = list_layout(panel_id);
+  for (std::uint32_t id : lay.item_ids) {
+    const Control* c = find(id);
+    if (!c || c->rect_px.h <= 0.f) continue;  // 被滚动裁掉的条目不进"可见"
+    out.push_back(id);
+  }
+  return out;
+}
+
+std::vector<std::uint32_t> Hud::add_list_items(std::uint32_t panel_id,
+                                               const std::vector<std::string>& labels) {
+  std::vector<std::uint32_t> ids;
+  if (!find(panel_id)) return ids;  // 没有面板 = 明确什么都不做(不静默建孤儿控件)
+  ids.reserve(labels.size());
+  for (std::size_t i = 0; i < labels.size(); ++i) {
+    Control item;
+    item.kind = ControlKind::ListItem;
+    item.label = labels[i];
+    item.index = static_cast<std::uint32_t>(i);
+    item.index_total = static_cast<std::uint32_t>(labels.size());
+    item.fill = palette::kPanelStroke;   // 条目底色(比面板亮一档)
+    item.stroke = Rgba8{0, 0, 0, 0};
+    item.text_color = palette::kText;
+    const std::uint32_t id = add(item);
+    // 归属在**加入那一刻**就登记,不能等到布局时再认领 ——
+    // 否则先布局左面板会把右面板的条目也一起认领走(实测踩到过)。
+    impl_->item_owner[id] = panel_id;
+    ids.push_back(id);
+  }
+  return ids;
+}
+
+bool Hud::select_list_item(std::uint32_t panel_id, std::uint32_t selected_index) {
+  if (!find(panel_id)) return false;
+  // 先保证本面板的条目归属已建立(否则 item_ids 为空)
+  ListColumnLayout lay = list_layout(panel_id);
+  if (lay.item_ids.empty()) lay = layout_list_panel(panel_id, lay.first_visible_row, impl_->cfg);
+  bool found = false;
+  for (std::uint32_t id : lay.item_ids) {
+    Control* c = find(id);
+    if (!c) continue;
+    if (c->index == selected_index) {
+      c->selected = true;
+      found = true;
+    } else {
+      c->selected = false;
+    }
+  }
+  return found;
 }
 
 bool Hud::on_input(const device::InputEvent& ev) {
@@ -327,6 +509,46 @@ void Hud::draw(stub::IOverlay2D& overlay) const {
         ++impl_->counts.strokes;
         break;
       }
+      case ControlKind::ListItem: {
+        // 不可见(被滚动裁掉)的条目几何高度为 0 → 一个图元都不画
+        if (c.rect_px.h <= 0.f) break;
+        // 选中态用强调色条 + 提亮的底色;按下再提亮一档(确定性,无动画)
+        Rgba8 fill = c.selected ? palette::kAccentDim : c.fill;
+        if (c.pressed) {
+          fill = Rgba8{static_cast<std::uint8_t>(std::min(255, fill.r + 40)),
+                       static_cast<std::uint8_t>(std::min(255, fill.g + 40)),
+                       static_cast<std::uint8_t>(std::min(255, fill.b + 40)), fill.a};
+        }
+        if (c.selected) fill.a = 255;  // 选中必须不透明,否则像素断言抓不稳
+        if (!c.enabled) fill.a = static_cast<std::uint8_t>(fill.a / 2);
+        if (fill.a) {
+          overlay.fill_rect(c.rect_px, fill);
+          ++impl_->counts.quads;
+        }
+        if (c.selected) {
+          // 左侧 3px 强调条:选中态在像素上是一条独立的竖直色块
+          overlay.fill_rect(Rect{c.rect_px.x, c.rect_px.y, 3.f, c.rect_px.h}, palette::kAccent);
+          ++impl_->counts.quads;
+        }
+        if (c.draw_text && !c.label.empty()) {
+          draw_label(overlay, c.rect_px, c.label, c.text_color);
+          ++impl_->counts.text_runs;
+        }
+        break;
+      }
+    }
+  }
+
+  // 滚动条(可见性提示):画在条目之后,保证在最上层,且夹在面板内。
+  // 只画 track/thumb 两条实心矩形 —— 没有新图元类型,后端无需改动。
+  for (const auto& kv : impl_->list_layouts) {
+    const ListColumnLayout& lay = kv.second;
+    if (!lay.has_scrollbar || lay.scrollbar_track.empty()) continue;
+    overlay.fill_rect(lay.scrollbar_track, palette::kPanelStroke);
+    ++impl_->counts.quads;
+    if (!lay.scrollbar_thumb.empty()) {
+      overlay.fill_rect(lay.scrollbar_thumb, palette::kAccent);
+      ++impl_->counts.quads;
     }
   }
 }
@@ -383,6 +605,104 @@ std::uint32_t build_minimal_hud(Hud* hud, const HudLayoutConfig& cfg, DisplayInf
 
   hud->relayout(cfg, display, 44.f, 64.f);
   return hud->size();
+}
+
+// ---------------------------------------------------------------- 侧栏(左列表 + 右列表)
+
+SidebarIds build_sidebar_hud(Hud* hud, const HudLayoutConfig& cfg, DisplayInfo display,
+                             const SidebarConfig& sidebar) {
+  SidebarIds ids;
+  if (!hud) return ids;
+  hud->clear();
+
+  const f32 d = display.density > 0.f ? display.density : 1.f;
+  const f32 W = static_cast<f32>(display.width);
+  const f32 H = static_cast<f32>(display.height);
+  const f32 m = cfg.margin_dp * d;
+  const f32 gap = cfg.gap_dp * d;
+  const f32 row_h = cfg.row_height_dp * d;
+
+  // ---- 顶部一行:返回按钮 + 两侧标题标签(标题文案由外部注入) ----
+  Control back;
+  back.kind = ControlKind::Button;
+  back.label = sidebar.back_button_label.empty() ? std::string("back")
+                                                 : sidebar.back_button_label;
+  back.fill = palette::kAccentDim;
+  back.stroke = palette::kPanelStroke;
+  back.rect_px = Rect{m, m, std::min(cfg.button_width_dp * d, std::max(0.f, W - 2 * m)),
+                      row_h};
+  ids.back_button = hud->add(back);
+
+  const f32 top_bar_bottom = m + row_h + gap;
+
+  // ---- 两块面板:左右分列,中间留 gap,两侧留 margin,不越界 ----
+  const f32 avail = std::max(0.f, W - 2 * m - gap);
+  f32 panel_w = avail * std::clamp(cfg.list_panel_width_ratio, 0.05f, 0.49f);
+  panel_w = std::min(panel_w, avail * 0.5f);  // 任何比例都不许挤掉另一块
+  const f32 panel_h = std::max(0.f, H - top_bar_bottom - m);
+
+  Control left;
+  left.kind = ControlKind::Panel;
+  left.fill = palette::kPanelFill;
+  left.stroke = palette::kPanelStroke;
+  left.draw_text = false;
+  left.rect_px = Rect{m, top_bar_bottom, panel_w, panel_h};
+  ids.left_panel = hud->add(left);
+
+  Control right = left;
+  right.rect_px = Rect{m + panel_w + gap, top_bar_bottom, panel_w, panel_h};
+  ids.right_panel = hud->add(right);
+
+  // ---- 标题:贴在各自面板顶部 ----
+  if (!sidebar.left_title.empty()) {
+    Control t;
+    t.kind = ControlKind::Label;
+    t.label = sidebar.left_title;
+    t.text_color = palette::kTextDim;
+    t.draw_text = true;
+    t.rect_px = Rect{left.rect_px.x + cfg.panel_padding_dp * d, left.rect_px.y,
+                     left.rect_px.w, cfg.list_row_height_dp * d};
+    hud->add(t);
+  }
+  if (!sidebar.right_title.empty()) {
+    Control t;
+    t.kind = ControlKind::Label;
+    t.label = sidebar.right_title;
+    t.text_color = palette::kTextDim;
+    t.draw_text = true;
+    t.rect_px = Rect{right.rect_px.x + cfg.panel_padding_dp * d, right.rect_px.y,
+                     right.rect_px.w, cfg.list_row_height_dp * d};
+    hud->add(t);
+  }
+
+  // ---- 两个列表:条目文案全部由外部注入 ----
+  ids.left_items = hud->add_list_items(ids.left_panel, sidebar.left_items);
+  ids.right_items = hud->add_list_items(ids.right_panel, sidebar.right_items);
+
+  // 回调:点击 → 通知外部(用列表内下标,不用控件 id,外部不必知道 HUD 内部编号)
+  for (std::size_t i = 0; i < ids.left_items.size(); ++i) {
+    if (auto* c = hud->find(ids.left_items[i])) {
+      const std::uint32_t idx = static_cast<std::uint32_t>(i);
+      auto cb = sidebar.on_left_item;
+      if (cb) c->on_click = [cb, idx]() { cb(idx); };
+    }
+  }
+  for (std::size_t i = 0; i < ids.right_items.size(); ++i) {
+    if (auto* c = hud->find(ids.right_items[i])) {
+      const std::uint32_t idx = static_cast<std::uint32_t>(i);
+      auto cb = sidebar.on_right_item;
+      if (cb) c->on_click = [cb, idx]() { cb(idx); };
+    }
+  }
+
+  // 初始滚动位置(越界会被夹住,不崩)
+  hud->layout_list_panel(ids.left_panel, sidebar.left_first_row, cfg);
+  hud->layout_list_panel(ids.right_panel, sidebar.right_first_row, cfg);
+
+  // 初始选中(空列表自然什么都不选中)
+  if (!ids.left_items.empty()) hud->select_list_item(ids.left_panel, sidebar.left_selected);
+  if (!ids.right_items.empty()) hud->select_list_item(ids.right_panel, sidebar.right_selected);
+  return ids;
 }
 
 }  // namespace magicblocks::ui

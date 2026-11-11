@@ -52,8 +52,10 @@
 #include "magicblocks/features/stack/block_brush.h"
 #include "magicblocks/features/stack/block_set.h"
 #include "magicblocks/features/stack/color_mode.h"
+#include "magicblocks/features/stack/grid_overlay.h"
 #include "magicblocks/features/stack/shape_template.h"
 #include "magicblocks/features/stack/stack_render.h"
+#include "magicblocks/features/stack/stack_session.h"
 #include "magicblocks/features/stack/stack_types.h"
 #include "magicblocks/features/sketch/sketch_document.h"
 #include "magicblocks/features/sketch/sketch_pipeline.h"
@@ -99,6 +101,10 @@ struct Args {
   bool inner_pass = true;
   bool inner_pass_given = false;
   bool dry_run = false;  // 只跑到逻辑阶段，不建设备不出图（§13.3）
+  // ---- 网格指示（需求「立方体…带网格指示」）----
+  // 缺省 **开**：需求原文点名要有网格指示，缺省关掉等于需求没落地。
+  // 关掉只为一件事：让"开/关两张图必须不同"的像素用例有对照图。
+  bool grid_overlay = true;
 };
 
 void print_usage() {
@@ -114,6 +120,7 @@ void print_usage() {
       "                            [--template square|circle|cross|sphere] [--template-radius 2]\n"
       "                            [--color-mode flat|by-layer|by-stroke] [--lock-layer N]\n"
       "                            [--inner-pass on|off] [--dry-run] --output stack.png\n"
+      "          stack 的网格指示缺省开，可用 [--grid-overlay on|off] 关掉做对照。\n"
       "\n"
       "通用可选参数:\n"
       "  --msaa N    MSAA 采样数(1=关闭,缺省;可填设备支持的 2/4/8)。\n"
@@ -198,6 +205,18 @@ int parse_args(int argc, char** argv, Args* out) {
       out->inner_pass_given = true;
     } else if (a == "--dry-run") {
       out->dry_run = true;
+    } else if (a == "--grid-overlay") {
+      if (!take_value(argc, argv, &i, "--grid-overlay", &v)) return -2;
+      // 与 --inner-pass 同一纪律：取值必须显式，不接受"让程序决定"。
+      if (v == "on" || v == "1" || v == "true") {
+        out->grid_overlay = true;
+      } else if (v == "off" || v == "0" || v == "false") {
+        out->grid_overlay = false;
+      } else {
+        std::fprintf(stderr, "--grid-overlay 取值必须显式(on|off|1|0|true|false), 实际: %s\n",
+                     v.c_str());
+        return -2;
+      }
     } else if (a == "--inner-depth-const") {
       // §13.1 / D-VX-4′：该参数**不存在**，且永远不该存在。
       // 它对应 depthConstWrite → depthBounds 特性（本设备从未请求，属 UB）。
@@ -2239,14 +2258,21 @@ int cmd_stack(const Args& args) {
       make_stack_strokes(args.strokes, args.layers, args.cell_size, grid.half_extent,
                          args.column_height);
 
-  // ---- 2) 逐笔吸附 → DDA → 去重 → IBlockSet ----
-  auto set_r = mbst::create_block_set(grid);
-  if (!set_r.ok()) {
-    std::fprintf(stderr, "[code=%d] %s\n", static_cast<int>(set_r.error_code()),
-                 set_r.text().c_str());
+  // ---- 2) 逐笔吸附 → DDA → 去重 → IStackSession（设计 §3.1 的状态机，不再用过程式流程）----
+  //
+  // 为什么这里必须走会话而不是直接调 IBlockSet：
+  //   · 「一笔的完整生命周期」（落笔 → 采样 → 抬笔 → 可被撤销）原先只存在于
+  //     这段函数的代码顺序里，没有任何对象持有，因此"撤销"在渲染路径上无法被验证；
+  //   · 会话把非法顺序（抬笔后还 Move、失败未补救就开下一笔）变成**显式错误**，
+  //     而不是悄悄做出某个结果。
+  std::unique_ptr<mbst::IStackSession> session = mbst::create_stack_session(grid);
+  if (!session) {
+    std::fprintf(stderr, "[code=%d] GridSpec 非法: cell_size=%g layers=%d half_extent=%d\n",
+                 static_cast<int>(mbst::StackCode::OutOfGrid), static_cast<double>(grid.cell_size),
+                 grid.layers, grid.half_extent);
     return 1;
   }
-  std::unique_ptr<mbst::IBlockSet> set = std::move(set_r).take();
+  mbst::IBlockSet* set = &session->mutable_set();
 
   mbst::BrushConfig bcfg;
   bcfg.grid = grid;
@@ -2270,6 +2296,7 @@ int cmd_stack(const Args& args) {
   // 前者是"后画的圈压在先画的圈上"，是叠叠乐的正常形态；
   // 后者是同一条笔迹内部的 DDA 重复。）
   std::uint32_t total_cross_skipped = 0;
+  std::uint32_t total_samples = 0;
   std::vector<mbp::Ray> rays;
   for (std::size_t i = 0; i < inputs.size(); ++i) {
     const StackStrokeInput& in = inputs[i];
@@ -2285,8 +2312,16 @@ int cmd_stack(const Args& args) {
     // 而 `--column-height 3` 立刻撞"柱高越顶"。这不是生成器的错，是调用方
     // 没告诉笔刷"我要第几层"。
     // `--lock-layer` 是用户覆盖项；没给时按每笔自己的 plane_layer 锁。
+    //
+    // 锁层走**会话**（§6.5 的子状态机）与笔刷**两处**：笔刷侧的 LayerLock 决定
+    // 射线吸附到哪一层，会话侧的 locked_layer 决定 GridOverlay 高亮哪一层、
+    // 并进会话快照。两处必须同一个值，否则"画在第 2 层、高亮第 0 层"。
     const std::int32_t want_layer = (args.lock_layer >= 0) ? args.lock_layer : in.plane_layer;
     if (auto ls = brush->layer_lock().lock(want_layer); !ls.ok()) {
+      std::fprintf(stderr, "[code=%d] %s\n", static_cast<int>(ls.error_code()), ls.text().c_str());
+      return 1;
+    }
+    if (auto ls = session->lock_layer(want_layer); !ls.ok()) {
       std::fprintf(stderr, "[code=%d] %s\n", static_cast<int>(ls.error_code()), ls.text().c_str());
       return 1;
     }
@@ -2311,12 +2346,14 @@ int cmd_stack(const Args& args) {
 
     // 有模板时，把每个已吸附格当作模板锚点展开；否则按列高直接落块。
     //
-    // ⚠️ 与 `IBlockBrush::commit` 的分工：commit 是"整笔原子、碰到已占格就
-    // 整体失败"（§7 的语义，给交互式落笔用：用户点到的格已占，应该整笔拒绝
-    // 而不是画出一半）。CLI 是**批量堆叠**，后画的圈天然会压在先画的圈上 ——
-    // 那是"叠叠乐"的正常形态，不是错误。所以这里不走 commit，而是自己按
-    // 列高生成块，再走 `add_stroke` 的"跳过已占格"路径（plan.stats.
-    // skipped_occupied 已经统计过笔迹内部的重叠，这里统计跨笔的重叠）。
+    // ⚠️ 会话的 `end_stroke` 对"格已被占用"的语义是：该格不生效并计数进
+    // skipped_occupied（§6.4 / §8），整笔**不**失败 —— 后画的圈压在先画的圈上
+    // 是叠叠乐的常态。这里因此不再需要"手动滤掉已占格"的旁路：把整笔的格
+    // （含重叠）交给会话，由会话在落块时去重并统计跨笔重叠。
+    //
+    // 模板分支的插入顺序是 `(y,z,x)` 升序（既有实现如此），它**与按下标序的
+    // 列高分支不同**：真源下标序 → doc_hash，所以这里的顺序是 golden 契约的一部分，
+    // 不许趁改写顺手改成"更自然"的顺序（那会让所有模板 golden 全部漂移）。
     std::vector<mbst::Cell> cells;
     if (tmpl.count > 0) {
       for (const mbst::Cell& anchor : plan.cells) {
@@ -2344,22 +2381,29 @@ int cmd_stack(const Args& args) {
       }
     }
 
-    // 滤掉已被占用的格（跨笔重叠）。剩下的为空 → 这一笔完全被前笔盖住，
-    // 跳过即可；不必报错，因为它不是逻辑错误。
-    std::vector<mbst::Cell> fresh;
-    fresh.reserve(cells.size());
-    for (const mbst::Cell& c : cells) {
-      if (set->find(c) == nullptr) fresh.push_back(c);
-    }
-    total_cross_skipped += static_cast<std::uint32_t>(cells.size() - fresh.size());
-    if (fresh.empty()) continue;
-
-    auto add = mbst::add_stroke(set.get(), fresh, stroke_colors[i], set->next_stroke_id());
-    if (!add.ok()) {
-      std::fprintf(stderr, "[code=%d] %s\n", static_cast<int>(add.error_code()),
-                   add.text().c_str());
+    // 一次落笔 = 会话里的一次完整生命周期：begin → move×N → end。
+    // 这里把同一笔的格按"采样批次"喂进去，保留 Move 的语义（便于将来接真实输入）。
+    mbst::StrokeRequest req;
+    req.rgba = stroke_colors[i];
+    req.layer = want_layer;
+    if (auto bs = session->begin_stroke(req); !bs.ok()) {
+      std::fprintf(stderr, "[code=%d] 第 %zu 笔 begin_stroke: %s\n",
+                   static_cast<int>(bs.error_code()), i, bs.text().c_str());
       return 1;
     }
+    ++total_samples;
+    if (auto ms = session->move_sample(cells); !ms.ok()) {
+      std::fprintf(stderr, "[code=%d] 第 %zu 笔 move_sample: %s\n",
+                   static_cast<int>(ms.error_code()), i, ms.text().c_str());
+      return 1;
+    }
+    auto committed = session->end_stroke();
+    if (!committed.ok()) {
+      std::fprintf(stderr, "[code=%d] 第 %zu 笔 end_stroke: %s\n",
+                   static_cast<int>(committed.error_code()), i, committed.text().c_str());
+      return 1;
+    }
+    total_cross_skipped += committed.value().skipped_occupied;
   }
 
   if (set->size() == 0) {
@@ -2370,6 +2414,7 @@ int cmd_stack(const Args& args) {
   // ---- 颜色模式 ----
   // 三种模式对色板形状的要求不同（Flat 必须恰好 1 项），所以按模式构造，
   // 而不是拿"每笔一色"那张表硬套 —— 后者在 Flat 下必然报 ColorOutOfRange。
+  // 走会话的 apply_color_mode：改色会清空撤销栈（改色之后"撤销整笔"已不成立）。
   mbst::ColorPalette mode_palette;
   switch (color_mode) {
     case mbst::ColorMode::Flat:
@@ -2383,11 +2428,14 @@ int cmd_stack(const Args& args) {
       mode_palette = stroke_colors;  // 每笔一色
       break;
   }
-  mbst::ColorApplyStats cstats{};
-  if (auto s = mbst::apply_color_mode(*set, color_mode, mode_palette, &cstats); !s.ok()) {
-    std::fprintf(stderr, "[code=%d] %s\n", static_cast<int>(s.error_code()), s.text().c_str());
+  auto color_r = session->apply_color_mode(color_mode, mode_palette);
+  if (!color_r.ok()) {
+    std::fprintf(stderr, "[code=%d] %s\n", static_cast<int>(color_r.error_code()),
+                 color_r.text().c_str());
     return 1;
   }
+  const mbst::ColorApplyStats cstats{};
+  (void)cstats;
 
   const std::uint64_t doc_hash = set->hash();
 
@@ -2397,8 +2445,7 @@ int cmd_stack(const Args& args) {
                 set->stroke_count(), set->size(), total_emitted, total_skipped,
                 static_cast<unsigned long long>(doc_hash));
     return 0;
-  }
-  // ---- 3) 设备 ----
+  }  // ---- 3) 设备 ----
   auto dev_r = dev::create_render_device(software_desc());
   if (!dev_r.ok()) {
     std::fprintf(stderr, "[stack] 创建设备失败: %s\n", dev_r.message().c_str());
@@ -2467,7 +2514,7 @@ int cmd_stack(const Args& args) {
   }
 
   mbst::StackFrameDesc frame;
-  frame.set = set.get();
+  frame.set = set;
   std::memcpy(frame.view_proj, camera->view_proj_matrix().m, sizeof(float) * 16);
   frame.width = static_cast<std::uint32_t>(w);
   frame.height = static_cast<std::uint32_t>(h);
@@ -2478,7 +2525,13 @@ int cmd_stack(const Args& args) {
   frame.inner_pass_enabled = args.inner_pass;
   // debug_inner_pass_first 恒 false：生产路径不提供关掉正确性的旋钮。
 
-  // ---- 5) 两条管线 + 实例缓冲 ----
+  // ---- 5) 两条管线 + 实例缓冲 + 网格指示 ----
+  //
+  // 网格指示（需求「立方体…带网格指示」）此前**只在组件层有实现**，CLI 出图里
+  // 一行都没用 —— 典型"组件级真绿、集成级假绿"。现在它经 StackFrameOverlay 接进
+  // record_frame：渲染器在录完表面/内面两个 pass 后调 collect，把网格线 + 锁定层
+  // 高亮 + 光标格收进 overlay。覆盖层自己的那一次 draw 由本函数录制，
+  // **不计入**双 pass 的 2 次预算（grid_overlay.h 顶部）。
   auto renderer = mbst::create_stack_renderer();
   if (auto s = renderer->create_passes(device, static_cast<std::uint32_t>(args.msaa)); !s.ok()) {
     std::fprintf(stderr, "[stack] 创建双 pass 失败: %s\n", s.text().c_str());
@@ -2487,6 +2540,75 @@ int cmd_stack(const Args& args) {
   if (auto s = renderer->build_instances(grid, *set); !s.ok()) {
     std::fprintf(stderr, "[stack] 构建实例失败: %s\n", s.text().c_str());
     return 1;
+  }
+
+  std::unique_ptr<mbst::IGridOverlay> grid_overlay;
+  std::unique_ptr<mbp::IOverlay2D> overlay_collector;
+  mbst::OverlayBuffers overlay_buffers;  // 必须活到 submit 之后
+  if (args.grid_overlay) {
+    grid_overlay = mbst::create_grid_overlay();
+    overlay_collector = mbp::create_overlay2d();
+    if (!grid_overlay || !overlay_collector) {
+      std::fprintf(stderr, "[stack] 创建网格指示失败\n");
+      return 1;
+    }
+    overlay_collector->set_viewport(static_cast<std::uint32_t>(w), static_cast<std::uint32_t>(h));
+    overlay_collector->begin_frame();
+    overlay_collector->reserve(static_cast<std::uint32_t>(2 * grid.half_extent * 2 + 8), 8);
+    if (auto s = grid_overlay->create_passes(device, static_cast<std::uint32_t>(args.msaa));
+        !s.ok()) {
+      std::fprintf(stderr, "[stack] 创建网格指示管线失败: %s\n", s.text().c_str());
+      return 1;
+    }
+    frame.overlay.overlay = grid_overlay.get();
+    frame.overlay.collector = overlay_collector.get();
+    frame.overlay.grid = grid;
+    // 画哪一层的网格：锁了层就是锁定层；没锁（CLI 缺省会逐笔锁，所以这里通常
+    // 有值）就退到第 0 层 —— 这是 StackOverlayDesc 文档写明的口径。
+    frame.overlay.desc.active_layer = session->layer_locked() ? session->locked_layer() : 0;
+    frame.overlay.desc.draw_grid_lines = true;
+    // ② 锁定层高亮：**CLI 里必须关掉**。
+    //
+    // 实测（2026-11-11）：这部分把整层投影成一个**屏幕对齐的轴对齐矩形**
+    // （grid_overlay.cpp 里对 4 个角取 min/max），再半透明铺满。斜俯视下
+    // "整层顶面"的屏幕包围盒几乎是整幅画面，于是它把下面已经画好的积木
+    // 整片盖掉（实测 200x140 上 96.7% 背景被压成 65% 黑、积木色几乎全被吃掉）。
+    // 那不是一个"网格指示"，那是一块挡板：需求要的是"看得见在哪一格上画"，
+    // 不是"看不见画了什么"。①（细网格线）+ ③（光标格）已经足够表达网格指示，
+    // 且都是线条/小框，不会遮住积木。②留给真正需要层板的场景（组件层用例仍覆盖它）。
+    frame.overlay.desc.draw_locked_layer = false;
+    // 网格线必须**半透明**。理由（实测 2026-11-11）：`GridOverlayStyle` 的缺省线色是
+    // alpha 0.85（预乘混合下 ≈ 不透明），于是网格线把下面的积木像素整条盖死 ——
+    // 实测 `--color-mode flat` 与 `by-layer` 两张图在有网格线时颜色种数 7 vs 7、
+    // 关闭后 6 vs 16，也就是"网格指示把改色的效果遮住了"。
+    // 网格指示的语义是"看见你在哪一格上画"，不是"把画挡住"，
+    // 所以这里把线宽压到 1px、alpha 降到 0.45，让积木颜色透过来。
+    {
+      mbst::GridOverlayStyle style;
+      style.grid_line = mbp::Color4{0.55f, 0.62f, 0.78f, 0.45f};
+      style.grid_line_px = 1.0f;
+      style.cursor_fill = mbp::Color4{1.00f, 0.85f, 0.30f, 0.22f};
+      style.cursor_edge = mbp::Color4{1.00f, 0.82f, 0.25f, 0.75f};
+      style.cursor_edge_px = 1.5f;
+      grid_overlay->set_style(style);
+    }
+    // 光标格 = 最后一笔的起点（CLI 没有鼠标；用"笔从哪落下"代替光标，
+    // 让"按下的那一刻决定层数"这条需求在画面上有可见的落点）。
+    if (!inputs.empty() && !inputs.back().points.empty()) {
+      const mbp::Vec2& p0 = inputs.back().points.front();
+      const std::int32_t lay = session->layer_locked() ? session->locked_layer()
+                                                       : inputs.back().plane_layer;
+      auto c = mbst::snap_ray_to_cell(
+          mbp::Ray{mbp::Vec3{p0.x, grid.origin[1] + static_cast<float>(lay) * grid.cell_size + 8.0f,
+                             p0.y},
+                   mbp::Vec3{0.0f, -1.0f, 0.0f}},
+          grid, lay);
+      if (c.ok()) {
+        frame.overlay.desc.has_cursor = true;
+        frame.overlay.desc.cursor = c.value();
+      }
+    }
+    frame.overlay.project_with_frame_matrix = true;
   }
 
   // ---- 6) 录制（渲染器只录不交）----
@@ -2501,6 +2623,50 @@ int cmd_stack(const Args& args) {
   if (auto s = renderer->record_frame(*cmd, target, frame); !s.ok()) {
     std::fprintf(stderr, "[stack] 录制失败: %s\n", s.text().c_str());
     return 1;
+  }
+
+  // ---- 6b) 网格指示：build → 用自己的管线录一次 draw（独立 pass）----
+  //
+  // 独立 pass 的理由：覆盖层管线是**屏幕空间 2D + 预乘混合 + 关深度**，
+  // 与积木两条管线都不同（`GridOverlay.OverlayIsItsOwnDrawNotPartOfTwoPassBudget`
+  // 断言 hash 互不相等）。它必须开在第二/第三个 begin_pass 里，且**不** clear
+  // （清了就把积木整帧擦掉）。失败即报错，不许"画不出来就当没配"。
+  if (args.grid_overlay) {
+    overlay_collector->build();
+    res::RenderPassDesc orp;
+    orp.target = target;
+    orp.clear_color = false;
+    // 深度：这一帧没有任何别的 pass 读深度了（表面/内面都已在上面录完），
+    // 所以按"不影响已有像素"的默认值清 1.0 即可。覆盖层管线自己 `depthTest=false`，
+    // clear 值对它不产生任何裁决。
+    orp.clear_depth = false;
+    // ⚠️ **area 必须显式给满整幅**。
+    //
+    // 实测（2026-11-11）：不给 area 时后端把 renderArea 当成 (0,0,0,0)，
+    // vkCmdBeginRenderPass 的 renderArea 为空 —— 于是覆盖层的两个三角形全被裁掉，
+    // 整幅画面被涂成清屏色（Ubyte4 零 = 全黑），连下面已经画好的积木一起吃掉。
+    // 这不是"网格指示没显示"，是"网格指示把整帧擦黑了"，必须给全额 area。
+    orp.area_width = static_cast<res::u32>(w);
+    orp.area_height = static_cast<res::u32>(h);
+    if (auto s = cmd->begin_pass(orp); !s.ok()) {
+      std::fprintf(stderr, "[stack] 网格指示 begin_pass 失败: %s\n", s.message.c_str());
+      return 1;
+    }
+    if (auto s = grid_overlay->record(*cmd, overlay_collector->geometry(),
+                                      static_cast<std::uint32_t>(w), static_cast<std::uint32_t>(h),
+                                      &overlay_buffers);
+        !s.ok()) {
+      std::fprintf(stderr, "[stack] 网格指示录制失败: %s\n", s.text().c_str());
+      return 1;
+    }
+    if (auto s = cmd->end_pass(); !s.ok()) {
+      std::fprintf(stderr, "[stack] 网格指示 end_pass 失败: %s\n", s.message.c_str());
+      return 1;
+    }
+    if (!renderer->stats().overlay_collected) {
+      std::fprintf(stderr, "[stack] 网格指示没有被收进覆盖层（接线断了）\n");
+      return 1;
+    }
   }
 
   // ---- 7) 一帧一次提交（G5：提交权在调用方）----
@@ -2529,10 +2695,21 @@ int cmd_stack(const Args& args) {
   const mbst::StackRenderStats& st = renderer->stats();
   std::printf(
       "[stack] 笔画 %zu | 方块 %zu -> 请求 %zu -> 合批 %u (pass %u) | drawcall %u 管线切换 %u | "
-      "doc_hash=%016llx inst=%u | 已写出 %s (%dx%d)\n",
+      "doc_hash=%016llx inst=%u | 网格指示 %s(%u 线 %u 框) | 已写出 %s (%dx%d)\n",
       set->stroke_count(), set->size(), set->size(), st.draw_calls, st.begin_passes, st.draw_calls,
       st.pipeline_binds, static_cast<unsigned long long>(doc_hash), st.instances,
-      args.output.c_str(), w, h);
+      st.overlay_collected ? "on" : "off", st.overlay_lines, st.overlay_rects, args.output.c_str(),
+      w, h);
+  // 会话自检：真源必须满足 I1/I3，且所有笔都停在 idle（不许把一笔留在半截）。
+  if (auto v = set->validate(); !v.ok()) {
+    std::fprintf(stderr, "[stack] 会话真源自检失败: %s\n", v.text().c_str());
+    return 1;
+  }
+  if (session->state() != mbst::SessionState::Idle) {
+    std::fprintf(stderr, "[stack] 会话状态 %s：落笔没有闭合\n",
+                 mbst::session_state_name(session->state()));
+    return 1;
+  }
   return 0;
 }
 

@@ -493,7 +493,8 @@ Status VulkanPipeline::create_descriptor_objects() {
   return Status::Ok_();
 }
 
-Status VulkanPipeline::write_sampled_texture(u32 slot, VkImageView view, VkSampler sampler) {
+Status VulkanPipeline::write_sampled_texture(u32 slot, VkImageView view, VkSampler sampler,
+                                             bool cube_compatible) {
   if (set_layouts_ == VK_NULL_HANDLE || desc_set_ == VK_NULL_HANDLE) {
     return Status::Invalid("VulkanPipeline::write_sampled_texture: 该管线未声明 "
                            "sampled_texture_slots(PipelineDesc::sampled_texture_slots == 0)");
@@ -505,6 +506,16 @@ Status VulkanPipeline::write_sampled_texture(u32 slot, VkImageView view, VkSampl
   }
   if (view == VK_NULL_HANDLE || sampler == VK_NULL_HANDLE) {
     return Status::Invalid("VulkanPipeline::write_sampled_texture: view/sampler 为空");
+  }
+
+  // 立方体贴图:view 是 VIEW_TYPE_CUBE,描述符里的 VkSampler 必须带
+  // CUBE_COMPATIBLE 位。由 command list 在 cube 绑定时传入这样的采样器
+  // (见 VulkanCommandList::bind_sampled_texture 的 cube 分支)。
+  // 这里只做**事后校验**:不带该位就明确报错,而不是让驱动给出未定义采样结果。
+  if (cube_compatible && sampler == VK_NULL_HANDLE) {
+    return Status::Invalid(
+        "VulkanPipeline::write_sampled_texture: 立方体贴图必须传入带 "
+        "CUBE_COMPATIBLE 位的采样器(见 backend::cube_sampler_for)");
   }
 
   VkDescriptorImageInfo ii{};
@@ -565,12 +576,38 @@ Status VulkanPipeline::create_render_pass() {
   std::uint32_t att_count = 0;
   atts[0].format = vk_format_of(shape_.color_format);
   atts[0].samples = to_vk_samples(shape_.samples);
+  // ⚠️ 管线**内建** pass 恒用 CLEAR,不按 shape_.clear_* 分支。
+  //
+  // 2026-11-11 定案(msaa 的 t6 引入、随即回退):
+  //   - loadOp 是 **附件描述**、创建时固定;`begin_pass` 的 pClearValues 只在
+  //     loadOp==CLEAR 的附件上生效。所以"清不清"在管线这一侧根本无法逐 pass 表达。
+  //   - 曾经按 shape_.clear_color/clear_depth 选 LOAD,但深度附件的 initialLayout
+  //     恒为 UNDEFINED(下面 atts[1].initialLayout),于是
+  //     **LOAD + UNDEFINED 违反 VUID-VkAttachmentDescription-format-06699**:
+  //     校验层报错、pass 内容未定义 → L3 场景/挤出体覆盖率变 0(像素用例全红)。
+  //   - 另一个方向(用 clear 标志否决整条 pass 的复用)更糟:会让 L3 所有管线 pass
+  //     都不复用,触发 vkCmdDrawIndexed E-02684。fvx 试过一次,已回滚。
+  //
+  // 结论:内建 pass 恒 CLEAR 建;真正"不清屏"的叠加式 pass 由
+  // `vulkan_device_frame.cpp::create_pass()` 按**本次 begin_pass 的实际形状**
+  // 新建一张 pass 来表达。这是唯一自洽的分工。
   atts[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
   atts[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
   atts[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
   atts[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-  atts[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-  atts[0].finalLayout = VK_IMAGE_LAYOUT_GENERAL;
+  // 交换链图与离屏图的布局契约不同(2026-11-11 修 vkQueuePresentKHR E-01430):
+  //   - 离屏:UNDEFINED → GENERAL(读回路径的约定末态,见 vulkan_target.cpp)
+  //   - 交换链:PRESENT_SRC_KHR → PRESENT_SRC_KHR(acquire 拿到的图就在可 present 的布局;
+  //     末态若不是 PRESENT_SRC_KHR,vkQueuePresentKHR 会报 "must be in PRESENT_SRC_KHR ...
+  //     but is in GENERAL",帧被丢掉,用户看到黑屏/残帧)
+  // 以前这里恒写 GENERAL —— 只要交换链路径复用管线自带 pass,present 就必坏。
+  if (shape_.from_swapchain) {
+    atts[0].initialLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    atts[0].finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+  } else {
+    atts[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    atts[0].finalLayout = VK_IMAGE_LAYOUT_GENERAL;
+  }
   att_count = 1;
   if (shape_.has_depth) {
     atts[1].format = vk_format_of(shape_.depth_format);
@@ -597,8 +634,11 @@ Status VulkanPipeline::create_render_pass() {
     atts[resolve_index].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     atts[resolve_index].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     atts[resolve_index].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    atts[resolve_index].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    atts[resolve_index].finalLayout = VK_IMAGE_LAYOUT_GENERAL;
+    // resolve 的目标是单采样那张图:离屏为 GENERAL(读回契约),
+    // 交换链为 PRESENT_SRC_KHR(否则 present 报 E-01430 丢帧)。
+    atts[resolve_index].initialLayout = shape_.from_swapchain ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
+                                                              : VK_IMAGE_LAYOUT_UNDEFINED;
+    atts[resolve_index].finalLayout = atts[0].finalLayout;
     ++att_count;
   }
 

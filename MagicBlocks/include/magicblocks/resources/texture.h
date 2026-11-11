@@ -63,6 +63,71 @@ class ITexture {
   ITexture() = default;
 };
 
+// ---------------------------------------------------------------- 立方体贴图(R1 扩展)
+//
+// 能力定位:立方体贴图是**纹理侧**的通用能力(方向查表),与任何玩法无关。
+// 命名一律中性(cube / cube_face),不出现使用方(天空盒/反射)的专有词 ——
+// 使用方在 L3 primitives 里,本层只负责"六张同尺寸 2D 面 = 一个可采样立方体"。
+//
+// 为什么用**独立的 CreateDesc + 独立工厂**而不是往 TextureDesc 加字段:
+//   - TextureDesc 的不变量是"一张 2D 纹理:extent/format/mip_levels/samples",
+//     加一个 face_count/array_layers 就会让 create_texture() 出现半合法组合
+//     (samples>1 的立方体、0 张面的立方体、"2D 但有 6 层"…),每个组合都要
+//     一条新的校验分支;既有管线与 golden 的输入面也被迫多看一眼。
+//   - 立方体现在只需要"建"和"整面上传",不需要 readback / mip / 转移用途,
+//     分开之后这些"不支持"是**结构性的**(接口里根本没有),不是运行期分支。
+//   - 采样仍走 ISampler(SamplerDesc 原样复用,不新增采样器类型)。
+//
+// 硬件形态(backend 侧):一张 6 层的 VkImage + VK_IMAGE_VIEW_TYPE_CUBE;
+// 采样器必须给 VK_SAMPLER_CREATE_FLAG_CUBE_COMPATIBLE_BIT(view 是 cube 时
+// 不设该位是校验层 ERROR),这一位由 bind_sampled_texture 按纹理类型自动处理,
+// 调用方**不需要**为此换一个 SamplerDesc。
+//
+// 面序固定为 Vulkan/GL 的约定(与 create_texture_view 的 layerCount 一致):
+enum class CubeFace : std::uint8_t {
+  PositiveX = 0,  // +X
+  NegativeX = 1,  // -X
+  PositiveY = 2,  // +Y
+  NegativeY = 3,  // -Y
+  PositiveZ = 4,  // +Z
+  NegativeZ = 5,  // -Z
+};
+inline constexpr u32 kCubeFaceCount = 6;
+
+struct CubeMapDesc {
+  Extent2D extent{};                   // 每张面的宽高,都必须 > 0 且**六面相同**
+  Format format = Format::RGBA8_UNORM;  // 本轮只支持 RGBA8_UNORM(其它 → Unsupported)
+  TextureUsage usage = TextureUsage::Sampled;
+};
+
+class ICubeMap {
+ public:
+  ICubeMap(const ICubeMap&) = delete;
+  ICubeMap& operator=(const ICubeMap&) = delete;
+  virtual ~ICubeMap() = default;
+
+  virtual ResourceId id() const = 0;
+  virtual const CubeMapDesc& desc() const = 0;
+
+  // 一整面的字节数(width * height * 4,无 padding),用于上传长度校验。
+  virtual u64 face_size() const = 0;
+
+  // 上传**一整面**:data 必须是 face_size() 字节的 RGBA8(行序自左上)。
+  // 不支持增量/子矩形上传(没有这条通路,就不会出现"只换了一半面"的纹理)。
+  // data 为空 / 长度不符 / face 越界 → InvalidArgument。
+  virtual Status upload_face(CubeFace face, const void* data, u64 size_bytes) = 0;
+
+  // CPU → GPU 真正提交(走与 ITexture 同一条 staging 批量通路)。
+  // 不调用 → 纹理里是未初始化内容;这里不做"自动 flush",避免每面一次提交。
+  virtual Status flush() = 0;
+
+  // 面是否已上传(诊断/断言用;未上传的面采样结果为未定义)。
+  virtual bool face_uploaded(CubeFace face) const = 0;
+
+ protected:
+  ICubeMap() = default;
+};
+
 // ---------------------------------------------------------------- 采样器(R1)
 
 enum class FilterMode : std::uint8_t {

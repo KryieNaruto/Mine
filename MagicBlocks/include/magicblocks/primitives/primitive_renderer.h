@@ -25,6 +25,7 @@
 #include "magicblocks/primitives/painter.h"
 #include "magicblocks/primitives/types.h"
 #include "magicblocks/resources/command.h"
+#include "magicblocks/device/render_device.h"  // IRenderDevice（set_instance_device）
 #include "magicblocks/resources/pipeline.h"
 
 namespace magicblocks::primitives {
@@ -61,6 +62,8 @@ struct RenderStats {
   // 每个都返回会淹没真正的失败原因。调用方在帧末检查。
   u32 missing_meshes = 0;
   u32 missing_pipelines = 0;
+  // 实例缓冲扩容次数（R-SK-11：稳态帧必须为 0）。每次"新建/重建实例缓冲"都 +1。
+  u32 instance_buffer_grows = 0;
   Status last_status = Status::Ok_();
 };
 
@@ -90,6 +93,35 @@ class IPrimitiveRenderer {
   // **不**调用 submit —— 调用方负责一帧一次提交。
   virtual Status record_frame(resources::ICommandList& cmd, const IBatchBuilder& batches,
                               const PrimitiveFrameDesc& desc) = 0;
+
+  // ------------------------------------------------------------ 实例化绘制（R-SK-11 / A11）
+  //
+  // 一个 IMesh + N 条实例属性 → **一次** draw_indexed。存在的理由是稳态零分配：
+  // 调用方不再为每帧的实例数据 `create_buffer`（那会每帧走一次分页分配器，
+  // 页不够时就触发 VMA —— 正是 "稳态帧热路径零分配、零 VMA 调用" 要禁止的事）。
+  //
+  // 实例数据走**复用缓冲**：渲染器持有一块 Host 可见的顶点缓冲（`BufferUsage::Staging`
+  // 落在 HostVisible 页，CPU 可 `write()`），首帧按 capacity 建一次，之后每帧
+  // 只 write 覆盖同一块内存。容量不够时按 2 倍扩容（**只在容量不足时**才新建，
+  // 稳态帧不会发生）；扩容失败返回 OutOfMemory，绝不静默截断实例。
+  //
+  // 参数：
+  //   pipeline_key : 必须是已 register_pipeline() 的键，否则 Invalid。
+  //   mesh         : 必须是已 register_mesh() 的网格（或在本调用里注册过），否则 Invalid。
+  //   instances    : N 条实例属性；nullptr + count>0 → Invalid，count==0 → 不录 draw（Ok）。
+  //
+  // 不引入几何着色器（G1）：本接口只做实例化，几何仍来自 mesh 本身。
+  virtual Status draw_mesh_instanced(resources::ICommandList& cmd, u64 pipeline_key,
+                                     const IMesh* mesh, const InstanceAttribs* instances,
+                                     u32 instance_count) = 0;
+
+  // 注入设备：draw_mesh_instanced 需要它来创建/扩容复用实例缓冲
+  // （L1 规矩：资源一律经 IRenderDevice::create_buffer，不允许旁路分配）。
+  // 不注入就调 draw_mesh_instanced → 明确 Invalid，绝不静默跳过。
+  virtual void set_instance_device(device::IRenderDevice* device) = 0;
+
+  // 实例缓冲的当前容量（条数）。稳态诊断用：连续帧里这个值必须不变。
+  virtual u32 instance_capacity() const = 0;
 
   virtual const RenderStats& stats() const = 0;
   virtual void reset_stats() = 0;

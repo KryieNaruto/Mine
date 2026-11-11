@@ -16,6 +16,12 @@
 //    绝不静默跳过、也绝不退化成别的 PathStyle（D8）。
 //    调用方拿到 errors 非空就必须把它当失败处理 —— 而不是"部分成功"。
 //
+// ============================ 双表示（R-SK-12 / A13）============================
+// 每笔的轮廓都走 L3 `primitives::make_outline(points, style, ...)`，
+// 并把 L3 返回的 `OutlineSet.source_style` **原样带进** StrokeMesh。
+// A13 第 3 条（source_style 与输入一致）因此是可断言的：
+// 断言的是 L4 输出里标注的 style 与文档输入相等，而不是"看代码应该是"。
+//
 // ============================ 为什么合并放在这一层 ============================
 // 多笔的并集/差集是**玩法手感**（"画三笔连成一个形状"vs"三个独立形状"），
 // 不是几何库的职责。L3 的 from_outline 只负责"一组轮廓 → 一个实体"，
@@ -40,17 +46,23 @@ struct StrokeMesh {
   std::vector<StrokeId> source;
   primitives::MeshData mesh;
   primitives::Color4 color{1.0f, 1.0f, 1.0f, 1.0f};
+  // 这片网格的轮廓来源（R-SK-12 双表示）。合并时取**第一笔**的 style ——
+  // 合并只发生在 Ribbon 组内（见 build_meshes 的合并条件），
+  // 所以这里恒为 Ribbon；单独成体的 Region 笔填 Region。
+  primitives::PathStyle source_style = primitives::PathStyle::Ribbon;
+  // 生成轮廓输入的哈希（来自 L3 OutlineSet::source_hash；合并时取第一笔）。
+  std::uint64_t source_hash = 0;
 };
 
 // 一次管线运行的错误。
 struct SketchError {
   enum class Code : std::uint8_t {
-    UnsupportedStyle = 1,   // 该 style 在此版本不支持
+    UnsupportedStyle = 1,     // 该 style 在此版本不支持
     UnsupportedRegionOp = 2,  // RegionOp 未实现（Difference/Intersect/Xor）
-    NotClosed = 3,          // Region 笔画首尾未闭合
-    Degenerate = 4,         // 点数/笔宽不合法
-    TessellationFailed = 5, // 三角化失败
-    EmptyResult = 6,        // 轮廓非空但挤出结果为空
+    NotClosed = 3,            // Region 笔画首尾未闭合
+    Degenerate = 4,           // 点数/笔宽不合法
+    TessellationFailed = 5,   // 三角化失败
+    EmptyResult = 6,          // 轮廓非空但挤出结果为空
   };
   Code code = Code::Degenerate;
   StrokeId stroke{};  // 相关笔画（可能无效）
@@ -70,7 +82,7 @@ struct BuildOptions {
   //                  动的是文档，重建网格是整体重算）。
   bool merge_strokes = false;
 
-  // Region 语义的布尔运算。首轮只支持 Union；
+  // Region 语义的布尔运算。本轮只支持 Union；
   // 其余值会让管线返回 UnsupportedRegionOp 而不是静默当 Union。
   RegionOp region_op = RegionOp::Union;
 
@@ -113,5 +125,11 @@ SketchMeshSet build_outlines(const SketchDocument& doc, const BuildOptions& opts
 
 // 2) 文档 → 最终的挤出网格。内部先 build_outlines 再挤出。
 SketchMeshSet build_meshes(const SketchDocument& doc, const BuildOptions& opts);
+
+// 3) 网格的水密性判据（R-SK-4 / A6）：每条无向边恰好被 2 个三角形共享。
+//    返回违规边数；0 = 水密。空网格返回 0（"没有边因此没有违规"，
+//    调用方应先判空再调用 —— 这里不把空当成错误，因为合并组可能不带网格）。
+//    单独暴露成函数，是为了让用例断言的是**几何本身**而不是某个计数器的值。
+std::size_t count_non_watertight_edges(const primitives::MeshData& mesh);
 
 }  // namespace magicblocks::features::sketch

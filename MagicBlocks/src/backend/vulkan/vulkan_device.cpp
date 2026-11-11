@@ -6,11 +6,14 @@
 //  - 所有失败路径返回带 code + message 的 Status。
 #include "backend/vulkan/vk_common.h"
 
+#include <cstddef>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include "backend/vulkan/vulkan_resource_common.h"  // 按格式复核采样数(见 collect_msaa)
 #include "magicblocks/device/render_device.h"
 
 namespace magicblocks::backend {
@@ -69,18 +72,65 @@ bool has_color_attachment(VkPhysicalDevice phys, VkFormat fmt) {
 }
 
 // VkSampleCountFlags → 采样数列表(只报告可同时作为颜色与深度附件的等级)
+//
+// 两阶段(2026-11-10 修 8x 静默降级的教训,别再退回只看全局限制的版本):
+//   1) 先用 framebufferColorSampleCounts & framebufferDepthSampleCounts 取"全局上限";
+//   2) 再用 vkGetPhysicalDeviceImageFormatProperties 对候选颜色格式**逐个**查实际支持,
+//      与第 1 步**取交集**。
+//
+// 只用第 1 步不够:那是设备全局上限,与格式无关。设备完全可能"全局允许 8x",
+// 而某个具体颜色格式只支持 1x|4x —— caps 于是把 8x 报成"支持",用户在 UI 里选了 8x,
+// vkCreateImage 失败(验证层只打印不拦,返回值仍是 VK_SUCCESS),MS 图无效且没有任何日志,
+// 表现为"开了 8x 还是有锯齿"。**用户实际会点的那条路径必须是对的。**
+//
+// 取交集而不是并集:只有"所有本项目会用到的颜色格式都支持"的等级才算真的可用;
+// 取并集等于换个位置重犯同一个错。
+//
+// ⚠️ 诚实交代本轮验证覆盖面(别让后来人以为它被证明过):
+//   本机(Windows + SwiftShader)的全局 framebufferColorSampleCounts & ...Depth 里
+//   **本来就不含 8x**(实测旧实现与修复后实现都输出 "caps levels: 1 4")。
+//   所以:**本层在本机零行为变化、零判别力**,针对它的注入自检在本机不可能变红,
+//   这一点已向团队负责人明确报告,没有用假注入充数。
+//   它的价值在于"全局允许但某格式不允许"的设备上守门(例如将来加 HDR/半浮点格式)。
+//   真正的、**本机可验证**的运行时防线是 vulkan_swapchain.cpp 里建图前的
+//   color_format_supports_samples() 兜底 —— 那条注入(color_format_supports_samples
+//   恒返回 true)会让 MsaaSwapchain.UnsupportedLevelRejectedAtSwapchain 变红。
 void collect_msaa(VkPhysicalDevice phys, const VkPhysicalDeviceLimits& lim, std::vector<u32>* out) {
   const VkSampleCountFlags color = lim.framebufferColorSampleCounts;
   const VkSampleCountFlags depth = lim.framebufferDepthSampleCounts;
+
+  // 第 2 步:候选颜色格式的实际采样数交集。查询失败的格式直接剔除;
+  // 四格式全失败时退回第 1 步(极端设备上不能让整条 caps 变空)。
+  constexpr std::size_t kProbeCount = sizeof(kMsaaProbeColorFormats) / sizeof(VkFormat);
+  VkSampleCountFlags fmt_mask = ~static_cast<VkSampleCountFlags>(0);
+  std::size_t probed = 0;
+  for (std::size_t i = 0; i < kProbeCount; ++i) {
+    const VkSampleCountFlags counts = query_color_sample_counts(phys, kMsaaProbeColorFormats[i]);
+    if (counts == 0) continue;  // 该格式不支持,剔除
+    fmt_mask &= counts;
+    ++probed;
+  }
+  const bool format_filtered = probed > 0;
+  if (!format_filtered) fmt_mask = ~static_cast<VkSampleCountFlags>(0);
+
   auto push = [&](VkSampleCountFlags bit, u32 n) {
-    if ((color & bit) && (depth & bit)) out->push_back(n);
+    if ((color & bit) && (depth & bit) && (fmt_mask & bit)) out->push_back(n);
   };
   push(VK_SAMPLE_COUNT_1_BIT, 1);
   push(VK_SAMPLE_COUNT_2_BIT, 2);
   push(VK_SAMPLE_COUNT_4_BIT, 4);
   push(VK_SAMPLE_COUNT_8_BIT, 8);
   push(VK_SAMPLE_COUNT_16_BIT, 16);
-  (void)phys;
+
+  // 1x 是底线:多采样全被格式否决时也要能开窗口。
+  if (out->empty()) out->push_back(1);
+
+  if (!format_filtered) {
+    std::fprintf(stderr,
+                 "[caps] 颜色格式采样数查询全部失败(%u 个候选),supported_msaa_levels 退回"
+                 "「只看设备全局限制」的结果 —— 该结果可能与具体格式不符,仅作兜底。\n",
+                 static_cast<unsigned>(kProbeCount));
+  }
 }
 
 }  // namespace

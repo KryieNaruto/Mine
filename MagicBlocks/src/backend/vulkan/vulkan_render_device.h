@@ -36,7 +36,27 @@ class VulkanRenderDevice final : public device::IRenderDevice {
   device::Result<std::unique_ptr<device::ISwapchain>> create_swapchain(
       const device::NativeSurface& surface, device::Extent2D extent) override;
 
+  // 后端内部：按指定 MSAA 采样数建交换链（0/1 等同关掉）。
+  //
+  // 为什么需要这条单独入口：MSAA 图必须在 init() 里建，而 set_requested_msaa()
+  // 又必须早于 init()。公共面 create_swapchain() 不带采样参数，而上层
+  // （Android 的 scene_renderer / CLI）只能看到 device::ISwapchain，
+  // 拿不到 backend 私有的 VulkanSwapchain::set_requested_msaa()。
+  // 所以把"设采样数 + init"这组顺序敏感的两步收进后端，调用方只传数字。
+  //
+  // 设备不支持时**不报错**：退回 1x 并在 stderr/Android log 说明原因 ——
+  // MSAA 不可用绝不该挡住上屏。
+  device::Result<std::unique_ptr<device::ISwapchain>> create_swapchain_with_msaa(
+      const device::NativeSurface& surface, device::Extent2D extent, std::uint32_t msaa_samples);
+
   device::IFrameSync* frame_sync() override { return frame_sync_.get(); }
+  // G8 / t13: expose the shaped-pipeline factory to L3 through the L0 abstraction.
+  // L1 keeps the resolver table (src/core/pipeline_factory_table.cpp); this device
+  // only has to say "which factory belongs to me", so no static object is needed.
+  resources::IPipelineFactory* pipeline_factory() override {
+    return resources::resolve_pipeline_factory(this);
+  }
+
 
   // ---- L1 资源层 ----
   resources::IMemoryAllocator* memory_allocator() override { return allocator_.get(); }
@@ -46,6 +66,8 @@ class VulkanRenderDevice final : public device::IRenderDevice {
       const resources::TextureDesc& desc) override;
   device::Result<std::unique_ptr<resources::ISampler>> create_sampler(
       const resources::SamplerDesc& desc) override;
+  device::Result<std::unique_ptr<resources::ICubeMap>> create_cube_map(
+      const resources::CubeMapDesc& desc) override;
   device::Result<std::unique_ptr<resources::IPipeline>> create_pipeline(
       const resources::PipelineDesc& desc) override;
   // 后端内部：按指定附件形状建管线。
@@ -53,10 +75,14 @@ class VulkanRenderDevice final : public device::IRenderDevice {
   // 用来 begin_pass 的 render pass **逐项兼容**（颜色格式/采样数/深度）。
   // 公共 create_pipeline(desc) 固定用 RGBA8 离屏形状，渲染到交换链
   // （BGRA8 或 RGBA8，由 surface 决定）时必须用这条入口。
-  // 公共面(include/)不能出现 AttachmentShape，因为它带 VkFormat 语义，
-  // 所以只在本后端头里暴露 —— 调用方是同目录的 src/android/。
+  //
+  // ⚠️ 类型必须写全限定 `resources::AttachmentShape`。
+  // 这里曾经写裸名 `AttachmentShape`，而它的定义在 resources/pipeline.h（纯值类型,
+  // 零 Vk*，是 G8 裁决后的公共面）。裸名会让不同 TU 按各自的 include 顺序解析到
+  // 不同的类型 —— 表现为 `dumpbin` 里库中有符号、链接时却 LNK2019 签名不匹配
+  // （库内是 @73 = resources::,测试侧请求 @23 = backend::）。
   device::Result<std::unique_ptr<resources::IPipeline>> create_pipeline_for_shape(
-      const resources::PipelineDesc& desc, const AttachmentShape& shape);
+      const resources::PipelineDesc& desc, const resources::AttachmentShape& shape);
   device::Result<std::unique_ptr<resources::ICommandList>> create_command_list() override;
 
   // L0→L1:把已录制完成的命令列表真正编码成 vkCmd* 并提交。
@@ -73,8 +99,9 @@ class VulkanRenderDevice final : public device::IRenderDevice {
   // L1:分页分配器(公共面通过 IRenderDevice::memory_allocator() 取接口指针)
   VulkanPagingAllocator* allocator_impl() { return allocator_.get(); }
   // 校验层的可计量判据(Device.CreateAndDestroy / RunsFifteenFrames)
-  std::uint32_t validation_error_count() const { return inst_.error_count; }
-  std::uint32_t validation_message_count() const { return inst_.message_count; }
+  std::uint32_t validation_error_count() const override { return inst_.error_count; }
+  std::uint32_t validation_message_count() const override { return inst_.message_count; }
+  bool validation_enabled() const override { return inst_.validation_enabled; }
 
  private:
   // 设备创建的缓冲资源句柄 → 实现指针。
@@ -84,6 +111,10 @@ class VulkanRenderDevice final : public device::IRenderDevice {
   // 而设备帧提交必须拿到 VkBuffer 才能 vkCmdBindVertexBuffers。这张表就是
   // 两者之间缺失的那座桥 —— 提交前按命令里的句柄把指针补进命令列表。
   void bind_known_buffers(VulkanCommandList& list) const;
+  // 纹理/采样器/AO 的同一座桥(P0 / X1 的 bind_sampled_texture 需要 ITexture* /
+  // ISampler* 才能取 VkImageView / VkSampler)。只登记**设备态**创建出来的对象;
+  // 对象析构时由 WeakTexture 回调摘掉(设备不拥有它们)。
+  void bind_known_textures(VulkanCommandList& list) const;
 
   InstanceBundle inst_{};
   VulkanContext ctx_{};
@@ -100,6 +131,14 @@ class VulkanRenderDevice final : public device::IRenderDevice {
   // 设备不拥有这些对象(所有权在调用方的 unique_ptr),这里只存裸指针;
   // 缓冲析构时通过 WeakBuffer 回调把自己摘掉,避免悬垂。
   std::vector<std::pair<resources::ResourceId, resources::IBuffer*>> known_buffers_;
+  // 纹理 / 立方体贴图 → 对象指针(bind_sampled_texture 设备态需要)。
+  // 立方体贴图与 ITexture 是**两个不同的接口**(ICubeMap 不是 ITexture 的子类:
+  // 它只有 face/flush,没有 readback/mip),所以分两张表登记,命令列表按句柄
+  // 各查各的 —— 不靠 dynamic_cast 猜类型。
+  std::vector<std::pair<resources::ResourceId, resources::ITexture*>> known_textures_;
+  std::vector<std::pair<resources::ResourceId, resources::ICubeMap*>> known_cubes_;
+  // 采样器句柄 → ISampler*。
+  std::vector<std::pair<resources::ResourceId, resources::ISampler*>> known_samplers_;
 };
 
 // 测试钩子:强制把枚举到的设备"假装"改名(用于 RefusesPhysicalGpu)。

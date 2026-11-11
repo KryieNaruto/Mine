@@ -26,6 +26,8 @@ std::uint64_t hash_float(std::uint64_t seed, float v) {
   return mix(seed ^ (static_cast<std::uint64_t>(bits) << 1));
 }
 
+bool same_color(const primitives::Color4& a, const primitives::Color4& b) { return a == b; }
+
 }  // namespace
 
 const Stroke* SketchDocument::find(StrokeId id) const {
@@ -75,6 +77,26 @@ bool SketchDocument::remove_stroke(StrokeId id) {
   return false;
 }
 
+bool SketchDocument::set_stroke_color(StrokeId id, primitives::Color4 color) {
+  for (std::size_t i = 0; i < strokes_.size(); ++i) {
+    if (strokes_[i].id != id) continue;
+
+    if (same_color(strokes_[i].color, color)) return true;  // 空操作，不压栈
+
+    SketchEdit edit;
+    edit.kind = SketchEdit::Kind::Recolor;
+    edit.index = i;
+    edit.stroke = strokes_[i];          // 存改之前的整笔（含颜色）
+    edit.previous_color = strokes_[i].color;
+    edit.stroke.color = color;          // 重做时要恢复新颜色
+    push_edit(std::move(edit));
+
+    strokes_[i].color = color;
+    return true;
+  }
+  return false;
+}
+
 void SketchDocument::push_edit(SketchEdit edit) {
   undo_.push_back(std::move(edit));
   // 新的编辑动作会让"重做栈"失效 —— 这是撤销/重做的标准语义。
@@ -106,6 +128,16 @@ bool SketchDocument::undo() {
       strokes_.insert(strokes_.begin() + static_cast<std::ptrdiff_t>(at), edit.stroke);
       break;
     }
+    case SketchEdit::Kind::Recolor: {
+      // 撤销"改色" = 把颜色换回 previous_color。几何一个字节都不动。
+      for (Stroke& s : strokes_) {
+        if (s.id == edit.stroke.id) {
+          s.color = edit.previous_color;
+          break;
+        }
+      }
+      break;
+    }
   }
 
   redo_.push_back(std::move(edit));
@@ -127,6 +159,15 @@ bool SketchDocument::redo() {
       for (std::size_t i = 0; i < strokes_.size(); ++i) {
         if (strokes_[i].id == edit.stroke.id) {
           strokes_.erase(strokes_.begin() + static_cast<std::ptrdiff_t>(i));
+          break;
+        }
+      }
+      break;
+    }
+    case SketchEdit::Kind::Recolor: {
+      for (Stroke& s : strokes_) {
+        if (s.id == edit.stroke.id) {
+          s.color = edit.stroke.color;  // push 时存的是新颜色
           break;
         }
       }
@@ -173,37 +214,37 @@ std::uint64_t SketchDocument::hash() const {
   return h;
 }
 
-bool SketchDocument::supports_region_op(RegionOp op) { return op == RegionOp::Union; }
-
-StyleCheck check_style(const Stroke& stroke, float close_tolerance) {
-  switch (stroke.style) {
-    case PathStyle::Ribbon:
-      if (stroke.points.size() < 2) {
-        return {false, "Ribbon 需要至少 2 个采样点"};
-      }
-      if (!(stroke.width > 0.0f)) {
-        return {false, "Ribbon 需要正的笔宽"};
-      }
-      return {true, ""};
-
-    case PathStyle::Region: {
-      // Region 要求折线真的闭合。**不自动闭合**：
-      // 自动连首尾会把用户画的"C"变成"O"，那是改变用户意图，
-      // 属于静默修正 —— D8 明令禁止。
-      if (stroke.points.size() < 3) {
-        return {false, "Region 需要至少 3 个采样点"};
-      }
-      const Vec2& a = stroke.points.front();
-      const Vec2& b = stroke.points.back();
-      const float dx = b.x - a.x;
-      const float dy = b.y - a.y;
-      if (std::sqrt(dx * dx + dy * dy) > close_tolerance) {
-        return {false, "Region 要求折线首尾闭合(超出容差)"};
-      }
-      return {true, ""};
+std::uint64_t SketchDocument::geometry_hash() const {
+  // 与 hash() 同构，唯独**不含颜色**四个分量。
+  // 刻意不写成 "hash() XOR 颜色哈希" —— 那样改色不一定让 geometry_hash 不变
+  // （XOR 会抵消到 0 的极端情形），也没法解释"几何"到底指什么。
+  std::uint64_t h = 0xC0FFEEull;
+  h = mix(h ^ static_cast<std::uint64_t>(strokes_.size()));
+  for (const Stroke& s : strokes_) {
+    h = mix(h ^ s.id.value);
+    h = mix(h ^ static_cast<std::uint64_t>(s.points.size()));
+    h = hash_float(h, s.width);
+    h = mix(h ^ (s.round_cap ? 1u : 2u));
+    h = mix(h ^ (static_cast<std::uint64_t>(s.style) << 8));
+    h = mix(h ^ (s.closed ? 1u : 2u));
+    for (const Vec2& p : s.points) {
+      h = hash_float(h, p.x);
+      h = hash_float(h, p.y);
     }
   }
-  return {false, "未知的 PathStyle"};
+  return h;
+}
+
+bool SketchDocument::supports_region_op(RegionOp op) { return primitives::supports_region_op(op); }
+
+StyleCheck check_style(const Stroke& stroke, float close_tolerance) {
+  // 委托给 L3 的 make_outline：可行性检查与实际几何生成必须是**同一份**实现。
+  // 这里只借用它的错误串，不产生几何（Points 传引用，L3 不会写回）。
+  const primitives::OutlineResult r =
+      primitives::make_outline(stroke.points, stroke.style, stroke.width, stroke.round_cap,
+                               6u, close_tolerance);
+  if (r.ok()) return {true, ""};
+  return {false, r.error};
 }
 
 }  // namespace magicblocks::features::sketch

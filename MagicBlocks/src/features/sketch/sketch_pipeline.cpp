@@ -1,8 +1,10 @@
 // MagicBlocks L4 —— 魔法涂鸦：文档 → 3D 实体管线实现（F-SK 基座）
 #include "magicblocks/features/sketch/sketch_pipeline.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <map>
 
 namespace magicblocks::features::sketch {
 namespace {
@@ -42,20 +44,39 @@ std::uint64_t hash_mesh(const pm::MeshData& m) {
   return h;
 }
 
-// 把一条 Region 笔画折线变成闭合环。
-// 调用前必须已通过 check_style（首尾在容差内）。
-std::vector<pm::Vec2> region_ring(const Stroke& s) {
-  std::vector<pm::Vec2> ring = s.points;
-  // 首尾极近 → 去掉末尾那个点，由 from_outline 隐式闭合。
-  // 不去掉会让 clipper/tess 看到一条零长度边。
-  if (ring.size() >= 2) {
-    const pm::Vec2& a = ring.front();
-    const pm::Vec2& b = ring.back();
-    const float dx = b.x - a.x;
-    const float dy = b.y - a.y;
-    if (dx * dx + dy * dy <= 1e-12f) ring.pop_back();
+// 一笔 → 轮廓。失败原因在这里就地翻译成 SketchError::Code。
+bool outline_for_stroke(const Stroke& s, const BuildOptions& opts, pm::OutlineSet* out,
+                        SketchError* err) {
+  // 1) style 能不能生成几何（委托 L3，与实际生成同一份实现）
+  const StyleCheck sc = check_style(s, opts.close_tolerance);
+  if (!sc.ok) {
+    err->code = (s.style == PathStyle::Region) ? SketchError::Code::NotClosed
+                                              : SketchError::Code::Degenerate;
+    err->detail = sc.reason;
+    return false;
   }
-  return ring;
+
+  // 2) Region 的布尔组合是否被支持。
+  if (s.style == PathStyle::Region && !SketchDocument::supports_region_op(opts.region_op)) {
+    err->code = SketchError::Code::UnsupportedRegionOp;
+    err->detail = "RegionOp 只实现了 Union;Difference/Intersect/Xor 属预留通道";
+    return false;
+  }
+
+  // 3) 真正生成轮廓。L3 会**再做一次**同样的检查 —— 这是刻意的：
+  //    L3 是公共 API，别的调用方可能直接用它；它不能假设上层检查过了。
+  //    上层的检查存在只是为了把错误归到具体笔画上（L3 不知道笔画是什么）。
+  const pm::OutlineResult r =
+      pm::make_outline(s.points, s.style, s.width, s.round_cap, opts.arc_steps,
+                       opts.close_tolerance);
+  if (!r.ok()) {
+    err->code = (s.style == PathStyle::Region) ? SketchError::Code::NotClosed
+                                              : SketchError::Code::Degenerate;
+    err->detail = r.error;
+    return false;
+  }
+  *out = r.outline;
+  return true;
 }
 
 }  // namespace
@@ -69,37 +90,11 @@ std::vector<pm::Vec2> region_ring(const Stroke& s) {
 SketchMeshSet build_outlines(const SketchDocument& doc, const BuildOptions& opts) {
   SketchMeshSet out;
 
-  const bool region_op_ok = SketchDocument::supports_region_op(opts.region_op);
-
   for (const Stroke& s : doc.strokes()) {
-    const StyleCheck sc = check_style(s, opts.close_tolerance);
-    if (!sc.ok) {
-      out.errors.push_back({s.style == PathStyle::Region ? SketchError::Code::NotClosed
-                                                         : SketchError::Code::Degenerate,
-                            s.id, sc.reason});
-      continue;
-    }
-
-    if (s.style == PathStyle::Region && !region_op_ok) {
-      out.errors.push_back(
-          {SketchError::Code::UnsupportedRegionOp, s.id,
-           "RegionOp 只实现了 Union;Difference/Intersect/Xor 属预留通道"});
-      continue;
-    }
-
-    std::vector<pm::Vec2> ring;
-    switch (s.style) {
-      case PathStyle::Ribbon:
-        ring = pm::stroke_outline(s.points, s.width, s.round_cap, opts.arc_steps);
-        break;
-      case PathStyle::Region:
-        ring = region_ring(s);
-        break;
-    }
-
-    if (ring.size() < 3) {
-      out.errors.push_back({SketchError::Code::Degenerate, s.id, "轮廓点数不足,无法成面"});
-    }
+    pm::OutlineSet os;
+    SketchError err;
+    err.stroke = s.id;
+    if (!outline_for_stroke(s, opts, &os, &err)) out.errors.push_back(std::move(err));
   }
 
   return out;
@@ -107,8 +102,6 @@ SketchMeshSet build_outlines(const SketchDocument& doc, const BuildOptions& opts
 
 SketchMeshSet build_meshes(const SketchDocument& doc, const BuildOptions& opts) {
   SketchMeshSet out;
-
-  const bool region_op_ok = SketchDocument::supports_region_op(opts.region_op);
 
   // ---- 第一遍：每笔 → 2D 轮廓。失败笔直接记错并跳过 ----
   struct Pending {
@@ -126,33 +119,11 @@ SketchMeshSet build_meshes(const SketchDocument& doc, const BuildOptions& opts) 
   std::size_t ribbon_group = kNoGroup;
 
   for (const Stroke& s : doc.strokes()) {
-    const StyleCheck sc = check_style(s, opts.close_tolerance);
-    if (!sc.ok) {
-      out.errors.push_back({s.style == PathStyle::Region ? SketchError::Code::NotClosed
-                                                         : SketchError::Code::Degenerate,
-                            s.id, sc.reason});
-      continue;
-    }
-
-    if (s.style == PathStyle::Region && !region_op_ok) {
-      out.errors.push_back(
-          {SketchError::Code::UnsupportedRegionOp, s.id,
-           "RegionOp 只实现了 Union;Difference/Intersect/Xor 属预留通道"});
-      continue;
-    }
-
-    std::vector<pm::Vec2> ring;
-    switch (s.style) {
-      case PathStyle::Ribbon:
-        ring = pm::stroke_outline(s.points, s.width, s.round_cap, opts.arc_steps);
-        break;
-      case PathStyle::Region:
-        ring = region_ring(s);
-        break;
-    }
-
-    if (ring.size() < 3) {
-      out.errors.push_back({SketchError::Code::Degenerate, s.id, "轮廓点数不足,无法成面"});
+    pm::OutlineSet os;
+    SketchError err;
+    err.stroke = s.id;
+    if (!outline_for_stroke(s, opts, &os, &err)) {
+      out.errors.push_back(std::move(err));
       continue;
     }
 
@@ -166,14 +137,19 @@ SketchMeshSet build_meshes(const SketchDocument& doc, const BuildOptions& opts) 
         ribbon_group = pending.size();
         pending.push_back(Pending{});
         pending.back().color = s.color;
+        pending.back().outline.source_style = os.source_style;
+        pending.back().outline.source_hash = os.source_hash;
       }
       pending[ribbon_group].ids.push_back(s.id);
-      pending[ribbon_group].outline.outer.push_back(std::move(ring));
+      for (auto& ring : os.outer)
+        pending[ribbon_group].outline.outer.push_back(std::move(ring));
+      for (auto& ring : os.holes)
+        pending[ribbon_group].outline.holes.push_back(std::move(ring));
     } else {
       Pending np;
       np.ids.push_back(s.id);
       np.color = s.color;
-      np.outline.outer.push_back(std::move(ring));
+      np.outline = std::move(os);
       pending.push_back(std::move(np));
     }
   }
@@ -201,6 +177,9 @@ SketchMeshSet build_meshes(const SketchDocument& doc, const BuildOptions& opts) 
     sm.source = p.ids;
     sm.color = p.color;
     sm.mesh = std::move(mesh);
+    // R-SK-12 / A13 第 3 条：来源标注**原样来自 L3**，不在 L4 重新推导。
+    sm.source_style = p.outline.source_style;
+    sm.source_hash = p.outline.source_hash;
     out.meshes.push_back(std::move(sm));
   }
 
@@ -215,6 +194,32 @@ SketchMeshSet build_meshes(const SketchDocument& doc, const BuildOptions& opts) 
   out.mesh_hash = h;
 
   return out;
+}
+
+std::size_t count_non_watertight_edges(const pm::MeshData& mesh) {
+  // 无向边计数：key 用 (min, max) 顶点下标对。
+  // 用 std::map 而不是 unordered_map：遍历顺序不影响结果（只数违规条数），
+  // 但确定性纪律宁可用有序容器 —— 将来若有人把它改成"返回边列表"，
+  // 顺序也不会突然变成不可复现的。
+  std::map<std::pair<std::uint32_t, std::uint32_t>, std::uint32_t> edges;
+  const std::size_t tri_count = mesh.indices.size() / 3;
+  for (std::size_t t = 0; t < tri_count; ++t) {
+    const std::uint32_t a = mesh.indices[t * 3 + 0];
+    const std::uint32_t b = mesh.indices[t * 3 + 1];
+    const std::uint32_t c = mesh.indices[t * 3 + 2];
+    const std::uint32_t tri[3][2] = {{a, b}, {b, c}, {c, a}};
+    for (const auto& e : tri) {
+      const std::uint32_t lo = std::min(e[0], e[1]);
+      const std::uint32_t hi = std::max(e[0], e[1]);
+      if (lo == hi) continue;  // 退化三角形自环边，不算
+      ++edges[{lo, hi}];
+    }
+  }
+  std::size_t bad = 0;
+  for (const auto& kv : edges) {
+    if (kv.second != 2) ++bad;
+  }
+  return bad;
 }
 
 }  // namespace magicblocks::features::sketch

@@ -19,6 +19,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -169,17 +170,44 @@ class VulkanSampler final : public ISampler {
   VkSampler vk_sampler() const { return vk_sampler_; }
   // SamplerDesc 的合法性检查(init() 用它,单测也可直接调以拿到明确 message)。
   static device::Status validate_desc(const SamplerDesc& desc);
+  // 析构钩子:设备在已知采样器表里存的是**裸指针**,对象析构时必须把自己摘掉,
+  // 否则下一个用例/下一帧会通过悬垂指针读到已销毁的 VkSampler(校验层表现为
+  // "invalid VkSampler ... or has been destroyed",SwiftShader 下直接 SEH 崩溃)。
+  void set_destroy_hook(std::function<void(VulkanSampler*)> hook) {
+    destroy_hook_ = std::move(hook);
+  }
 
  private:
   VulkanContext ctx_{};
   bool has_ctx_ = false;
   SamplerDesc desc_{};
   u32 slot_index_ = 0;
-  ResourceId id_{};  // 采样器不占内存子块(id 恒 invalid,槽位号在 slot_index_)
+  ResourceId id_{};  // kSamplerPage / offset 0 / size 1 / id = slot_index(见 .cpp)
   VkSampler vk_sampler_ = VK_NULL_HANDLE;
+  std::function<void(VulkanSampler*)> destroy_hook_{};
 };
 
 // 全局采样器槽位发号(单队列单线程;进程级单调递增,便于命令流去重)。
 u32 allocate_sampler_slot();
+
+// ---------------------------------------------------------------- 立方体贴图用的采样器
+//
+// 为什么要单独一条:tie 在 ISampler 上的 SamplerDesc 是**按描述去重复用**的
+// (同一 SamplerDesc 只建一个 VkSampler,身份就是 slot_index),而立方体贴图的
+// 描述符要求 VkSampler 带 VK_SAMPLER_CREATE_FLAG_CUBE_COMPATIBLE_BIT。
+// 为了让同一个 ISampler 既能给 2D 用又能给 cube 用,这里按同一份 SamplerDesc
+// 另建一个"带 cube 位"的 VkSampler,并以描述为键缓存(同描述只建一次)。
+// 若调用方给的 desc 本身不合法(wrap 不是 ClampToEdge / 开了比较采样),
+// 返回明确错误,不静默改参数。
+device::Status cube_sampler_for(const VulkanContext& ctx, const SamplerDesc& desc, VkSampler* out);
+// 某个已存在的 VkSampler 是否带该位(跨描述符写入前的可判断据)。
+// 说明:Vulkan 没有"查询 VkSampler 创建标志"的接口,所以只能记录本后端自己建过的
+// 带标志的采样器句柄 —— 这也是 cube_sampler_for 返回的对象的唯一来源。
+bool sampler_has_cube_flag(VkSampler sampler);
+// 释放本设备缓存的 cube 采样器(设备销毁前必须调用,且在 vkDestroyDevice 之前)。
+// 不调用 → 每个带天空盒的过程都会漏 VkSampler:
+//   VUID-vkDestroyDevice-device-05137: ... leaked objects ... VkSampler
+// 只处理该 device 名下的条目,不影响同进程内其他设备的缓存。
+void destroy_cube_samplers(VkDevice device);
 
 }  // namespace magicblocks::backend

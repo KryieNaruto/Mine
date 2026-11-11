@@ -1,0 +1,6 @@
+# 只放清单与脚本，模型/贴图等二进制一律不入 git。
+# 用 tools/fetch-assets.ps1 从 RayTracing res 复制到 res/ 并按 assets.lock.json 校验。
+res/
+*.obj
+!assets.lock.json
+!.gitignore

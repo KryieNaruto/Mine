@@ -145,6 +145,21 @@ class FakeCommandList final : public mb::resources::ICommandList {
     ++commands;
     return {};
   }
+  // sync_resources():立方体贴图落地时给 ICommandList 新增的纯虚函数。
+  //
+  // 这里**刻意不写成空实现 `return {}`**:那会让用例在"假前提"上跑 —— 看起来
+  // 资源同步成功了,其实本 Fake 根本没有句柄→指针的反查表需要刷新。
+  // 按该函数的契约,正确语义是"记录被调用过、供断言用":
+  //   * 契约规定它**不是一条命令**,不计入 command_count();
+  //   * 契约规定它不改变命令流,所以这里也不动任何其它状态;
+  //   * 返回值明确表示"此替身不支持资源同步"(Unsupported),调用方如果真在
+  //     录制路径上依赖它,会立刻看到失败,而不是静默通过。
+  mb::resources::Status sync_resources() override {
+    ++sync_resources_calls;
+    return mb::resources::Status::Unsupported(
+        "FakeCommandList 是测试替身,没有资源登记表,不支持 sync_resources()");
+  }
+  int sync_resources_calls = 0;
   mb::resources::Status begin_pass(const mb::resources::RenderPassDesc&) override { return {}; }
   mb::resources::Status end_pass() override { return {}; }
 };
@@ -569,6 +584,431 @@ TEST(ui_Hud, DrawIsDeterministic) {
     EXPECT_FLOAT_EQ(a.b.y, b.b.y);
   }
   EXPECT_EQ(o1.compute_stats().draw_calls, o2.compute_stats().draw_calls);
+}
+
+// ================================================================ 侧栏列表(UI 布局 v1)
+
+namespace {
+
+// 造一个"左列表 + 右列表"的侧栏配置。条目文案由测试注入 —— UI 层不认识这些词。
+ui::SidebarConfig sidebar_cfg(std::size_t left_n, std::size_t right_n) {
+  ui::SidebarConfig sb;
+  sb.left_title = "models";
+  sb.right_title = "play";
+  sb.back_button_label = "back";
+  for (std::size_t i = 0; i < left_n; ++i) sb.left_items.push_back("m" + std::to_string(i));
+  for (std::size_t i = 0; i < right_n; ++i) sb.right_items.push_back("p" + std::to_string(i));
+  return sb;
+}
+
+const ui::Control* find_kind(const ui::Hud& hud, ui::ControlKind k) {
+  for (const auto& c : hud.controls()) {
+    if (c.kind == k) return &c;
+  }
+  return nullptr;
+}
+
+}  // namespace
+
+TEST(ui_Sidebar, BuildsTwoPanelsLeftAndRight) {
+  ui::Hud hud;
+  const ui::SidebarIds ids =
+      ui::build_sidebar_hud(&hud, test_hud_cfg(), test_display(), sidebar_cfg(4, 6));
+
+  const ui::Control* left = hud.find(ids.left_panel);
+  const ui::Control* right = hud.find(ids.right_panel);
+  ASSERT_NE(left, nullptr);
+  ASSERT_NE(right, nullptr);
+  EXPECT_EQ(left->kind, ui::ControlKind::Panel);
+  EXPECT_EQ(right->kind, ui::ControlKind::Panel);
+
+  // 左右分列:左面板整体在右面板左侧,两者不重叠,且中间留出 gap。
+  // (不假设"越过屏宽中点" —— 两栏窄时面板可以都落在左半区,只要分列正确。)
+  EXPECT_LT(left->rect_px.x, right->rect_px.x) << "左面板必须在右面板左侧";
+  EXPECT_LE(left->rect_px.right(), right->rect_px.x) << "两块面板不许重叠";
+  EXPECT_FLOAT_EQ(right->rect_px.x - left->rect_px.right(), test_hud_cfg().gap_dp)
+      << "两栏之间必须留出 gap";
+  EXPECT_FLOAT_EQ(left->rect_px.y, right->rect_px.y) << "两栏必须同高同顶";
+
+  // 都必须在屏幕内(不越界)
+  const float W = static_cast<float>(test_display().width);
+  const float H = static_cast<float>(test_display().height);
+  for (const auto* c : {left, right}) {
+    EXPECT_GE(c->rect_px.x, 0.f);
+    EXPECT_GE(c->rect_px.y, 0.f);
+    EXPECT_LE(c->rect_px.right(), W + 0.5f);
+    EXPECT_LE(c->rect_px.bottom(), H + 0.5f);
+  }
+
+  EXPECT_EQ(ids.left_items.size(), 4u);
+  EXPECT_EQ(ids.right_items.size(), 6u);
+  EXPECT_NE(ids.back_button, 0u);
+}
+
+TEST(ui_Sidebar, ItemsStackVerticallyInsideTheirPanel) {
+  ui::Hud hud;
+  const ui::SidebarIds ids =
+      ui::build_sidebar_hud(&hud, test_hud_cfg(), test_display(), sidebar_cfg(4, 4));
+  const ui::ListColumnLayout ll = hud.list_layout(ids.left_panel);
+  const ui::ListColumnLayout rl = hud.list_layout(ids.right_panel);
+
+  // 左列表:4 条都在可见区内,自上而下等距排列
+  ASSERT_GE(ll.visible_rows, 4u);
+  float prev_bottom = -1.f;
+  for (std::size_t i = 0; i < ids.left_items.size(); ++i) {
+    const ui::Control* it = hud.find(ids.left_items[i]);
+    ASSERT_NE(it, nullptr);
+    EXPECT_FLOAT_EQ(it->rect_px.h, ll.row_height_px);
+    EXPECT_GE(it->rect_px.x, ll.viewport.x - 0.5f);
+    EXPECT_LE(it->rect_px.right(), ll.viewport.right() + 0.5f);
+    if (i == 0) {
+      EXPECT_FLOAT_EQ(it->rect_px.y, ll.viewport.y);
+    } else {
+      EXPECT_GT(it->rect_px.y, prev_bottom - 0.5f) << "条目必须自上而下排";
+    }
+    prev_bottom = it->rect_px.bottom();
+  }
+
+  // 右列表条目必须落在**右面板**的 viewport 里(不是左面板)
+  for (std::uint32_t id : ids.right_items) {
+    const ui::Control* it = hud.find(id);
+    ASSERT_NE(it, nullptr);
+    EXPECT_GE(it->rect_px.x, rl.viewport.x - 0.5f);
+    EXPECT_LE(it->rect_px.right(), rl.viewport.right() + 0.5f);
+  }
+}
+
+TEST(ui_Sidebar, SelectionIsSingleAcrossList) {
+  ui::Hud hud;
+  ui::SidebarConfig sb = sidebar_cfg(5, 3);
+  sb.left_selected = 2;
+  const ui::SidebarIds ids = ui::build_sidebar_hud(&hud, test_hud_cfg(), test_display(), sb);
+
+  int selected = 0;
+  for (std::uint32_t id : ids.left_items) {
+    const ui::Control* it = hud.find(id);
+    ASSERT_NE(it, nullptr);
+    if (it->selected) {
+      ++selected;
+      EXPECT_EQ(it->index, 2u) << "选中的必须是第 2 条";
+    }
+  }
+  EXPECT_EQ(selected, 1) << "同一列表内至多一条选中";
+
+  // 切换选中:旧的被清掉
+  EXPECT_TRUE(hud.select_list_item(ids.left_panel, 4));
+  EXPECT_FALSE(hud.find(ids.left_items[2])->selected);
+  EXPECT_TRUE(hud.find(ids.left_items[4])->selected);
+  // 越界下标 = 明确失败(不静默)
+  EXPECT_FALSE(hud.select_list_item(ids.left_panel, 99));
+  // 越界后所有条目都不该处于选中态(没有一条匹配)
+  for (std::uint32_t id : ids.left_items) {
+    EXPECT_FALSE(hud.find(id)->selected);
+  }
+}
+
+TEST(ui_Sidebar, OverlongListScrollsWithoutDrawingOutside) {
+  // 30 条塞进一个只能放 5~8 行的小面板:必须给出滚动提示、不越界绘制、不崩
+  ui::Hud hud;
+  ui::SidebarConfig sb = sidebar_cfg(2, 30);
+  const ui::SidebarIds ids = ui::build_sidebar_hud(&hud, test_hud_cfg(), test_display(), sb);
+  ui::ListColumnLayout lay = hud.list_layout(ids.right_panel);
+  ASSERT_TRUE(lay.scrollable) << "条目数超过可见行时必须标记可滚动";
+  ASSERT_GT(lay.visible_rows, 0u);
+  EXPECT_LT(lay.visible_rows, 30u);
+
+  // 可见条目数 = visible_rows,且每一条都在 viewport 内
+  const auto visible = hud.visible_list_items(ids.right_panel);
+  EXPECT_EQ(visible.size(), static_cast<std::size_t>(lay.visible_rows));
+  for (std::uint32_t id : visible) {
+    const ui::Control* it = hud.find(id);
+    ASSERT_NE(it, nullptr);
+    EXPECT_GE(it->rect_px.y, lay.viewport.y - 0.5f);
+    EXPECT_LE(it->rect_px.bottom(), lay.viewport.bottom() + 0.5f);
+  }
+
+  // 滚到底:起始行被夹住,不会把列表滚出面板
+  lay = hud.layout_list_panel(ids.right_panel, 999u, test_hud_cfg());
+  EXPECT_EQ(lay.first_visible_row, 30u - lay.visible_rows)
+      << "越界的滚动值必须夹到 last-visible 行";
+  for (std::uint32_t id : hud.visible_list_items(ids.right_panel)) {
+    const ui::Control* it = hud.find(id);
+    EXPECT_LE(it->rect_px.bottom(), lay.viewport.bottom() + 0.5f);
+  }
+
+  // 滚动条几何必须夹在面板内
+  EXPECT_TRUE(lay.has_scrollbar);
+  EXPECT_GE(lay.scrollbar_track.x, lay.panel.x);
+  EXPECT_LE(lay.scrollbar_track.right(), lay.panel.right() + 0.5f);
+  EXPECT_LE(lay.scrollbar_track.bottom(), lay.panel.bottom() + 0.5f);
+  EXPECT_LE(lay.scrollbar_thumb.bottom(), lay.scrollbar_track.bottom() + 0.5f);
+}
+
+TEST(ui_Sidebar, ScrollHintDisappearsWhenEverythingFits) {
+  ui::Hud hud;
+  const ui::SidebarIds ids =
+      ui::build_sidebar_hud(&hud, test_hud_cfg(), test_display(), sidebar_cfg(3, 3));
+  const ui::ListColumnLayout lay = hud.list_layout(ids.right_panel);
+  EXPECT_FALSE(lay.scrollable) << "条目全部装得下时不该出现滚动提示";
+  EXPECT_FALSE(lay.has_scrollbar);
+}
+
+TEST(ui_Sidebar, InvisibleItemsAreNotClickable) {
+  // 滚出 viewport 的条目几何为 0 高 → 既不可见也不可命中
+  ui::Hud hud;
+  ui::SidebarConfig sb = sidebar_cfg(2, 30);
+  const ui::SidebarIds ids = ui::build_sidebar_hud(&hud, test_hud_cfg(), test_display(), sb);
+  hud.layout_list_panel(ids.right_panel, 0, test_hud_cfg());
+  const auto visible = hud.visible_list_items(ids.right_panel);
+  ASSERT_FALSE(visible.empty());
+
+  // 找一个不可见条目,它的矩形必须为空
+  for (std::uint32_t id : ids.right_items) {
+    bool is_visible = false;
+    for (std::uint32_t v : visible) {
+      if (v == id) is_visible = true;
+    }
+    if (!is_visible) {
+      const ui::Control* it = hud.find(id);
+      EXPECT_TRUE(it->rect_px.empty()) << "不可见条目必须收成空矩形(否则会画到面板外)";
+      break;
+    }
+  }
+}
+
+TEST(ui_Sidebar, EmptyListStillDrawsPanelAndDoesNotCrash) {
+  ui::Hud hud;
+  ui::SidebarConfig sb = sidebar_cfg(0, 0);
+  const ui::SidebarIds ids = ui::build_sidebar_hud(&hud, test_hud_cfg(), test_display(), sb);
+  EXPECT_NE(ids.left_panel, 0u) << "空列表也要有面板(否则 HUD 面板没画出来)";
+  EXPECT_NE(ids.right_panel, 0u);
+  EXPECT_TRUE(ids.left_items.empty());
+  const ui::ListColumnLayout lay = hud.list_layout(ids.right_panel);
+  EXPECT_EQ(lay.total_rows, 0u);
+  EXPECT_FALSE(lay.scrollable);
+  EXPECT_FALSE(hud.select_list_item(ids.right_panel, 0)) << "空列表没有可选项";
+
+  mb::ui::detail::Overlay2D ov;
+  ov.begin(ui::Rect{0, 0, 480, 320});
+  hud.draw(ov);
+  ov.end();
+  EXPECT_GT(ov.primitive_count(), 0u) << "空列表也必须画出面板底色";
+}
+
+TEST(ui_Sidebar, ItemClickReportsListIndexNotControlId) {
+  ui::Hud hud;
+  ui::SidebarConfig sb = sidebar_cfg(3, 3);
+  std::uint32_t left_hit = 999, right_hit = 999;
+  sb.on_left_item = [&left_hit](std::uint32_t i) { left_hit = i; };
+  sb.on_right_item = [&right_hit](std::uint32_t i) { right_hit = i; };
+  const ui::SidebarIds ids = ui::build_sidebar_hud(&hud, test_hud_cfg(), test_display(), sb);
+
+  const ui::Control* it = hud.find(ids.left_items[1]);
+  ASSERT_NE(it, nullptr);
+  const float cx = it->rect_px.x + it->rect_px.w * 0.5f;
+  const float cy = it->rect_px.y + it->rect_px.h * 0.5f;
+  EXPECT_TRUE(hud.on_input(pev(dev::InputEventKind::PointerDown, cx, cy)));
+  EXPECT_TRUE(hud.on_input(pev(dev::InputEventKind::PointerUp, cx, cy)));
+  EXPECT_EQ(left_hit, 1u) << "回调必须给列表内下标(不是控件 id)";
+
+  const ui::Control* rit = hud.find(ids.right_items[2]);
+  ASSERT_NE(rit, nullptr);
+  const float rx = rit->rect_px.x + rit->rect_px.w * 0.5f;
+  const float ry = rit->rect_px.y + rit->rect_px.h * 0.5f;
+  hud.on_input(pev(dev::InputEventKind::PointerDown, rx, ry));
+  hud.on_input(pev(dev::InputEventKind::PointerUp, rx, ry));
+  EXPECT_EQ(right_hit, 2u);
+}
+
+TEST(ui_Input, SidebarPanelConsumesClickSoNoLeakToCamera) {
+  // spec §7 ①:面板消费点击后**不得**漏给相机 —— 包括点中条目与点中面板空白处
+  ui::Hud hud;
+  ui::SidebarConfig sb = sidebar_cfg(4, 4);
+  ui::build_sidebar_hud(&hud, test_hud_cfg(), test_display(), sb);
+
+  ui::InputRouter r;
+  RecordingTool tool;
+  RecordingCamera cam;
+  tool.active = true;  // 工具也激活,更容易暴露"漏给相机/工具"
+  r.set_hud(&hud);
+  r.set_tool(&tool);
+  r.set_camera(&cam);
+
+  const ui::SidebarIds ids = ui::build_sidebar_hud(
+      &hud, test_hud_cfg(), test_display(), sidebar_cfg(4, 4));
+  const ui::Control* item = hud.find(ids.right_items[1]);
+  ASSERT_NE(item, nullptr);
+  const float cx = item->rect_px.x + item->rect_px.w * 0.5f;
+  const float cy = item->rect_px.y + item->rect_px.h * 0.5f;
+
+  EXPECT_EQ(r.route(pev(dev::InputEventKind::PointerDown, cx, cy)), ui::InputOwner::Hud)
+      << "点中列表面板条目必须归 HUD(spec §7 ①)";
+  EXPECT_EQ(r.route(pev(dev::InputEventKind::PointerMove, cx + 3.f, cy + 2.f)),
+            ui::InputOwner::Hud) << "Move 必须沿用按下时的归属";
+  EXPECT_EQ(r.route(pev(dev::InputEventKind::PointerUp, cx, cy)), ui::InputOwner::Hud);
+  EXPECT_EQ(cam.events, 0) << "面板消费后不得漏给相机";
+  EXPECT_EQ(tool.events, 0) << "面板消费后不得漏给工具";
+
+  // 面板空白处(没点到条目)同样必须由 Panel 消费
+  const ui::ListColumnLayout lay = hud.list_layout(ids.left_panel);
+  const float bx = lay.panel.x + 1.f;
+  const float by = lay.panel.bottom() - 1.f;
+  EXPECT_EQ(r.route(pev(dev::InputEventKind::PointerDown, bx, by)), ui::InputOwner::Hud);
+  EXPECT_EQ(r.route(pev(dev::InputEventKind::PointerUp, bx, by)), ui::InputOwner::Hud);
+  EXPECT_EQ(cam.events, 0);
+  EXPECT_EQ(r.stats().dropped, 0u) << "面板内的事件不该有丢事件";
+}
+
+TEST(ui_Input, OverlongListScrollAreaAlsoConsumed) {
+  // 滚动条所在的窄条也必须由 HUD 消费(它压在面板边缘,不能穿透到相机)
+  ui::Hud hud;
+  const ui::SidebarIds ids =
+      ui::build_sidebar_hud(&hud, test_hud_cfg(), test_display(), sidebar_cfg(2, 30));
+  ui::InputRouter r;
+  RecordingCamera cam;
+  r.set_hud(&hud);
+  r.set_camera(&cam);
+  const ui::Control* right = hud.find(ids.right_panel);
+  ASSERT_NE(right, nullptr);
+  const float sx = right->rect_px.right() - 3.f;
+  const float sy = right->rect_px.y + right->rect_px.h * 0.5f;
+  EXPECT_EQ(r.route(pev(dev::InputEventKind::PointerDown, sx, sy)), ui::InputOwner::Hud);
+  EXPECT_EQ(cam.events, 0);
+}
+
+// ---- 路由:点右条目 → 经 Router 进空桩 → 返回按钮回列表 ----
+
+TEST(ui_SidebarRoute, RightItemPushesStubAndBackReturns) {
+  ui::UiApp app;
+  ui::UiAppConfig cfg;
+  cfg.display = test_display();
+  cfg.mode = ui::TargetMode::Offscreen;
+  cfg.scene_frame.mode = ui::TargetMode::Offscreen;
+  ProbeFeature::State st;
+  cfg.sidebar = sidebar_cfg(3, 4);
+  // 右列表第 2 条 → 一个"空 FeatureHost"(只有骨架)
+  ui::UiAppDeps deps;
+  std::string err;
+  ASSERT_TRUE(app.init(cfg, deps, &err)) << err;
+  app.register_feature(ui::FeatureRegistration{
+      ui::FeatureId("slot2"), [&st]() { return std::make_unique<ProbeFeature>(&st); }});
+  ASSERT_TRUE(app.bind_sidebar_route(2, ui::FeatureId("slot2")));
+  EXPECT_FALSE(app.bind_sidebar_route(99, ui::FeatureId("slot2")))
+      << "越界下标必须明确失败";
+
+  ASSERT_TRUE(app.router().current().empty()) << "初始在 HomeScreen";
+
+  const auto ids = app.sidebar_ids();
+  const ui::Control* item = app.hud().find(ids.right_items[2]);
+  ASSERT_NE(item, nullptr);
+  const float cx = item->rect_px.x + item->rect_px.w * 0.5f;
+  const float cy = item->rect_px.y + item->rect_px.h * 0.5f;
+  app.on_input(pev(dev::InputEventKind::PointerDown, cx, cy));
+  app.on_input(pev(dev::InputEventKind::PointerUp, cx, cy));
+
+  EXPECT_EQ(app.router().current().value, "slot2")
+      << "点右侧条目必须经 Router 进入对应 FeatureHost(spec §4 唯一入口)";
+  EXPECT_EQ(st.enters, 1);
+
+  // 点返回 → 回列表(HomeScreen)
+  const ui::Control* back = app.hud().find(app.sidebar_ids().back_button);
+  ASSERT_NE(back, nullptr);
+  const float bx = back->rect_px.x + back->rect_px.w * 0.5f;
+  const float by = back->rect_px.y + back->rect_px.h * 0.5f;
+  app.on_input(pev(dev::InputEventKind::PointerDown, bx, by));
+  app.on_input(pev(dev::InputEventKind::PointerUp, bx, by));
+  EXPECT_TRUE(app.router().current().empty()) << "返回按钮必须回列表";
+  EXPECT_EQ(st.exits, 1);
+}
+
+TEST(ui_SidebarRoute, UnboundItemOnlyHighlights) {
+  // 没绑路由的条目:点击不路由(不崩、不静默跳屏)
+  ui::UiApp app;
+  ui::UiAppConfig cfg;
+  cfg.display = test_display();
+  cfg.mode = ui::TargetMode::Offscreen;
+  cfg.scene_frame.mode = ui::TargetMode::Offscreen;
+  cfg.sidebar = sidebar_cfg(2, 3);
+  ui::UiAppDeps deps;
+  std::string err;
+  ASSERT_TRUE(app.init(cfg, deps, &err)) << err;
+
+  const auto ids = app.sidebar_ids();
+  const ui::Control* item = app.hud().find(ids.right_items[0]);
+  ASSERT_NE(item, nullptr);
+  const float cx = item->rect_px.x + item->rect_px.w * 0.5f;
+  const float cy = item->rect_px.y + item->rect_px.h * 0.5f;
+  app.on_input(pev(dev::InputEventKind::PointerDown, cx, cy));
+  app.on_input(pev(dev::InputEventKind::PointerUp, cx, cy));
+  EXPECT_TRUE(app.router().current().empty()) << "未绑路由的条目不该跳转";
+}
+
+TEST(ui_SidebarRoute, SurfaceChangedRebuildsSidebarWithoutLosingRoutes) {
+  ui::UiApp app;
+  ui::UiAppConfig cfg;
+  cfg.display = test_display();
+  cfg.mode = ui::TargetMode::Offscreen;
+  cfg.scene_frame.mode = ui::TargetMode::Offscreen;
+  cfg.sidebar = sidebar_cfg(2, 3);
+  ProbeFeature::State st;
+  ui::UiAppDeps deps;
+  std::string err;
+  ASSERT_TRUE(app.init(cfg, deps, &err)) << err;
+  app.register_feature(ui::FeatureRegistration{
+      ui::FeatureId("slot1"), [&st]() { return std::make_unique<ProbeFeature>(&st); }});
+  ASSERT_TRUE(app.bind_sidebar_route(1, ui::FeatureId("slot1")));
+
+  // 竖屏旋转:侧栏必须按新尺寸重排,且所有控件仍在新屏幕内
+  dev::AppLifecycleEvent rot;
+  rot.kind = dev::LifecycleKind::SurfaceChanged;
+  rot.width = 320;
+  rot.height = 480;
+  app.on_lifecycle(rot);
+
+  bool saw_item = false;
+  for (const auto& c : app.hud().controls()) {
+    EXPECT_LE(c.rect_px.right(), 320.f + 0.5f) << "控件越界: " << c.label;
+    EXPECT_LE(c.rect_px.bottom(), 480.f + 0.5f) << "控件越界: " << c.label;
+    if (c.kind == ui::ControlKind::ListItem) saw_item = true;
+  }
+  EXPECT_TRUE(saw_item) << "旋转后列表条目必须还在";
+
+  // 路由绑定必须保留:点第 1 条仍然能进空桩
+  const ui::Control* item = app.hud().find(app.sidebar_ids().right_items[1]);
+  ASSERT_NE(item, nullptr);
+  ASSERT_FALSE(item->rect_px.empty());
+  const float cx = item->rect_px.x + item->rect_px.w * 0.5f;
+  const float cy = item->rect_px.y + item->rect_px.h * 0.5f;
+  app.on_input(pev(dev::InputEventKind::PointerDown, cx, cy));
+  app.on_input(pev(dev::InputEventKind::PointerUp, cx, cy));
+  EXPECT_EQ(app.router().current().value, "slot1") << "旋转后路由绑定不得丢失";
+}
+
+TEST(ui_Sidebar, DrawIsDeterministicAndStaysInBounds) {
+  // 绘制顺序固定 + 所有图元都夹在屏幕内(不越界绘制)
+  ui::Hud hud;
+  ui::build_sidebar_hud(&hud, test_hud_cfg(), test_display(), sidebar_cfg(4, 30));
+  mb::ui::detail::Overlay2D a, b;
+  a.begin(ui::Rect{0, 0, 480, 320});
+  hud.draw(a);
+  a.end();
+  b.begin(ui::Rect{0, 0, 480, 320});
+  hud.draw(b);
+  b.end();
+  ASSERT_EQ(a.primitives().size(), b.primitives().size());
+  EXPECT_GT(a.primitives().size(), 0u);
+  for (std::size_t i = 0; i < a.primitives().size(); ++i) {
+    const auto& pa = a.primitives()[i];
+    const auto& pb = b.primitives()[i];
+    EXPECT_EQ(pa.kind, pb.kind);
+    EXPECT_EQ(pa.color, pb.color);
+    EXPECT_FLOAT_EQ(pa.a.x, pb.a.x);
+    EXPECT_FLOAT_EQ(pa.b.y, pb.b.y);
+    EXPECT_GE(pa.a.x, 0.f);
+    EXPECT_GE(pa.a.y, 0.f);
+    EXPECT_LE(pa.b.x, 480.f + 0.5f);
+    EXPECT_LE(pa.b.y, 320.f + 0.5f);
+  }
 }
 
 // ================================================================ Perf(spec §6)
@@ -1053,6 +1493,18 @@ struct SwEnv {
     cfg.display = ui::DisplayInfo{w, h, 1.f};
     cfg.mode = ui::TargetMode::Offscreen;
     cfg.scene_frame.mode = ui::TargetMode::Offscreen;
+    // 与 magicblocks-ui-cli 用**同一套** HUD 布局参数(CLI 侧也钉住了这套):
+    // golden 由 CLI 生成、由本测试比对,两边几何必须一致,否则永远对不上。
+    cfg.hud = test_hud_cfg();
+    // 侧栏条目必须与 magicblocks-ui-cli 的 default_sidebar() **完全相同**:
+    // UI 层不内置任何条目(spec §2),条目纯属"外部注入",所以 golden 的
+    // 生成方(CLI)与比对方(本测试)必须注入同一份数据。
+    cfg.sidebar.left_title = "models";
+    cfg.sidebar.right_title = "play";
+    cfg.sidebar.back_button_label = "back";
+    cfg.sidebar.left_items = {"cube", "quad", "sphere", "cylinder"};
+    cfg.sidebar.right_items = {"slot0", "slot1", "slot2", "slot3",
+                               "slot4", "slot5", "slot6", "slot7"};
     ui::UiAppDeps deps;
     // 离屏模式没有壳层 surface:场景帧走 G7 跳过,UI 图元由离屏通道单独出图。
     deps.scene_sink = nullptr;

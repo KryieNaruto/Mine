@@ -57,6 +57,17 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
     var onStatus: ((String) -> Unit)? = null
     private var lastStatusAt = 0L
 
+    // ================================================================ MSAA
+    //
+    // 这里存的是**请求值**；实际生效值由引擎在 attach 时回报（设备可能不支持
+    // 请求档位而退回 1x）。两者分开存，UI 才能把"我点的是 8x、实际是 4x"显示出来。
+    //
+    // 默认 4x：这个 APK 是演示用的，打开就该看见抗锯齿效果。
+    // 设备不支持 4x 时后端会在建交换链前拦下来并退回 1x（还会打日志），
+    // HUD 显示的是退回后的真实值，不会骗人。
+    private var msaaSamples = DEFAULT_MSAA_SAMPLES
+    private var msaaEffective = 1
+
     // ================================================================ 惯性
     //
     // 设计要点：
@@ -132,7 +143,12 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         val w = if (surfaceWidth > 0) surfaceWidth else width
         val h = if (surfaceHeight > 0) surfaceHeight else height
         if (w <= 0 || h <= 0) return
+        // 采样数必须在 attachSurface 之前送进引擎：交换链要按它决定建几张 MS 图。
+        session.setMsaa(msaaSamples)
         session.attachSurface(holder.surface, w, h)
+        // 记下**实际生效**的采样数（设备不支持时后端会退回 1x），UI 显示的是这个值。
+        msaaEffective = session.msaaSamples()
+        Log.i(MbRenderer.TAG, "MSAA 请求 ${msaaSamples}x → 实际 ${msaaEffective}x（支持: ${supportedMsaaLevels()}）")
         // 建好交换链后立刻画一帧，避免第一屏是黑的
         renderOnce()
     }
@@ -443,6 +459,33 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         session.destroy()
     }
 
+    // ------------------------------------------------------------ MSAA
+
+    /**
+     * 切换 MSAA 档位。做法是 detach → 设值 → attach：
+     * 采样数是交换链属性（决定 MS 图张数与规格），只能在重建交换链时改变。
+     *
+     * 返回**实际生效**的采样数 —— 设备不支持请求档位时后端会退回 1x，
+     * 调用方必须拿这个返回值去更新 UI，否则按钮上会显示一个假的 ×8。
+     */
+    fun applyMsaa(samples: Int): Int {
+        stopFling()
+        msaaSamples = if (samples <= 0) 1 else samples
+        val holder = this.holder ?: return msaaEffective
+        session.detachSurface()
+        attach(holder)
+        return msaaEffective
+    }
+
+    /** 设备支持的采样数档位（升序，至少含 1）。 */
+    fun supportedMsaaLevels(): List<Int> = session.supportedMsaa()
+
+    /** 实际生效的采样数。 */
+    fun effectiveMsaaSamples(): Int = msaaEffective
+
+    /** 当前请求的采样数。 */
+    fun requestedMsaaSamples(): Int = msaaSamples
+
     private companion object {
         // 相机
         const val CAM_DIST = 2.6f
@@ -467,5 +510,9 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         const val FLING_WINDOW_MS = 100f
         // 角速度上限（rad/s）：约 3.3 圈/秒，再快也没意义
         const val MAX_YAW_VEL = 21f
+
+        // 启动时的 MSAA 请求档位。4x 是画质/性能的常用折中；
+        // 设备不支持时引擎会退回 1x 并打日志，UI 显示实际生效值。
+        const val DEFAULT_MSAA_SAMPLES = 4
     }
 }

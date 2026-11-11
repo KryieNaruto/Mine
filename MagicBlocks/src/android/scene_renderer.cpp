@@ -236,11 +236,27 @@ bool SceneRenderer::attach_surface(void* window, int width, int height, std::str
   ns.a = window;
   ns.b = 0;
 
-  auto sc = device_->create_swapchain(ns, dev::Extent2D{static_cast<dev::u32>(width),
-                                                        static_cast<dev::u32>(height)});
+  // 走带采样的入口：set_requested_msaa 必须先于 init()，而公共面
+  // create_swapchain() 不带采样参数。MSAA 不可用时后端会退回 1x 并打日志，
+  // 不会让这里失败 —— 所以只有一条创建路径，别写成"先建一条再换一条"，
+  // 那会白建一条交换链（连同它下面的 surface 与图）。
+  const dev::Extent2D sc_extent{static_cast<dev::u32>(width), static_cast<dev::u32>(height)};
+  auto* vkdev_sc = dynamic_cast<backend::VulkanRenderDevice*>(device_.get());
+  dev::Result<std::unique_ptr<dev::ISwapchain>> sc =
+      (vkdev_sc != nullptr)
+          ? vkdev_sc->create_swapchain_with_msaa(ns, sc_extent, msaa_samples_)
+          : device_->create_swapchain(ns, sc_extent);
   if (!sc.ok()) return fail("创建交换链失败: " + sc.message());
   swapchain_ = sc.take();
   native_window_ = window;  // 引用由 JNI 层产生，归本对象持有
+
+  // 实际生效的采样数：设备不支持时后端会退回 1x（并已打日志）。
+  // 后面建管线必须用**这个**值，否则管线按 4 采样建、pass 按 1 采样开，
+  // vkCmdDraw 会被静默丢弃 —— 屏幕上只剩清屏色，且没有任何报错。
+  effective_msaa_samples_ = 1;
+  if (auto* vsc_samples = dynamic_cast<backend::VulkanSwapchain*>(swapchain_.get())) {
+    effective_msaa_samples_ = vsc_samples->msaa_samples();
+  }
 
   width_ = width;
   height_ = height;
@@ -283,7 +299,16 @@ bool SceneRenderer::rebuild_pipeline_for_swapchain(std::string* err) {
   backend::AttachmentShape shape{};
   shape.color_format = fmt;
   shape.has_depth = false;
-  shape.samples = 1;
+  // 必须用 **实际生效** 的采样数，且与交换链建 MS 图时的值一致。
+  // 这里曾经硬编码 1，导致 MS 图建好却没任何管线/附件用它 —— 开了 ×4 等于没开。
+  shape.samples = effective_msaa_samples_;
+  // 2026-11-11（t6）：AttachmentShape 现在**带** from_swapchain，且必须置真。
+  // 以前注释写着"没有这个字段，这个差异由设备层自行判定"——那句话是错的：
+  // 设备层只在**回退分支**（自己 create_pass）里才有 from_swapchain，
+  // 一旦复用管线自带 pass，管线 pass 的 finalLayout 恒为 GENERAL →
+  // vkQueuePresentKHR 报 E-01430（must be in PRESENT_SRC_KHR but is in GENERAL），
+  // 上屏帧被丢掉。现在两边同口径，pass_compatible() 也会比较它。
+  shape.from_swapchain = true;
 
   auto pr = vkdev->create_pipeline_for_shape(cube_pipeline_desc(), shape);
   if (!pr.ok()) return fail("按交换链形状建管线失败: " + pr.message());
@@ -460,6 +485,15 @@ bool SceneRenderer::render_frame(float yaw, float pitch, float scale, float pan_
   ++frame_count_;
   last_error_.clear();
   return true;
+}
+
+std::vector<std::uint32_t> SceneRenderer::supported_msaa_levels() const {
+  // 直接转发设备 caps：这是驱动 vkGetPhysicalDeviceImageFormatProperties
+  // 查出来的真实结果，不是猜的。UI 拿它来循环切换，就不会点到不支持的档位。
+  if (!device_) return {1u};
+  const auto& lv = device_->caps().supported_msaa_levels;
+  if (lv.empty()) return {1u};  // 老后端没填这个字段时至少保证 1x 可用
+  return lv;
 }
 
 std::string SceneRenderer::status_text() const {

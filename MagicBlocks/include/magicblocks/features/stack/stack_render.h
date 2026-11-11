@@ -36,9 +36,11 @@
 #include <vector>
 
 #include "magicblocks/features/stack/block_set.h"
+#include "magicblocks/features/stack/grid_overlay.h"
 #include "magicblocks/features/stack/stack_types.h"
 #include "magicblocks/primitives/batch.h"
 #include "magicblocks/primitives/camera.h"
+#include "magicblocks/primitives/overlay2d.h"
 #include "magicblocks/device/render_device.h"
 #include "magicblocks/resources/command.h"
 #include "magicblocks/resources/pipeline.h"
@@ -81,6 +83,38 @@ resources::PipelineDesc inner_pipeline_desc(std::uint32_t samples);
 // 两个 hash 必须不同 —— 否则合批器会把两个 pass 合并成一个 draw（顺序契约消失）。
 std::uint64_t compute_pass_hash(const resources::PipelineDesc& desc, std::uint64_t salt);
 
+// 网格指示（需求「立方体…带网格指示」）的接线口。
+//
+// ======================== 为什么不直接塞一个 IGridOverlay* ========================
+// 覆盖层是**屏幕空间**的 2D 图元（`IOverlay2D`），它有自己的一条管线与一次 draw，
+// 并且明确**不计入**双 pass 的"恰好 2 次 drawcall"预算（见 grid_overlay.h 顶部）。
+// 如果把 `IGridOverlay` 直接交给 `IStackRenderer`，渲染器就要同时持有 L3 的覆盖层
+// 收集器、覆盖层几何与覆盖层缓冲 —— 那等于把两套生命周期塞进一个对象，
+// 而且"覆盖层到底画没画"会退化成读某个内部统计字段。
+//
+// 所以接线口是这样的（所有权都在调用方，渲染器只借用来"收集"）：
+//
+//   1. 调用方建 `IGridOverlay` 与 `IOverlay2D`，填好本结构；
+//   2. `record_frame()` 在录完表面 + 内面两个 pass 之后，调 `overlay->collect(collector, ...)`，
+//      把网格线/锁定层/光标格收进 `collector`；
+//   3. 调用方 `collector->build()` 后调 `overlay->record(cmd, geometry, w, h, &buffers)`
+//      录成**自己的**一次 draw —— 缓冲由调用方持有到 submit 之后。
+//
+// 这样"网格指示有没有进出图"是可观测的：`StackRenderStats::overlay_collected` 与
+// 调用方 `overlay->stats()`。像素级证据见用例 `StackGridOverlay.WiredOverlayChangesPixels`。
+//
+// `grid` 刻意在这里再给一次而不是复用 `IBlockSet` 的：`IBlockSet` 不暴露 GridSpec，
+// 而覆盖层要画**整张网格**（包括没有方块的那些格），不能从真源反推。
+struct StackFrameOverlay {
+  IGridOverlay* overlay = nullptr;                         // 覆盖层（管线 + 收集 + 录制）
+  magicblocks::primitives::IOverlay2D* collector = nullptr;             // 收集器（调用方持有，活到 submit）
+  GridSpec grid{};                                         // 网格规格（与 IBlockSet 同一份）
+  StackOverlayDesc desc{};                                 // 画哪层 / 光标格 / 开关
+  // 叠加用的 view_proj：**必须与 StackFrameDesc::view_proj 是同一份快照**，
+  // 否则覆盖层与积木会错位（错位的画面看起来"只是有点歪"，不会报错）。
+  bool project_with_frame_matrix = true;
+};
+
 // 一帧的渲染输入。
 struct StackFrameDesc {
   const IBlockSet* set = nullptr;
@@ -115,6 +149,10 @@ struct StackFrameDesc {
   // 生产路径不给关掉它的旋钮。
   CellOrder surface_order = CellOrder::Index;
   CellOrder inner_order = CellOrder::YZX;
+
+  // 网格指示接线（需求「带网格指示」）。`overlay.overlay == nullptr` = 这一帧不画网格，
+  // 是**显式**的"不画"，不是"忘了接"：用例 `StackGridOverlay.OverlayIsOptIn` 钉住默认值。
+  StackFrameOverlay overlay{};
 };
 
 // 一帧的渲染统计 —— 供用例断言"没有偷偷多发 draw / 多提交"。
@@ -132,6 +170,11 @@ struct StackRenderStats {
   // 本帧内面 pass 是否真的绑了**独立**的内面实例缓冲
   // （false = 两种顺序相同，复用了表面缓冲）。
   bool inner_buffer_distinct = false;
+  // 网格指示是否真的被收进了调用方的覆盖层收集器（需求「带网格指示」的观测点）。
+  // false = 这一帧没配 StackFrameDesc::overlay，或 collect 走了空路径。
+  bool overlay_collected = false;
+  std::uint32_t overlay_lines = 0;
+  std::uint32_t overlay_rects = 0;
 };
 
 // 实例缓冲的最小实例数。

@@ -96,3 +96,89 @@ MagicBlocks\build\magicblocks-l2-cli.exe record --scene demo --width 320 --heigh
 
 重生成后必须跑一遍 `magicblocks_test.exe --gtest_filter=L2Golden.*` 确认通过，
 并核对左上角确实是纯绿、背景确实偏蓝。
+
+## golden_fsk_*.png —— L4 魔法涂鸦（F-SK）基线
+
+审计 `docs/superpowers/specs/2026-11-11-magicblocks-fsk-fvx-completion-audit.md` 的 GAP-07
+指出：F-SK 的 golden **从来没有生成过**。这里补三份，均由 `magicblocks-fsk-cli render` 在
+**SwiftShader** 上产出，320x240 RGBA8：
+
+| 文件 | 生成参数 | 它钉住什么 |
+| --- | --- | --- |
+| `golden_fsk_persp.png` | `render --width 320 --height 240 --strokes 3 --camera perspective` | A1/A2 基线 |
+| `golden_fsk_ortho.png` | 同上，`--camera ortho` | A3 相机双模态 |
+| `golden_fsk_region.png` | `--width 320 --height 240 --strokes 2 --camera ortho --region` | R-SK-12 双表示 |
+
+被 `SketchGolden.RenderedFrameMatchesBaselineAndPassesStructuralChecks` 等三条用例使用
+（`tests/magicblocks_l4_sketch_test.cpp`），判据分三层：
+
+1. **结构断言（不依赖 golden 内容）**：四角为背景色 `(15,18,26)`、
+   前景像素占比 ∈ [3%, 60%]、颜色种数 > 2（证明有光照/深度）。
+   这三条能挡住「整张上下颠倒 / 通道写反 / 空图」的错基线 ——
+   而逐像素比对照样会通过那样的图（见上面 L0 的事故记录）。
+2. **与 golden 逐像素比对**，容差 0。
+3. **三份 golden 必须两两不同**：persp vs ortho 验 A3（实测差异 7561 像素），
+   ortho vs region 验 R-SK-12（实测差异 14430 像素）。
+
+### 重新生成
+
+**只有渲染逻辑有意变更后才重新生成**，且必须走脚本（脚本里同时写着生成参数与结构断言）：
+
+```powershell
+$py = "C:\Users\Administrator\AppData\Local\Programs\Python\Python313\python.exe"
+& $py MagicBlocks\scripts\fsk_golden.py all --cli MagicBlocks\build\magicblocks-fsk-cli.exe
+```
+
+`gen` 重新出图；`check` 对 golden **自身**做结构断言 + 两两差异断言（退出码 0 才算合格）。
+`check` 可以脱离用例单独跑，这是防「错基线自我固化」的那一步。
+
+## golden_l4_stack_{basic,no_overlay,inner_off,by_layer}.png —— F-VX 魔法叠叠乐基线
+
+审计 `2026-11-11-magicblocks-fsk-fvx-completion-audit.md` 的 **GAP-07**（F-VX golden 从未落地）。
+四张都是 320×200 RGBA8，**SwiftShader** 产出，清屏色 `#0f121a`。
+
+| 文件 | 生成参数 | 背景占比 | 颜色种数 | SHA256（前 16） |
+| --- | --- | --- | --- | --- |
+| `golden_l4_stack_basic.png` | `--layers 8 --strokes 3`（网格指示缺省 on） | 90.35% | 52 | `AAC7E34DB20BD39A` |
+| `golden_l4_stack_no_overlay.png` | 同上 + `--grid-overlay off` | 93.45% | 6 | `AF4D23888D3C4BF9` |
+| `golden_l4_stack_inner_off.png` | 同上 + `--inner-pass off` | 90.35% | 39 | `E65DA0BBB656470B` |
+| `golden_l4_stack_by_layer.png` | 同上 + `--color-mode by-layer` | 90.35% | 89 | `8424C5EC33A5987C` |
+
+产出于 2026-11-11（fvx，独立构建目录 `build-fvx`）。关键差异：
+`basic` vs `no_overlay` 相差 **3470 像素** ——「带网格指示」在像素上的可观测证据；
+`basic` vs `inner_off` 相差 **2129 像素**（ON 颜色种数 5 > OFF 的 3）—— 内面 pass 确实参与绘制。
+
+### 记录前先做结构验证（captain 2026-11-11 规则）
+
+**只有结构性断言全对才允许把图写成 golden**；结构不对说明渲染是错的，带数字上报、不录基线。
+脚本：`MagicBlocks/build-fvx/verify_structure.py`（本地验证工具，不入库）。它完全不读 golden，
+只对"本次跑出来的图"断言：四角为 `#0f121a`、包围盒非满幅/非退化且大致居中、
+前景占比 ∈[3%,60%]、按层改色出现 ≥8 档明暗、内面 ON 比 OFF 颜色更多且两图相差 >500 像素、
+同参数两次逐字节相同。实测全部 PASS 后才记录本组 golden。
+
+**`inner_off` 曾经被刻意排除**：captain 在共享构建目录观测到 `InnerPass*` 出现 diff=0
+（内面 pass 根本没画），而 `build-fvx` 里 `StackRender*` 9/9 全绿 —— 观测不一致时不录基线。
+该不一致已于同日解除（ON 5 色 > OFF 3 色、两图差 2129 像素），故现在纳入，并由
+`StackGolden.InnerPassOffMatchesGoldenWithStructure` 额外断言"`inner_off` 必须不等于 `basic`"，
+专门抓"内面 pass 静默失效"这类回归。
+
+被 `StackGolden.*`（`tests/magicblocks_l4_stack_golden_test.cpp`）使用，判据四层：
+① 四角必须是背景；② 画面中心 17×17 有非背景像素；③ 前景占比在区间内、颜色种数下限；
+④ 与 golden 逐像素比（容差 4/255、差异像素 < 1%）。
+另外 `GridOverlayChangesPixels` 独立于 golden：同参数只差 `--grid-overlay on/off`，两图必须差 >200 像素。
+
+重生成（**只在渲染逻辑有意变更时**；生成后必须重跑 `verify_structure.py` 并核对上表数字）：
+
+```powershell
+$g = "MagicBlocks\tests\data"
+MagicBlocks\build-fvx\magicblocks-l3-cli.exe stack --width 320 --height 200 --layers 8 --strokes 3 `
+    --output "$g\golden_l4_stack_basic.png"
+MagicBlocks\build-fvx\magicblocks-l3-cli.exe stack --width 320 --height 200 --layers 8 --strokes 3 `
+    --grid-overlay off --output "$g\golden_l4_stack_no_overlay.png"
+MagicBlocks\build-fvx\magicblocks-l3-cli.exe stack --width 320 --height 200 --layers 8 --strokes 3 `
+    --inner-pass off --output "$g\golden_l4_stack_inner_off.png"
+MagicBlocks\build-fvx\magicblocks-l3-cli.exe stack --width 320 --height 200 --layers 8 --strokes 3 `
+    --color-mode by-layer --output "$g\golden_l4_stack_by_layer.png"
+```
+
+核对后跑 `magicblocks_test.exe --gtest_filter=StackGolden.*`。

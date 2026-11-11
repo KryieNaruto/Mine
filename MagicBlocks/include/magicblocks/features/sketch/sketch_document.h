@@ -16,64 +16,38 @@
 // 这条"真源 vs 派生"的分界是本模块的核心约束，实现里任何缓存都必须
 // 能由文档完全重建，否则就是隐形的第二真源。
 //
-// ============================ 双表示（Q-SK-2 用户裁定）============================
+// ============================ 双表示（Q-SK-2 用户裁定 / R-SK-12）============================
 // 用户明确要求：**后续的笔画路径分为路径，和路径包围的布尔区域，需要预留。**
-// 所以一笔有两种几何解读，本文件同时保留、且都从同一份采样点推导：
+// 同一串采样点有两种几何解读：
 //
-//   PathStyle::Ribbon  —— "路径"：把折线按笔宽加粗成带状（胶囊串联）。
-//                        语义是"我在画一根线"，实体是一根有粗细的管子。
-//                        【首轮完整实现】
+//   PathStyle::Ribbon  —— "路径"：把折线按笔宽加粗成带状（描边）。
+//   PathStyle::Region  —— "路径包围的布尔区域"：把闭合折线的**内部**填满（填充）。
 //
-//   PathStyle::Region  —— "路径包围的布尔区域"：把闭合折线的**内部**填满。
-//                        语义是"我在圈一块地"，实体是圈内的那块面。
-//                        【首轮只做"闭合即成面"，即只支持 Union 语义；
-//                          Difference/Intersect/Xor 与"路径 + 区域复合"
-//                          已在接口里预留（RegionOp / PathStyle 双通道），
-//                          但未实现的分支会在调用时**显式报 Unsupported**，
-//                          绝不静默退化到 Ribbon（D8：失败要响，不许悄悄降级）。】
-//
-// 预留而不是现在就做全套，是因为首轮验收只需要 Ribbon；但接口一旦定死
-// 成"只有路径"，后面加区域语义就要动文档格式、命令流、回放——
-// 那是破坏性变更。所以现在把**通道**留下，把**实现**推迟。
+// 这两个概念的设计 §6.3.1(c) 明确要求属 **L3 primitives**（`OutlineSet` 必须
+// 能标注自己是怎么来的）。本文件因此**不再自定义 PathStyle/RegionOp**，而是
+// 直接复用 `primitives::PathStyle` / `primitives::RegionOp`：
+// 类型只有一份，L4 只负责"选哪一种"，不写玩法分支。
+// 未实现的分支（Difference/Intersect/Xor、未闭合 Region）会在调用时
+// **显式报 Unsupported / NotClosed**，绝不静默退化到 Ribbon（D8：失败要响）。
 //
 // ============================ 不做的事 ============================
 //   - 不做笔刷纹理 / 压感 / 倾斜（spec §15 out-of-scope）
-//   - 不做笔画内插样条（采样点即几何，平滑交给 IPainter 的既有路径）
+//   - 不做笔画内插样条（采样点即几何）
 //   - 不做多画布 / 图层合成
 #pragma once
 
 #include <cstdint>
 #include <vector>
 
+#include "magicblocks/primitives/mesh_factory.h"
 #include "magicblocks/primitives/types.h"
 
 namespace magicblocks::features::sketch {
 
+using primitives::PathStyle;
+using primitives::RegionOp;
 using primitives::Vec2;
 using primitives::Vec3;
-
-// 笔画几何的解读方式。Q-SK-2 双表示的入口。
-enum class PathStyle : std::uint8_t {
-  // "路径"：折线按笔宽加粗 → 有粗细的管子。
-  Ribbon = 0,
-  // "路径包围的布尔区域"：闭合折线内部填充 → 一块面。
-  // 首轮：调用时要求笔画已闭合（首尾距离 <= close_tolerance），否则
-  // 返回 Unsupported —— 不替用户"自动闭合"，那会改变用户画的图形。
-  Region = 1,
-};
-
-// 区域语义在有多笔合并时的布尔运算。
-//
-// 首轮只实现 Union。其余三个**存在但未实现**：
-// 调用会返回明确的 Unsupported 状态，而不是被静默当成 Union。
-// 留着它们是为了让命令流/文件格式从一开始就带上这个字段——
-// 否则将来加"挖空"功能又要改格式版本。
-enum class RegionOp : std::uint8_t {
-  Union = 0,       // 并集（首轮支持）
-  Difference = 1,  // 差集（未实现）
-  Intersect = 2,   // 交集（未实现）
-  Xor = 3,         // 异或（未实现）
-};
 
 // 笔画归属与身份。
 //
@@ -111,9 +85,12 @@ struct SketchEdit {
   enum class Kind : std::uint8_t {
     AddStroke,     // 加了一笔
     RemoveStroke,  // 删了一笔
+    Recolor,       // 改了某一笔的颜色（A10：不动几何）
   };
   Kind kind = Kind::AddStroke;
   Stroke stroke{};   // AddStroke 存被加的；RemoveStroke 存被删的（供重做）
+  // Recolor 用：改之前的颜色（撤销时恢复）。新颜色在 `stroke.color` 里。
+  primitives::Color4 previous_color{1.0f, 1.0f, 1.0f, 1.0f};
   std::size_t index = 0;  // 在 strokes 里的位置（重做时插回原处，保持顺序稳定）
 };
 
@@ -139,6 +116,14 @@ class SketchDocument {
   // 按 id 删一笔。成功返回 true 并压入撤销栈。
   bool remove_stroke(StrokeId id);
 
+  // 改一笔的颜色（R-SK-9 / A10）。
+  //
+  // **只改 color 字段**：不 touch points / width / style，因此
+  // `geometry_hash()` 不变、挤出网格逐字节不变。找不到 id → 返回 false
+  // 且不改文档（不静默忽略成"成功"）。
+  // 颜色相同 → 返回 true 但**不压栈**（空操作不该占用一次撤销）。
+  bool set_stroke_color(StrokeId id, primitives::Color4 color);
+
   // ---- 撤销 / 重做 ----
   bool can_undo() const { return !undo_.empty(); }
   bool can_redo() const { return !redo_.empty(); }
@@ -148,17 +133,22 @@ class SketchDocument {
   void clear_history();
 
   // ---- 快照（回放校验用）----
-  // 文档指纹：对"笔画 id + 点数 + 每点坐标 + 参数"按顺序做 64 位混合。
+  // 文档指纹：对"笔画 id + 点数 + 每点坐标 + 参数 + 颜色"按顺序做 64 位混合。
   // 不含任何指针/地址，因此跨进程稳定；浮点按位比较（不是 epsilon），
   // 因为回放要求**逐位一致**而不是"看起来一样"。
   std::uint64_t hash() const;
 
+  // **几何**指纹：hash() 去掉颜色分量。
+  // A10 用它断言"改色不影响几何"：两次改色前后这个值必须一致，
+  // 而 hash() 必须变化（否则说明改色根本没生效 —— 两个方向都要钉住）。
+  std::uint64_t geometry_hash() const;
+
   // 清空（同时清历史）。
   void clear();
 
-  // ---- Region 语义约束（首轮能力边界）----
-  // 首轮是否支持给定的区域运算。调用方应先问再做，
-  // 免得执行到一半才发现不支持。
+  // ---- Region 语义约束（能力边界）----
+  // 委托给 L3：`primitives::supports_region_op`。L4 不自己维护第二份能力表，
+  // 否则"L3 说支持、L4 说不支持"这类分叉迟早出现。
   static bool supports_region_op(RegionOp op);
 
   // 下一笔将拿到的 id（供命令流预分配/回放对齐）。
@@ -177,6 +167,9 @@ class SketchDocument {
 // 双表示的可选性检查：给定笔画能否用指定 style 生成几何。
 // 返回 false 时不产生任何几何，调用方必须**显式处理**（报错或跳过），
 // 不允许当成空轮廓静默继续。
+//
+// 实现委托给 L3 的 `make_outline`：检查逻辑与几何生成必须是**同一份**，
+// 两处各写一套就会出现"检查说行、生成说不行"。
 struct StyleCheck {
   bool ok = false;
   const char* reason = "";  // ok=false 时给出人类可读原因（静态字符串，无分配）

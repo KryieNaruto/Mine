@@ -80,6 +80,11 @@ class UiOverlayPass {
   device::Status ensure_pipeline();
   void destroy_pipeline();
 
+  // 目标真实采样数。**唯一真源是 target->samples()**,不是调用方随便给的数。
+  std::uint32_t target_samples() const;
+  // 把 uint32 采样数转成 VkSampleCountFlagBits;非法/不受支持时返回 0 位。
+  static VkSampleCountFlagBits to_vk_samples(std::uint32_t n);
+
   VulkanContext ctx_;
   OffscreenTarget* target_ = nullptr;
 

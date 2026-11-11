@@ -72,6 +72,20 @@ class SceneRenderer {
 
   bool surface_ready() const { return swapchain_ != nullptr; }
 
+  // MSAA 采样数（1=关闭）。必须在 attach_window **之前**设置 ——
+  // 采样数决定交换链建几张什么规格的 MS 图，也决定管线按几采样建。
+  // 设备不支持时不会失败，会退回 1x 并打日志说明原因。
+  void set_msaa_samples(std::uint32_t n) { msaa_samples_ = n == 0 ? 1u : n; }
+  std::uint32_t msaa_samples() const { return msaa_samples_; }
+  // 实际生效的采样数（可能因设备不支持而低于请求值）。
+  std::uint32_t effective_msaa_samples() const { return effective_msaa_samples_; }
+  // 设备**报告支持**的采样数列表（升序，例如 {1,4,8}）。
+  //
+  // 为什么要问设备而不是在 UI 里写死 {1,4,8}：不同手机的 GPU 支持面差异很大
+  // （有的只到 4x，有的到 16x），把 8x 写死在按钮上会出现"点了 8x 却悄悄退回
+  // 4x"的假象 —— 这台 pad 上就真的验证过这种静默降级，所以必须由设备说了算。
+  std::vector<std::uint32_t> supported_msaa_levels() const;
+
   // 调试信息（Kotlin 侧打日志用）
   std::string status_text() const;
 
@@ -84,6 +98,8 @@ class SceneRenderer {
 
   std::unique_ptr<dev::IRenderDevice> device_;
   std::unique_ptr<dev::ISwapchain> swapchain_;
+  std::uint32_t msaa_samples_ = 1;
+  std::uint32_t effective_msaa_samples_ = 1;
   std::unique_ptr<res::IBuffer> vertex_buffer_;
   std::unique_ptr<res::IBuffer> index_buffer_;
   std::unique_ptr<res::IPipeline> pipeline_;

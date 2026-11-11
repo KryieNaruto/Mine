@@ -79,6 +79,30 @@ UiOverlayPass::~UiOverlayPass() {
 
 std::uint32_t UiOverlayPass::max_instances_hard_limit() { return kHardInstanceLimit; }
 
+std::uint32_t UiOverlayPass::target_samples() const {
+  // 目标才是唯一真源。IRenderTarget::samples() 约定 0 表示"未声明"⇒ 按单采样。
+  if (!target_) return 1;
+  const std::uint32_t n = target_->samples();
+  return n == 0 ? 1u : n;
+}
+
+VkSampleCountFlagBits UiOverlayPass::to_vk_samples(std::uint32_t n) {
+  switch (n) {
+    case 1:
+      return VK_SAMPLE_COUNT_1_BIT;
+    case 2:
+      return VK_SAMPLE_COUNT_2_BIT;
+    case 4:
+      return VK_SAMPLE_COUNT_4_BIT;
+    case 8:
+      return VK_SAMPLE_COUNT_8_BIT;
+    case 16:
+      return VK_SAMPLE_COUNT_16_BIT;
+    default:
+      return static_cast<VkSampleCountFlagBits>(0);
+  }
+}
+
 Status UiOverlayPass::init() {
   if (!target_) return Status::Invalid("UiOverlayPass: target 为空");
   return ensure_pipeline();
@@ -135,22 +159,59 @@ Status UiOverlayPass::ensure_pipeline() {
   r = vkCreatePipelineLayout(ctx_.device, &plci, nullptr, &pipeline_layout_);
   if (r != VK_SUCCESS) return Status::InitFailed(fmt_err("vkCreatePipelineLayout", r));
 
-  // --- render pass:LoadOp::Load(閸欑姴濮為崷銊ユ簚閺咁垯绠ｆ稉?spec 鎼?.3)---
-  VkAttachmentDescription att{};
-  att.format = color_fmt;
-  att.samples = VK_SAMPLE_COUNT_1_BIT;
-  att.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-  att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-  att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-  att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-  att.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-  att.finalLayout = VK_IMAGE_LAYOUT_GENERAL;  // 必须与 readback_rgba8 的 oldLayout 假定一致
+  // --- render pass:LoadOp::Load(旁路, spec §5.2 Pass 2)---
+  //
+  // 2026-11-11(t6 / R1):这里过去把 `att.samples` 与下面的
+  // `ms.rasterizationSamples` **双双写死 1**。于是"UI 层没有 MSAA 入口"——
+  // 用户唯一能看到的界面路径上,MSAA 永远关着(哪怕目标本来就有 4 采样)。
+  //
+  // 现在两者都从**目标的真实形状**派生(target->samples()),并在形状对不上时
+  // 显式报错而不是悄悄按 1 采样把图画出来(能力纪律:不支持 → Unsupported)。
+  //
+  // MSAA 语义:target 的 color_ 是多重采样渲染图,resolve_ 才是单采样可读回图。
+  //   - 附件[0] = color_(samples = N)
+  //   - pResolveAttachments[0] = resolve_(samples = 1)
+  //   - 附件[0].finalLayout = COLOR_ATTACHMENT_OPTIMAL:resolve 写完之后由
+  //     调用方的屏障把它转到 TRANSFER_SRC / GENERAL(readback_rgba8 自己那道)。
+  const std::uint32_t nsamp = target_samples();
+  const VkSampleCountFlagBits vsamp = to_vk_samples(nsamp);
+  if (vsamp == 0) {
+    return Status::Unsupported("UiOverlayPass: 目标采样数 " + std::to_string(nsamp) +
+                               " 不是合法的 MSAA 等级");
+  }
+  const bool msaa = nsamp > 1;
+
+  VkAttachmentDescription atts[2] = {};
+  atts[0].format = color_fmt;
+  atts[0].samples = vsamp;
+  atts[0].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+  atts[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  atts[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+  atts[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+  atts[0].initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  // 非 MSAA:颜色附件本身就是可读回的那张 → 末态必须与 readback_rgba8 的
+  //   oldLayout 假定一致(GENERAL)。
+  // MSAA:附件[0] 是 MS 图**不可**读回,真正读出的是 resolve 附件;
+  //   因此附件[0] 停在 COLOR_ATTACHMENT_OPTIMAL(留给自己那道屏障),
+  //   resolve 附件 [1] 末态 GENERAL —— 这正是 readback 期望的布局。
+  atts[0].finalLayout = msaa ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
+
+  atts[1].format = color_fmt;
+  atts[1].samples = VK_SAMPLE_COUNT_1_BIT;  // resolve 目标永远是单采样
+  atts[1].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;  // resolve 会整体覆写
+  atts[1].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  atts[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+  atts[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+  atts[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  atts[1].finalLayout = VK_IMAGE_LAYOUT_GENERAL;
 
   VkAttachmentReference ref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+  VkAttachmentReference resolve_ref{1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
   VkSubpassDescription sub{};
   sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
   sub.colorAttachmentCount = 1;
   sub.pColorAttachments = &ref;
+  sub.pResolveAttachments = msaa ? &resolve_ref : nullptr;
 
   VkSubpassDependency dep{};
   dep.srcSubpass = VK_SUBPASS_EXTERNAL;
@@ -162,14 +223,17 @@ Status UiOverlayPass::ensure_pipeline() {
 
   VkRenderPassCreateInfo rpci{};
   rpci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-  rpci.attachmentCount = 1;
-  rpci.pAttachments = &att;
+  rpci.attachmentCount = msaa ? 2u : 1u;
+  rpci.pAttachments = atts;
   rpci.subpassCount = 1;
   rpci.pSubpasses = &sub;
   rpci.dependencyCount = 1;
   rpci.pDependencies = &dep;
   r = vkCreateRenderPass(ctx_.device, &rpci, nullptr, &render_pass_);
-  if (r != VK_SUCCESS) return Status::InitFailed(fmt_err("vkCreateRenderPass(ui)", r));
+  if (r != VK_SUCCESS) {
+    return Status::InitFailed(fmt_err(
+        ("vkCreateRenderPass(ui, samples=" + std::to_string(nsamp) + ")").c_str(), r));
+  }
 
   // --- 管线:实例化四边形 = 4 个程序化顶点 x N 实例(无 GS)---
   VkShaderModule vs = make_module(ctx_.device, shaders::kUi_overlayVert,
@@ -212,7 +276,9 @@ Status UiOverlayPass::ensure_pipeline() {
   rs.lineWidth = 1.f;
   VkPipelineMultisampleStateCreateInfo ms{};
   ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-  ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+  // 必须与 render pass 附件[0] 的 samples 逐位相等,否则 vkCreateGraphicsPipelines
+  // 直接报 VUID-VkGraphicsPipelineCreateInfo-renderPass-06045。
+  ms.rasterizationSamples = vsamp;
   // 旁路(spec §5.2 Pass 2):UI 图元在场景之后合成进同一 image
   VkPipelineDepthStencilStateCreateInfo ds{};
   ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
@@ -415,6 +481,8 @@ Status UiOverlayPass::render_offscreen() {
 
   // 2) 实例数据 memcpy 进持久映射缓冲,再一次性交给 GPU
   const Extent2D ext = target_->extent();
+  const std::uint32_t nsamp = target_samples();
+  const bool msaa = nsamp > 1;
   VkImageViewCreateInfo vci{};
   vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
   vci.image = target_->color_image();
@@ -425,11 +493,30 @@ Status UiOverlayPass::render_offscreen() {
   r = vkCreateImageView(ctx_.device, &vci, nullptr, &view);
   if (r != VK_SUCCESS) return Status::InitFailed(fmt_err("vkCreateImageView(ui)", r));
 
+  // MSAA:附件数与 render pass 必须逐一对上 —— [0]=MS 颜色, [1]=单采样 resolve。
+  // 少了第二项 → VUID-VkFramebufferCreateInfo-attachmentCount-00816。
+  VkImageView att_views[2] = {view, VK_NULL_HANDLE};
+  if (msaa) {
+    const VkImage rimg = target_->resolve_image();
+    if (rimg == VK_NULL_HANDLE) {
+      vkDestroyImageView(ctx_.device, view, nullptr);
+      return Status::InitFailed("UiOverlayPass: 目标采样数 " + std::to_string(nsamp) +
+                                " 但没有 resolve 图像(MSAA 通路必须双图)");
+    }
+    VkImageViewCreateInfo rvci = vci;
+    rvci.image = rimg;
+    r = vkCreateImageView(ctx_.device, &rvci, nullptr, &att_views[1]);
+    if (r != VK_SUCCESS) {
+      vkDestroyImageView(ctx_.device, view, nullptr);
+      return Status::InitFailed(fmt_err("vkCreateImageView(ui resolve)", r));
+    }
+  }
+
   VkFramebufferCreateInfo fci{};
   fci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
   fci.renderPass = render_pass_;
-  fci.attachmentCount = 1;
-  fci.pAttachments = &view;
+  fci.attachmentCount = msaa ? 2u : 1u;
+  fci.pAttachments = att_views;
   fci.width = ext.width;
   fci.height = ext.height;
   fci.layers = 1;
@@ -437,8 +524,10 @@ Status UiOverlayPass::render_offscreen() {
   r = vkCreateFramebuffer(ctx_.device, &fci, nullptr, &fb);
   if (r != VK_SUCCESS) {
     vkDestroyImageView(ctx_.device, view, nullptr);
+    if (att_views[1] != VK_NULL_HANDLE) vkDestroyImageView(ctx_.device, att_views[1], nullptr);
     return Status::InitFailed(fmt_err("vkCreateFramebuffer(ui)", r));
   }
+
 
   // 3) 场景 pass 之后开 UI pass(LoadOp::Load),不清屏
   VkCommandBufferAllocateInfo cai{};
@@ -453,20 +542,27 @@ Status UiOverlayPass::render_offscreen() {
   bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
   vkBeginCommandBuffer(cmd, &bi);
 
-  // 收尾:转到 COLOR_ATTACHMENT_OPTIMAL(读回前必须转 TRANSFER_SRC)
-  VkImageMemoryBarrier to_att{};
-  to_att.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-  to_att.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-  to_att.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-  to_att.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-  to_att.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-  to_att.image = target_->color_image();
-  to_att.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-  to_att.srcAccessMask = 0;
-  to_att.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+  // 清屏走**通用布局**:vkCmdClearColorImage 只接受 GENERAL 或
+  // TRANSFER_DST_OPTIMAL(vkCmdClearColorImage-imageLayout 的 VUID),
+  // 过去这里传 COLOR_ATTACHMENT_OPTIMAL 是明确的校验层错误(R8)。
+  //   UNDEFINED → GENERAL(清屏) → COLOR_ATTACHMENT_OPTIMAL(进 pass)
+  // 因此下面拆成两道屏障。
+  VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+  // (a) 清屏前:UNDEFINED → GENERAL。MSAA 时清的是 MS 颜色图(附件[0]);
+  //     非 MSAA 时 color_ 本身就是那张图,行为与历史一致。
+  VkImageMemoryBarrier to_gen{};
+  to_gen.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+  to_gen.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  to_gen.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+  to_gen.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  to_gen.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  to_gen.image = target_->color_image();
+  to_gen.subresourceRange = range;
+  to_gen.srcAccessMask = 0;
+  to_gen.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
   vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                       VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1,
-                       &to_att);
+                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_gen);
 
   // 场景 pass 的替身:清成背景色(spec §5.2 Pass 1 的桩;真场景由 L2 提供)
   // LOAD 的 render pass 无法清屏,因此单独来一次 clear(离屏路径才有这一步)
@@ -475,9 +571,34 @@ Status UiOverlayPass::render_offscreen() {
   clear_color.float32[1] = 18.f / 255.f;
   clear_color.float32[2] = 22.f / 255.f;
   clear_color.float32[3] = 1.f;
-  VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-  vkCmdClearColorImage(cmd, target_->color_image(), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                       &clear_color, 1, &range);
+  vkCmdClearColorImage(cmd, target_->color_image(), VK_IMAGE_LAYOUT_GENERAL, &clear_color, 1,
+                       &range);
+
+  // (b) 清屏后:GENERAL → COLOR_ATTACHMENT_OPTIMAL(读回前还会转 TRANSFER_SRC)
+  VkImageMemoryBarrier to_att{};
+  to_att.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+  to_att.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+  to_att.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  to_att.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  to_att.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  to_att.image = target_->color_image();
+  to_att.subresourceRange = range;
+  to_att.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  to_att.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
+  vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                       VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                       &to_att);
+
+  // (c) MSAA 的 resolve 图:UNDEFINED → COLOR_ATTACHMENT_OPTIMAL(pass 会整体覆写它)
+  if (msaa) {
+    VkImageMemoryBarrier resolve_att = to_att;
+    resolve_att.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    resolve_att.srcAccessMask = 0;
+    resolve_att.image = target_->resolve_image();
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr,
+                         1, &resolve_att);
+  }
 
   VkRenderPassBeginInfo rbi{};
   rbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
@@ -506,6 +627,7 @@ Status UiOverlayPass::render_offscreen() {
   vkFreeCommandBuffers(ctx_.device, ctx_.cmd_pool, 1, &cmd);
   vkDestroyFramebuffer(ctx_.device, fb, nullptr);
   vkDestroyImageView(ctx_.device, view, nullptr);
+  if (att_views[1] != VK_NULL_HANDLE) vkDestroyImageView(ctx_.device, att_views[1], nullptr);
   if (r != VK_SUCCESS) return Status::InitFailed(fmt_err("UI pass 绘制失败", r));
   return Status::Ok_();
 }

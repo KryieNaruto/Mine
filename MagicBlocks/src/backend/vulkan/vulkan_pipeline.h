@@ -51,14 +51,22 @@ using resources::ShaderStage;
 using resources::u32;
 using resources::u64;
 
-// 管线兼容的附件形状(可选)。不给时按 {RGBA8, 1 采样, 无深度} 建 pass:
-// 那是 L0 离屏目标的形状,L1 的命令列表也用它(裁定 2:渲染附件仍走 IRenderTarget)。
-struct AttachmentShape {
-  device::Format color_format = device::Format::RGBA8_UNORM;
-  bool has_depth = false;
-  device::Format depth_format = device::Format::D16_UNORM;
-  u32 samples = 1;
-};
+// 管线兼容的附件形状(必需,不再有"默认值")。
+//
+// 历史(2026-11-11 修):这里曾经是 `has_depth = false` 的默认值,而
+// `create_pipeline(desc)` 走的正是这个默认构造 → **管线自带 pass 永远没有深度附件**。
+// 后果(t2 报告 §3.3.1):
+//   1) 任何带深度的目标都与管线 pass 不兼容 → 每帧都退回 create_pass(),
+//      `PipelineDesc.samples` 对 render pass 完全无效;
+//   2) L1 的 `clear_depth` 标志被静默丢弃;
+//   3) 交换链一旦走到复用分支,`finalLayout` 又不是 PRESENT_SRC_KHR → present 全坏。
+// 现在形状**必须由调用方按目标真实形状派生**,并在 init() 里做一致性校验;
+// 不再有任何"猜一个默认值"的路径。
+// 2026-11-11 (t13/g8): the shape value now lives in the public L1 header
+// (resources::AttachmentShape) so that L3 can derive shaped pipelines without
+// including any backend header. This alias keeps every existing backend call site
+// source-compatible; the two definitions are **identical field for field**.
+using AttachmentShape = resources::AttachmentShape;
 
 // 图形管线的哈希/生命周期缓存由调用方(设备层)负责;本类只负责"一个 desc → 一个管线"。
 class VulkanPipeline final : public IPipeline {
@@ -112,7 +120,13 @@ class VulkanPipeline final : public IPipeline {
   // slot 必须 < sampled_texture_slots(越界 → InvalidArgument)。
   // 注意:VkDescriptorSet 的写入**不要求**命令缓冲处于录制态,但本后端统一由
   // VulkanCommandList 在提交前调用,保证"一帧内最后一次绑定生效"。
-  device::Status write_sampled_texture(u32 slot, VkImageView view, VkSampler sampler);
+  //
+  // cube_compatible(V1 立方体贴图):view 是 VIEW_TYPE_CUBE 时,描述符里的采样器
+  // 必须带 VK_SAMPLER_CREATE_FLAG_CUBE_COMPATIBLE_BIT,否则是校验层 ERROR、
+  // 采样行为未定义。采样器对象由调用方提供(见 backend::cube_sampler_for),
+  // 这里只做"带了该位"的事后校验 —— 不静默替换成一个调用方没要的对象。
+  device::Status write_sampled_texture(u32 slot, VkImageView view, VkSampler sampler,
+                                       bool cube_compatible = false);
 
   // 校验 PipelineDesc。单测可直接调以拿到具体错误码与 message:
   //   stages 空 → InvalidArgument;图形管线缺 Vertex/Fragment → InvalidArgument;

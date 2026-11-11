@@ -267,6 +267,8 @@ const char* stack_code_name(StackCode code) {
     case StackCode::TemplateOutOfGrid: return "TemplateOutOfGrid";
     case StackCode::EmptyStroke: return "EmptyStroke";
     case StackCode::ColorOutOfRange: return "ColorOutOfRange";
+    case StackCode::InvalidTransition: return "InvalidTransition";
+    case StackCode::PendingStroke: return "PendingStroke";
   }
   return "?";
 }

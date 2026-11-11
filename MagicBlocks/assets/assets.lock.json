@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "note": "MagicBlocks 资源清单: 只记录路径/字节数/sha256, 二进制不入 git. 用 tools/fetch-assets.ps1 从 RayTracing res 复制并校验.",
+  "source_root": "E:\\workspace\\myspace\\RayTracing\\_install\\bin\\res",
+  "files": [
+    {
+      "path": "models/bunny.obj",
+      "bytes": 417256,
+      "sha256": "4e2d1e8a696f33e9d9a8a0cefd45e3036bf9402bb7cf2ebe526a2fb8d4909e81"
+    },
+    {
+      "path": "models/cube.obj",
+      "bytes": 717,
+      "sha256": "ad96b0febf923186f40be532f0a9c11fdd5b4221194deaabdd2f2b2fb340f8bf"
+    },
+    {
+      "path": "models/panel.obj",
+      "bytes": 350,
+      "sha256": "901b6cfa9ec31d0f622c4edc3534c3b9b33b323ce05fbb53f384e7c438223e67"
+    },
+    {
+      "path": "models/sphere.obj",
+      "bytes": 170493,
+      "sha256": "e718600231973fa30cddfd5348abb6d874a39562ee3b88a553c9b2c3e46cfacf"
+    },
+    {
+      "path": "models/teapot.obj",
+      "bytes": 463325,
+      "sha256": "3408e026bbb23740d9c973510144a1194103b9e8f11ea90e14213b796046a2dd"
+    }
+  ]
+}
