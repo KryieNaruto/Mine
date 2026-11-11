@@ -269,11 +269,45 @@ FrameLayout
 
 ```
 rot=90/270 时先交换 dx/dy,然后
-  yaw   += vx * ROT_PER_PX   // 左右滑 → 绕世界 Y 轴(左右转)
-  pitch += vy * ROT_PER_PX   // 上下滑 → 绕世界 X 轴(上下翻),夹在 ±1.4835 rad
+  q ← normalize( q * Δpitch(局部 X) * Δyaw(局部 Y) )
 ```
 
-C++ 侧(`scene_renderer.cpp`)**恒**按 `yaw→Y、pitch→X` 组装旋转矩阵,不随
-`rot90` 交换 —— 上一次的 bug 正是两边都各交换了一次,叠成两次错误。
-`rot90` 在 C++ 里只保留给宽高比补偿(那是像素密度问题,与轴向无关)。
+姿态是**单位四元数** `(qx,qy,qz,qw)`,Kotlin → JNI → C++ 全链路只传四元数,
+不分解欧拉角、不做 pitch 夹紧、没有万向锁。两个增量都是**右乘**(局部轴),
+所以旋转轴永远是摄像机自己的轴:左右拖 = 绕相机 up 转,
+上下拖 = 绕相机 right 转,与相机已经转了多少度无关。
 
+C++ 侧(`scene_renderer.cpp`)从四元数取三根轴:`col0=right、col1=up、col2=back`,
+`eye = center - dist * back`,`view = make_look_at(eye, center, up)`;物体世界矩阵恒为
+**单位阵**,转的永远只有相机。`rot90` 在 C++ 里只保留给宽高比补偿
+(那是像素密度问题,与轴向无关)。
+
+### 10.5 渲染线程与 UI 线程(重要)
+
+`session.render()` **不在主线程上跑**。早期它挂在 `Choreographer` 上,等于在 UI 线程里
+调 Vulkan 提交;而 SDK 的 `render_frame()` 内部有同步等待(acquire fence、
+`vkWaitForFences`、模型上传…)。SDK 一慢,**整条链就拖死主线程**,
+输入/动画/Compose 重绘全停 —— 表现成"整个 App 奇卡"。
+
+注意这不是合成层的问题:`SurfaceView` 的 buffer 一直由 SurfaceFlinger 独立
+合成,和 Compose 本来就没共享;共享的是**调用的线程**。
+
+现在的分工:
+
+| 线程 | 职责 |
+|---|---|
+| `mb-render`(专用线程) | 只做 `session.render(qx,qy,qz,qw,scale,panX,panY)` |
+| 主线程 | 手势 → 纯数学改四元数/缩放/平移;Compose 重绘 |
+
+两者只通过一个 `@Volatile` 的 7-float 姿态快照(`pendingPose`)通信,没有任何等待。
+主线程侧统一调 `requestRender()`(非阻塞),不再有同步出帧的点。
+
+两条硬约束:
+
+1. `stopRenderLoop()` 必须 `join` 到渲染线程真正退出,**再** `detachSurface()`,
+   否则渲染线程会对着已销毁的 swapchain 取图(use-after-free)。
+2. 渲染线程空闲时按 `FRAME_BUDGET_MS = 8` 节拍休眠,不是忙等 —— 两个
+   线程共享 CPU/带宽,渲染线程狂转同样会把 UI 挤卡。
+
+效果:SDK 重构期间再慢,也只有画面掉帧(SurfaceView 那层的
+`queueBuffer fps` 下降),UI 不再跟着卡。
