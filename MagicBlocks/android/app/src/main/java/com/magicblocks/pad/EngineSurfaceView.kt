@@ -9,6 +9,8 @@ import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import kotlin.math.abs
+import kotlin.math.PI
+import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.exp
 import kotlin.math.hypot
@@ -29,7 +31,7 @@ import kotlin.math.tan
  *     而且 SurfaceView 的 buffer 由 SurfaceFlinger 直接合成 —— 引擎写进去的
  *     像素**不经过** CPU，也不经过 Compose 重绘。
  *
- * 交互（方向按用户看到的物理屏幕算，见 [applyRotationDelta]）：
+ * 交互（方向按用户看到的物理屏幕算，见 [toVisualDelta] / [accumulateFingerSample]）：
  *   单指左右拖 → 绕**相机自身 Y 轴**转（画面左右转）
  *   单指上下拖 → 绕**相机自身 X 轴**转（画面上下转）
  *   松手      → 惯性：按松手瞬间的角速度继续转，速度指数衰减到 0
@@ -139,46 +141,58 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
     private var msaaSamples = DEFAULT_MSAA_SAMPLES
     private var msaaEffective = 1
 
-    // ================================================================ 惯性
+    // ================================================================ 运动状态
     //
-    // 设计要点：
-    //  1. 用 Choreographer 跟随屏幕刷新率逐帧推进（不是固定 sleep），
-    //     这样 60/90/120Hz 设备手感一致。
-    //  2. 速度来自**松手前最后一段位移 / 时间**，所以"滑得快就转得快"。
-    //  3. 速度按指数衰减 v *= exp(-k*dt)，k 越大停得越快。指数衰减的好处是
-    //     数学上永远不会真正到 0，所以再配一个"速度阈值"来收尾，避免无限重绘。
-    //  4. 用 frameTimeNanos 做真实 dt，掉帧时不会突然转一大截。
+    // 拖动与惯性是**同一套**状态，区别只在于"角速度从哪来"：
+    //   * 拖动：手指位移 → 目标角速度（按屏幕像素/秒算速度，见 accumulateFingerSample）
+    //   * 松手：角速度原封不动地留着，由指数衰减把它带到 0
+    //   * 两者的位移量都通过 stepMotion(dt) 走同一条"速度 → 四元数"的路径
+    //
+    // 为什么**不能**把位移直接乘上 ROT_PER_PX 就完事：那样"同样拖 100 像素"
+    // 无论拖多快都转同样的角度，手感是死的 —— 快甩和慢拖没有区别，就是
+    // "没有加速度机制、转起来不丝滑"。现在改为：
+    //       手指速度(px/s) → 目标角速度(rad/s) → 一阶低通 → 积分成角度
+    // 低通那一步就是"惯性感"的来源：角速度追不上手指速度的变化，
+    // 快甩时先被拉高的一点会继续往前推，视觉上就是"越甩越顺"。
+    //
+    // 注意这些字段里**没有一个"绕世界轴的角度"**：姿态只有一个四元数，
+    // 面内旋转只有一个标量。没有任何"角度 → 轴"的换算，所以旋转轴不可能变。
 
     private val choreographer = Choreographer.getInstance()
-    private var flingRunning = false
+    private var motionRunning = false
     private var lastFrameNanos = 0L
 
-    // 角速度（弧度/秒）
-    private var yawVel = 0f
-    private var pitchVel = 0f
+    // 机体系角速度（rad/s）。轴恒为**相机自己**的 right / up / 视线(滚转)。
+    private var yawVel = 0f     // 绕相机 Y（up）—— 左右拖
+    private var pitchVel = 0f   // 绕相机 X（right）—— 上下拖
+    private var rollVel = 0f    // 绕相机 Z（back）—— 双指旋转
     // 平移速度（世界单位/秒）
     private var panXVel = 0f
     private var panYVel = 0f
 
-    // 松手前的采样，用来算速度
-    private var trackStartTime = 0L
+    // 驱动"目标速度"的因子：拖动时 =1，惯性时 =0（目标速度归零 → 只剩衰减）
+    private var driveRotation = 0f
+    private var drivePan = 0f
+
+    // ================================================================ 手指速度
+    //
+    // 只记**手指**的速度（px/s → 归一化后的 rad/s），不记角度：
+    // 四元数姿态没有"两条轴的角度"可以相减。
     private var tracking = false
-    // 滑动窗口锚点（见 updateWindow / startFlingFromTrack）
-    private var winStartMs = 0L
-    private var winYaw0 = 0f
-    private var winPitch0 = 0f
-    private var winPanX0 = 0f
-    private var winPanY0 = 0f
+    private var fingerYawTarget = 0f
+    private var fingerPitchTarget = 0f
+    private var fingerRollTarget = 0f
+    private var fingerPanXTarget = 0f
+    private var fingerPanYTarget = 0f
 
-    private val flingFrame = Choreographer.FrameCallback { frameTimeNanos -> stepFling(frameTimeNanos) }
+    // 上一次 MOVE 的时间，用来算帧间速度
+    private var lastMoveTime = 0L
+    private var hasLastMove = false
 
-    init {
-        holder.addCallback(this)
-        // 让引擎的 swapchain image 直接浮在窗口最上层时不会被 Compose 遮住
-        holder.setFormat(android.graphics.PixelFormat.OPAQUE)
-        setZOrderOnTop(false)   // 保持在下面，Compose 浮在上面
-        isFocusable = true
-    }
+    // 双指上一次的连线夹角（NaN = 还没有基准，第一帧不产生滚转）
+    private var lastTwistAngle = Float.NaN
+
+    private val motionFrame = Choreographer.FrameCallback { frameTimeNanos -> stepMotion(frameTimeNanos) }
 
     fun ensureEngine() {
         session.create()
@@ -206,7 +220,7 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
         Log.i(MbRenderer.TAG, "surfaceDestroyed")
-        stopFling()
+        stopMotion()
         stopRenderLoop()
         session.detachSurface()
     }
@@ -227,7 +241,7 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         startRenderLoop()
     }
 
-    private fun renderOnce() {
+    private fun renderOnce(): Long {
         // 只在**渲染线程**上调用（见 renderLoopBody）。
         // 计时包住 session.render()：这段时间 = 录制 + 提交 + 等 GPU 完成 + present，
         // 也就是"这一帧让渲染线程占用了多久"。它不等于 GPU 执行时间（那是另一回事），
@@ -280,6 +294,7 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
             // 不刷屏：只在失败时打一次日志（render 内部会把具体原因回调过来）
             Log.w(MbRenderer.TAG, "渲染失败: ${session.status()}")
         }
+        return costNs / 1_000_000L
     }
 
     // ================================================================ 触摸
@@ -297,6 +312,21 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
     //   * onTouchEvent 里保留一份 DOWN 处理，作为"父容器自己把事件转回本 View"
     //     时的兜底，两条路径都幂等（stopFling / 重设锚点不会产生副作用）。
 
+    // ================================================================ 触摸
+    //
+    // 只重写 onTouchEvent 会有**死区**：手指刚按下时，Android 的触摸分发会先把
+    // ACTION_DOWN 发给这条链上的父容器（FrameLayout → 各种系统容器），只有当
+    // 位移超过系统的 touch slop 后，`onTouchEvent` 才会开始收到 MOVE。结果是
+    // "按下 → 前 8~24dp 完全没反应"，也就是用户说的"左右拖动还有阈值"。
+    //
+    // 真正能做到**零延迟**的只有 dispatchTouchEvent：它在 View 自己的
+    // dispatch 入口，先于任何 slop 判定，ACTION_DOWN 一进来就能拿到。
+    // 所以：
+    //   * ACTION_DOWN 在 dispatchTouchEvent 里**直接**处理（锚定 + 抢占）；
+    //   * 之后的 MOVE / UP 再到 onTouchEvent 里正常走；
+    //   * onTouchEvent 里保留一份 DOWN 处理，作为"父容器自己把事件转回本 View"
+    //     时的兜底，两条路径都幂等（stopMotion / 重设锚点不会产生副作用）。
+
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
         if (ev.actionMasked == MotionEvent.ACTION_DOWN) {
             beginGesture(ev)
@@ -310,13 +340,15 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
 
     /** 按下：掐断惯性、把锚点摆到手指位置。可重复调用。 */
     private fun beginGesture(event: MotionEvent) {
-        stopFling()                       // 手指一落下就掐断惯性（"抓住"画面）
+        stopMotion()                      // 手指一落下就掐断惯性（"抓住"画面）
         lastX = event.x
         lastY = event.y
         lastPinchDist = 0f
         lastFocusX = event.x
         lastFocusY = event.y
-        beginTrack(event)
+        lastTwistAngle = Float.NaN
+        clearFingerVelocity()
+        tracking = true
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
@@ -334,7 +366,9 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
                     lastFocusX = focusX(event)
                     lastFocusY = focusY(event)
                     // 双指模式下重新取样，避免把单指阶段的速度带进来
-                    beginTrack(event)
+                    lastTwistAngle = Float.NaN
+                    clearFingerVelocity()
+                    tracking = true
                 }
             }
 
@@ -350,7 +384,9 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
                     lastFocusX = lastX
                     lastFocusY = lastY
                 }
-                beginTrack(event)
+                lastTwistAngle = Float.NaN
+                clearFingerVelocity()
+                tracking = true
             }
 
             MotionEvent.ACTION_MOVE -> {
@@ -359,7 +395,8 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
                 } else {
                     handleOneFinger(event)
                 }
-                updateWindow(event)
+                // 手指一动，推进器就得跑着 —— 真正的角度积分在 stepMotion 里按帧做。
+                startMotion()
                 // 主线程只更新快照，真正出帧在渲染线程（见 renderLoopBody）。
                 // 这里**绝不能**再同步调 session.render() —— 那等于把手势处理和
                 // SDK 的等待绑在同一个线程上，SDK 一慢，整个 UI 跟着卡。
@@ -368,11 +405,14 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
 
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 lastPinchDist = 0f
-                // 松手：按最近这段的瞬时速度启动惯性
                 if (event.actionMasked == MotionEvent.ACTION_UP) {
-                    startFlingFromTrack(event)
+                    // 松手：手指速度原封不动地变成惯性初速度（见 releaseToFling）
+                    releaseToFling()
+                } else {
+                    // CANCEL 不是真正松手，不该带惯性
+                    tracking = false
+                    stopMotion()
                 }
-                tracking = false
             }
         }
         return true
@@ -382,8 +422,8 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
      * 单指：拖动 = **环绕摄像机检视模型**（不是转物体本身）。
      *
      * 映射约定（**屏幕**方向 → **视觉**方向，与 MainActivity 的横屏锁定配套）：
-     *   屏幕左右滑 → 相机绕世界 Y 轴绕行（yaw）
-     *   屏幕上下滑 → 相机绕世界 X 轴俯仰（pitch）
+     *   屏幕左右滑 → 视线左右摆（绕相机自身 up 轴）
+     *   屏幕上下滑 → 视线上下摆（绕相机自身 right 轴）
      *
      * 为什么方向按"物理屏幕"算而不是直接拿 MotionEvent 的 x/y：
      * 这台 pad 是横屏应用但面板物理竖置（SurfaceFlinger 会做 ROTATE_90）。
@@ -392,85 +432,67 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
      * 事件里给出的却是一截 dY。不做换算，就会出现"左右拖像上下转"。
      * 换算表由 [displayRotation] 给出（Activity 用 [setRotationListener] 同步）。
      *
-     * 这里**没有**任何阈值/死区：按下即锚定，之后每一像素位移都立刻换算成角度。
-     * （曾经靠 ACTION_MOVE 是否到达来"意外"产生一段死区，已在 distributeEvent
-     *  里修掉，见那里的说明。）
+     * 这里**没有**任何阈值/死区：按下即锚定，之后每一像素位移都参与速度计算。
+     *
+     * 注意本函数**不直接改姿态**：它只把位移换算成"手指速度"，真正转多少由
+     * [stepMotion] 按真实帧间隔积分。这样拖动和惯性走同一条路径，掉帧时也不会
+     * 因为一次 MOVE 跳变而"闪一下"。
      */
     private fun handleOneFinger(event: MotionEvent) {
-        val dx = event.x - lastX
-        val dy = event.y - lastY
-        applyRotationDelta(dx, dy)
+        val (vx, vy) = toVisualDelta(event.x - lastX, event.y - lastY)
         lastX = event.x
         lastY = event.y
         // 单指阶段不产生平移，但焦点要跟着走，否则从双指切回来时会跳
         lastFocusX = event.x
         lastFocusY = event.y
+        accumulateFingerSample(vx, vy, event.eventTime,
+                               panDxPx = 0f, panDyPx = 0f, rollRad = 0f)
     }
 
     /**
-     * 把一截**逻辑坐标**下的位移换算成"绕相机自身轴"的转角。
+     * 把一截**逻辑坐标**下的位移换算成视觉（物理屏）位移。
      *
      * displayRotation 是 Display.getRotation()：
      *   0/180（逻辑横屏，与物理排布一致）→ 直接用
      *   90/270（图片被转了 90°，事件仍按逻辑横屏上报）→ 交换 x/y
-     *
-     * 符号：两个方向都写成"元素往哪边推，画面就往哪边动"（跟手）。
-     *   vx > 0（往右推）→ 绕相机 +Y 转 -vx*c：物体跟着手指往右转
-     *   vy > 0（往下推）→ 绕相机 +X 转 +vy*c：物体跟着手指往下走，顶面露出来
-     * 转的是摄像机（见 scene_renderer.cpp record_into），物体在世界里不动。
      */
-    private fun applyRotationDelta(dx: Float, dy: Float) {
+    private fun toVisualDelta(dx: Float, dy: Float): Pair<Float, Float> {
         val swapped = displayRotation == Surface.ROTATION_90 || displayRotation == Surface.ROTATION_270
-        val vx = if (swapped) dy else dx   // 视觉水平位移（物理屏）
-        val vy = if (swapped) dx else dy   // 视觉垂直位移（物理屏）
-        // 位移 → **绕相机自身轴**的转角，全程没有阈值也没有夹取
-        rotateLocal(yawDelta = -vx * ROT_PER_PX, pitchDelta = vy * ROT_PER_PX)
+        return if (swapped) Pair(dy, dx) else Pair(dx, dy)
     }
 
     /**
-     * 绕**相机自身轴**转一小步。这是"旋转轴永远不变"的关键。
+     * 绕**相机自身的一根轴**转一小步。这是"旋转轴永远不变"的全部数学。
      *
-     * 数学（q 是相机系→世界系的单位四元数，四元数乘法左乘=绕世界轴、右乘=绕机体轴）：
-     *     Δq_pitch = (sin(b/2), 0, 0, cos(b/2))   局部 X
-     *     Δq_yaw   = (0, sin(a/2), 0, cos(a/2))   局部 Y
-     *     q ← q * Δq_pitch * Δq_yaw
-     * 先应用 yaw 再应用 pitch：右乘 Δpitch 之后 Δyaw 就发生在**已经转过 pitch 的**
-     * 坐标系里，所以横向永远是"绕当前画面的竖直轴"，不会因为俯仰过大而变成
-     * 绕世界 Y（那就是老实现的症状）。
+     * q 是"相机系 → 世界系"的单位四元数。四元数乘法里**右乘** = 绕机体轴、
+     * 左乘 = 绕世界轴。所以只要永远右乘单轴小旋转，轴就不可能跑到世界系去：
      *
-     * 为什么用乘积而不是"先算两个角再合成"：一次拖动只累积一次乘法，
-     * 反复相乘也不会出现欧拉角的万向节问题；四元数本来就能表示 360° 内任意朝向，
-     * 无需 pitch 夹取（模型的上下左右都能转到，看到底面也是合法视角）。
+     *     axis 0 (right, 局部 X): Δq = (sin(b/2), 0,         0,         cos(b/2))
+     *     axis 1 (up,    局部 Y): Δq = (0,         sin(b/2), 0,         cos(b/2))
+     *     axis 2 (back,  局部 Z): Δq = (0,         0,        sin(b/2),  cos(b/2))
+     *     q ← normalize(q * Δq)
+     *
+     * 关键：**一次只绕一根轴**。上一版把 pitch 和 yaw 两次右乘写死在同一个
+     * 函数里（q ← q*Δpitch*Δyaw），后一次乘法的轴会跟着前一次的结果走，
+     * 横竖方向一连动就互相"串轴" —— 那正是"旋转会影响旋转轴"。
+     * 现在每一帧各轴**分别**右乘，轴各转各的。
+     *
+     * 另外没有任何 pitch 夹取：四元数能表示 360° 内任意朝向（滚转由双指给），
+     * 上下翻到底看到底面也是合法视角。
      */
-    private fun rotateLocal(yawDelta: Float, pitchDelta: Float) {
-        var nx = 0f
-        var ny = 0f
-        var nz = 0f
-        var nw = 1f
-        // ---- 先 q * Δpitch ----
-        if (pitchDelta != 0f) {
-            val sh = sin(pitchDelta * 0.5f)
-            val ch = cos(pitchDelta * 0.5f)
-            // (qx,qy,qz,qw) * (sh,0,0,ch)
-            val ax = qw * sh + qx * ch
-            val ay = qy * ch + qz * sh
-            val az = qz * ch - qy * sh
-            val aw = qw * ch - qx * sh
-            nx = ax; ny = ay; nz = az; nw = aw
-        } else {
-            nx = qx; ny = qy; nz = qz; nw = qw
-        }
-        // ---- 再 (上式) * Δyaw ----
-        if (yawDelta != 0f) {
-            val sh = sin(yawDelta * 0.5f)
-            val ch = cos(yawDelta * 0.5f)
-            // (nx,ny,nz,nw) * (0,sh,0,ch)
-            val ax = nx * ch - nz * sh
-            val ay = ny * ch + nw * sh
-            val az = nz * ch + nx * sh
-            val aw = nw * ch - ny * sh
-            nx = ax; ny = ay; nz = az; nw = aw
-        }
+    private fun rotateAboutLocalAxis(axis: Int, angle: Float) {
+        if (angle == 0f) return
+        val sh = sin(angle * 0.5f)
+        val ch = cos(angle * 0.5f)
+        val ax = if (axis == 0) sh else 0f
+        val ay = if (axis == 1) sh else 0f
+        val az = if (axis == 2) sh else 0f
+        val aw = ch
+        // q * Δq。Δq 只有一根轴非零，展开后每步只有两项相加。
+        val nx = qw * ax + qx * aw + qy * az - qz * ay
+        val ny = qw * ay - qx * az + qy * aw + qz * ax
+        val nz = qw * az + qx * ay - qy * ax + qz * aw
+        val nw = qw * aw - qx * ax - qy * ay - qz * az
         // 归一化：几万次乘法后浮点会漂，不归一化相机会慢慢"缩水/变形"
         val len = sqrt(nx * nx + ny * ny + nz * nz + nw * nw)
         if (len < 1e-6f) return
@@ -480,7 +502,12 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         qw = nw / len
     }
 
-    /** 双指：距离变化 = 缩放，焦点移动 = 平移。 */
+    /**
+     * 双指：距离变化 = 缩放，焦点移动 = 平移，绕中点转动 = 面内旋转（滚转）。
+     *
+     * 滚转绕的是相机自身的 back（局部 Z）轴 —— 没有这条通路，"摄像机的三个轴"
+     * 就少了滚转这一维，画面只能上下左右摆、不能歪。
+     */
     private fun handleTwoFinger(event: MotionEvent) {
         // --- 缩放 ---
         val d = pinchDistance(event)
@@ -489,6 +516,20 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         }
         lastPinchDist = d
 
+        // --- 焦点（缩放/平移/滚转都要用，先取好） ---
+        val fx = focusX(event)
+        val fy = focusY(event)
+
+        // --- 面内旋转（绕视线轴） ---
+        // 两指连线的夹角变化就是滚转角。先折到 (-π, π] 再差分，
+        // 否则双指转过 ±180° 时会出现整圈跳变。
+        val span = normalizeAngle(
+            atan2(event.getY(0) - fy, event.getX(0) - fx) -
+                atan2(event.getY(1) - fy, event.getX(1) - fx)
+        )
+        val twistStep = if (lastTwistAngle.isNaN()) 0f else normalizeAngle(span - lastTwistAngle)
+        lastTwistAngle = span
+
         // --- 平移 ---
         //
         // 把屏幕像素位移换算成世界位移：屏幕上"整个高度"对应的世界跨度
@@ -496,17 +537,21 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         //     世界每像素 = 2*dist*tan(fov/2) / surfaceHeight
         // dist 随 scale 变化，于是放大后同样的手指位移走的世界距离更小 ——
         // 效果是"画面贴着手指走"，缩放级别不影响跟手程度。
-        val fx = focusX(event)
-        val fy = focusY(event)
         val dxPx = fx - lastFocusX
         val dyPx = fy - lastFocusY
         lastFocusX = fx
         lastFocusY = fy
 
-        val worldPerPx = worldUnitsPerPixel()
-        // 屏幕 y 向下，世界 y 向上 → 取反
-        panX -= dxPx * worldPerPx
-        panY += dyPx * worldPerPx
+        accumulateFingerSample(0f, 0f, event.eventTime,
+                               panDxPx = dxPx, panDyPx = dyPx, rollRad = twistStep)
+    }
+
+    /** 把角度折到 (-π, π]。 */
+    private fun normalizeAngle(a: Float): Float {
+        var v = a
+        while (v > PI) v -= TWO_PI_F
+        while (v <= -PI) v += TWO_PI_F
+        return v
     }
 
     /** 当前视角下，一个屏幕像素对应多少世界单位。 */
@@ -527,155 +572,210 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
 
     private fun focusY(e: MotionEvent): Float =
         if (e.pointerCount >= 2) (e.getY(0) + e.getY(1)) * 0.5f else e.y
+    // ================================================================ 手指速度
 
-    // ================================================================ 速度追踪
+    /**
+     * 手指每移动一次就调用一次（单指 / 双指都走这里）。
+     *
+     * 它**只算速度，不改姿态**。这是"加速度机制"的核心：
+     *   手指速度(px/s) ──> 目标角速度(rad/s) ──> 一阶低通 ──> (stepMotion 里积分)
+     *
+     * 为什么不直接 `q * Δq(位移 * 灵敏度)`：那样"同样拖 100px"不管拖多快都转
+     * 同样的角度，快甩和慢拖一模一样 —— 手感是死的。走速度以后：
+     *   * 拖得慢 → 目标速度小，低通很快跟上，画面稳稳地跟手；
+     *   * 拖得快 → 目标速度大，低通需要几帧才追上来，这一段"追赶"就是
+     *     用户能感觉到的加速度/惯性感；
+     *   * 松手 → 目标速度立刻归零，而实际速度只按 FLING_DAMPING 衰减，
+     *     于是自然滑出一段再停。
+     *
+     * 符号（全部按"视觉 = 物理屏"的方向，见 toVisualDelta）：
+     *   vx > 0（往右推）→ yaw 为负 → 绕相机 +Y(up) 转负角，物体跟着往右转
+     *   vy > 0（往下推）→ pitch 为正 → 绕相机 +X(right) 转正角，露出顶面
+     *   twist > 0（双指顺时针）→ roll 为负 → 绕相机 +Z(back) 转
+     *
+     * @param vxPx/vyPx 单指位移（视觉像素）
+     * @param panDxPx/panDyPx 双指焦点位移（逻辑像素）
+     * @param rollRad 双指转过的角度（弧度）
+     */
+    private fun accumulateFingerSample(
+        vxPx: Float,
+        vyPx: Float,
+        eventTimeMs: Long,
+        panDxPx: Float,
+        panDyPx: Float,
+        rollRad: Float,
+    ) {
+        val now = eventTimeMs
+        // 事件间隔可能为 0（同一毫秒内的两个 MOVE）：用 0 除会得到 inf，
+        // 直接跳过，等下一次有真实间隔的 MOVE 再算。
+        val dtMs = if (hasLastMove) (now - lastMoveTime).toFloat() else 0f
+        if (hasLastMove && dtMs > 0f && dtMs < MAX_SAMPLE_DT_MS) {
+            val dt = dtMs / 1000f
+            // 帧间噪声很大（一次 MOVE 只有 1~2 像素），先做一次归一化再低通
+            val yawT = -vxPx / dt * ROT_PER_PX
+            val pitchT = vyPx / dt * ROT_PER_PX
+            val rollT = rollRad / dt
+            val panXT = -panDxPx / dt * worldUnitsPerPixel()
+            val panYT = panDyPx / dt * worldUnitsPerPixel()
+            val k = 1f - exp(-FINGER_SMOOTHING * dt)   // 帧率无关的低通系数
 
-    private fun beginTrack(event: MotionEvent) {
-        trackStartTime = event.eventTime
-        tracking = true
-        // 重置滑动窗口：每次手势阶段切换（单指↔双指）都从当前位置重新锚定，
-        // 避免把上一阶段的速度算进这一阶段。
-        winStartMs = event.eventTime
-        // 四元数姿态没有"两条轴的角度"可以相减，所以窗口起点记成 0，
-        // 之后每次 rotateLocal 把这一段的转角**累加**到 winYaw0/winPitch0 上。
-        // 松手时 yawVel = winYaw0 / dt 就是这段的角速度。
-        winYaw0 = 0f
-        winPitch0 = 0f
-        winPanX0 = panX
-        winPanY0 = panY
+            fingerYawTarget += (yawT - fingerYawTarget) * k
+            fingerPitchTarget += (pitchT - fingerPitchTarget) * k
+            fingerRollTarget += (rollT - fingerRollTarget) * k
+            fingerPanXTarget += (panXT - fingerPanXTarget) * k
+            fingerPanYTarget += (panYT - fingerPanYTarget) * k
+        }
+        lastMoveTime = now
+        hasLastMove = true
     }
 
     /**
-     * 用**滑动窗口**估算松手瞬间的速度。
+     * 手指按下的那一刻：把"手指速度"清干净。
      *
-     * 为什么不直接用"按下 → 松手"的平均速度：用户可能按住不动 2 秒再快速
-     * 一甩，平均值会被前面的静止摊薄成接近 0，惯性就没了。
-     *
-     * 也不能只用最后一次 MOVE 的瞬时速度：手指抬起前常有几十毫秒没有事件
-     * （或最后一段位移是 0），那样算出来会突然变 0。
-     *
-     * 所以取最近 [FLING_WINDOW_MS] 内的角度/平移变化来算 —— 既反映"最后甩得多快"，
-     * 又不会被单帧抖动带偏。窗口尚未积累够时，退化成"从按下到现在的平均值"。
+     * 不清的话，上一笔留下的目标速度会让新手势一按下就自己转 ——
+     * 这是"按下即静止"的必要条件。
      */
-    private fun startFlingFromTrack(event: MotionEvent) {
-        if (!tracking) return
-        val now = event.eventTime
-        val spanMs = (now - trackStartTime).toFloat()
-        if (spanMs < MIN_TRACK_MS) return      // 太短，速度不可信
+    private fun clearFingerVelocity() {
+        fingerYawTarget = 0f
+        fingerPitchTarget = 0f
+        fingerRollTarget = 0f
+        fingerPanXTarget = 0f
+        fingerPanYTarget = 0f
+        hasLastMove = false
+        lastMoveTime = 0L
+        lastTwistAngle = Float.NaN
+    }
 
-        // 窗口内实际经过的时间：窗口够长用窗口，否则用全程
-        val windowMs = min(spanMs, FLING_WINDOW_MS)
-        val dt = windowMs / 1000f
-
-        yawVel = winYaw0 / dt
-        pitchVel = winPitch0 / dt
-        panXVel = (panX - winPanX0) / dt
-        panYVel = (panY - winPanY0) / dt
-
-        if (abs(yawVel) + abs(pitchVel) + abs(panXVel) + abs(panYVel) < MIN_FLING_SPEED) {
-            return  // 基本没动，不用惯性（省电，也避免极限值抖动）
+    /**
+     * 松手：把"手指速度"直接变成"惯性初速度"。
+     *
+     * 两件事一起做：
+     *   1. 速度**原封不动**地接过去（不是重新算一遍）—— 所以从"拖动"到
+     *      "松手后继续滑"中间没有任何速度断点，视觉上是一条连续的曲线。
+     *   2. driveRotation = 0：手指不再提供新速度，之后只剩衰减。
+     *
+     * 为什么要判"松手前是否有真实位移"：手指按住不动两秒再抬起，
+     * 低通后的目标速度已经衰减到很小，但仍然非零；再判一次阈值，
+     * 避免"按住不动"也会滑一点点。
+     */
+    private fun releaseToFling() {
+        driveRotation = 0f
+        drivePan = 0f
+        tracking = false
+        hasLastMove = false
+        // 目标速度可能因为最后几次 MOVE 的方向抖动而不为 0；
+        // 取"实际速度"作初速度，它才是这一帧真实在转的角速度。
+        if (abs(yawVel) + abs(pitchVel) + abs(rollVel) +
+            abs(panXVel) + abs(panYVel) < MIN_FLING_SPEED
+        ) {
+            stopMotion()
+            return
         }
         // 速度夹上限：防止极快的一甩把画面"甩飞"
         yawVel = yawVel.coerceIn(-MAX_YAW_VEL, MAX_YAW_VEL)
         pitchVel = pitchVel.coerceIn(-MAX_YAW_VEL, MAX_YAW_VEL)
-        // 新的一段从 0 重新累计，否则下一段会带上这一段的量
-        winYaw0 = 0f
-        winPitch0 = 0f
-        startFling()
+        rollVel = rollVel.coerceIn(-MAX_YAW_VEL, MAX_YAW_VEL)
+        startMotion()
+    }
+
+    // ================================================================ 运动推进
+
+    private fun startMotion() {
+        if (motionRunning) return
+        motionRunning = true
+        lastFrameNanos = 0L
+        choreographer.postFrameCallback(motionFrame)
+    }
+
+    /** 立刻停住：速度清零、所有驱动归零、撤掉帧回调。 */
+    private fun stopMotion() {
+        motionRunning = false
+        choreographer.removeFrameCallback(motionFrame)
+        yawVel = 0f
+        pitchVel = 0f
+        rollVel = 0f
+        panXVel = 0f
+        panYVel = 0f
+        driveRotation = 0f
+        drivePan = 0f
+        clearFingerVelocity()
     }
 
     /**
-     * 维护滑动窗口的起点：每次 MOVE 后调用。
+     * 拖动 / 惯性的**唯一**推进器，由 Choreographer 按屏幕刷新率驱动。
      *
-     * 做法很朴素 —— 窗口只由最近一次"锚点"决定：锚点比窗口更旧时就推进到
-     * 当前值并重置锚点时间。因为 MOVE 事件本身很密（60~120Hz），
-     * 这种"粗粒度滚动"的误差只有一帧，对惯性初速度足够了。
+     * 用真实帧间隔 dt 而不是固定步长：掉帧时转的角度按时间补齐，
+     * 不会"卡一下之后突然跳过去"。
+     *
+     * 每一帧做三件事：
+     *   1. 速度向目标速度收敛（拖动时目标来自手指，惯性时目标为 0）——
+     *      这一步就是加速度感本身；收敛得快慢由 FLING_DAMPING 决定。
+     *   2. 各轴**分别**右乘一小段角度（见 rotateAboutLocalAxis）：
+     *      绕相机 X / Y / Z 各转各的，谁也不会改变谁的轴。
+     *   3. 速度按 exp(-k*dt) 衰减（拖动时目标非零，衰减只影响"追赶"的快慢）。
+     *
+     * 收敛 + 衰减写成同一个式子：
+     *     v ← v * exp(-2k*dt) + target * (1 - exp(-2k*dt))
+     * 目标为 0 时退化成纯指数衰减（惯性收尾）；target 恒定时趋于 target
+     * （拖动稳态角速度 = 手指速度换算值）。
      */
-    private fun updateWindow(event: MotionEvent) {
-        val now = event.eventTime
-        if (winStartMs == 0L) {
-            winStartMs = now
-            winYaw0 = 0f
-            winPitch0 = 0f
-            winPanX0 = panX
-            winPanY0 = panY
-            return
-        }
-        if (now - winStartMs > FLING_WINDOW_MS.toLong()) {
-            winStartMs = now
-            winYaw0 = 0f
-            winPitch0 = 0f
-            winPanX0 = panX
-            winPanY0 = panY
-        }
-    }
-
-    // ================================================================ 惯性推进
-
-    private fun startFling() {
-        if (flingRunning) return
-        flingRunning = true
-        lastFrameNanos = 0L
-        choreographer.postFrameCallback(flingFrame)
-    }
-
-    private fun stopFling() {
-        if (!flingRunning) return
-        flingRunning = false
-        choreographer.removeFrameCallback(flingFrame)
-        yawVel = 0f
-        pitchVel = 0f
-        panXVel = 0f
-        panYVel = 0f
-    }
-
-    private fun stepFling(frameTimeNanos: Long) {
-        if (!flingRunning) return
+    private fun stepMotion(frameTimeNanos: Long) {
+        if (!motionRunning) return
 
         // 首帧没有上一帧时间戳：记下来，下一帧再算 dt（避免出现一个巨大的 dt）
         if (lastFrameNanos == 0L) {
             lastFrameNanos = frameTimeNanos
-            choreographer.postFrameCallback(flingFrame)
+            choreographer.postFrameCallback(motionFrame)
             return
         }
         val dt = (frameTimeNanos - lastFrameNanos) / 1_000_000_000f
         lastFrameNanos = frameTimeNanos
         if (dt <= 0f) {
-            choreographer.postFrameCallback(flingFrame)
+            choreographer.postFrameCallback(motionFrame)
             return
         }
+        // 掉帧严重时 dt 可能是几百毫秒，按它积分会直接转过半圈。
+        // 夹到 3 帧以内，宁可"少转一点"也不要一次跳变。
+        val step = min(dt, MAX_STEP_S)
 
-        // 指数衰减：v *= exp(-k*dt)。
-        // 用 exp 而不是 (1-k*dt)：后者在掉帧(dt 大)时会变成负数 → 反向抖动。
-        val decay = exp(-FLING_DAMPING * dt)
+        val tgtYaw = fingerYawTarget * driveRotation
+        val tgtPitch = fingerPitchTarget * driveRotation
+        val tgtRoll = fingerRollTarget * driveRotation
+        val tgtPanX = fingerPanXTarget * drivePan
+        val tgtPanY = fingerPanYTarget * drivePan
 
-        // 惯性同样绕**相机自身轴**累积（右乘），所以甩出去之后横竖方向依旧
-        // 各自只作用于机体系，不会像欧拉角那样越甩轴越歪。
-        rotateLocal(yawDelta = yawVel * dt, pitchDelta = pitchVel * dt)
-        panX -= panXVel * dt
-        panY += panYVel * dt
+        // 收敛系数：exp 而不是 (1-k*dt)，后者在 dt 大时会变负 → 反向抖动
+        val follow = 1f - exp(-FLING_DAMPING * step)
+        yawVel += (tgtYaw - yawVel) * follow
+        pitchVel += (tgtPitch - pitchVel) * follow
+        rollVel += (tgtRoll - rollVel) * follow
+        panXVel += (tgtPanX - panXVel) * follow
+        panYVel += (tgtPanY - panYVel) * follow
 
-        yawVel *= decay
-        pitchVel *= decay
-        panXVel *= decay
-        panYVel *= decay
+        // 各轴**独立**右乘：轴永远是相机自己的 right / up / back
+        rotateAboutLocalAxis(0, pitchVel * step)
+        rotateAboutLocalAxis(1, yawVel * step)
+        rotateAboutLocalAxis(2, rollVel * step)
+        // 平移是世界系里绕着中心走，与相机朝向无关，所以直接加
+        panX += panXVel * step
+        panY += panYVel * step
 
-        // 惯性只改姿态快照；出帧由渲染线程按自己的节奏做，主线程不等 GPU。
+        // 姿态只改快照；出帧由渲染线程按自己的节奏做，主线程不等 GPU。
         requestRender()
 
-        val speed = abs(yawVel) + abs(pitchVel) + abs(panXVel) + abs(panYVel)
-        if (speed > MIN_FLING_SPEED) {
-            choreographer.postFrameCallback(flingFrame)
+        // 还在拖（driveRotation=1）就一直跑，直到松手让速度自然衰减到阈值以下
+        val speed = abs(yawVel) + abs(pitchVel) + abs(rollVel) + abs(panXVel) + abs(panYVel)
+        if (driveRotation > 0f || speed > MIN_FLING_SPEED) {
+            choreographer.postFrameCallback(motionFrame)
         } else {
-            stopFling()
+            stopMotion()
         }
     }
-
     // ================================================================ 对外接口
 
     /** 缩放若干倍（给 UI 的 +/- 按钮用；双指手势走的是同一份 scale 状态）。 */
     fun zoomBy(factor: Float) {
-        stopFling()
+        stopMotion()
         scale = (scale * factor).coerceIn(MIN_SCALE, MAX_SCALE)
         requestRender()
     }
@@ -687,13 +787,11 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
 
     /** 复位视角：姿态回单位四元数 + 缩放回 1.0 + 平移归零，并立刻重画一帧。 */
     fun resetView() {
-        stopFling()
+        stopMotion()
         qx = 0f
         qy = 0f
         qz = 0f
         qw = 1f
-        winYaw0 = 0f
-        winPitch0 = 0f
         scale = 1f
         panX = 0f
         panY = 0f
@@ -765,10 +863,16 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         // 循环外**不**赌 SDK 的快慢：每一帧都按目标间隔给主线程让路，
         // 这样即便 SDK 只花 1ms，也不会把渲染线程烧成忙等。
         while (renderLoopRunning) {
-            val t0 = System.nanoTime()
-            val p = pendingPose
-            session.render(p[0], p[1], p[2], p[3], p[4], p[5], p[6])
-            val elapsedMs = (System.nanoTime() - t0) / 1_000_000L
+            // 【2026-11-11 修复 · 9416e56 的回归】这里原先直接内联
+            // `session.render(...)` 并丢掉返回值，于是 renderOnce() 里的
+            // 帧统计 / 窗口结算 / 失败计数 / MB_PERF 日志**全部成了死代码**
+            // （9146e56 把帧循环搬到渲染线程时漏搬了度量逻辑）。
+            // 后果：HUD 的 fps 永远停在初值显示 `--`，renderFailCount 永远是 0，
+            // 渲染失败拿不到任何可见信号。
+            //
+            // 现在改为调用 renderOnce()：它内部自己计时（t0/costNs），
+            // 所以下面不再重复计一次 elapsedMs —— 改成用它返回的耗时。
+            val elapsedMs = renderOnce()
             val sleepMs = FRAME_BUDGET_MS - elapsedMs
             if (sleepMs > 0) {
                 try {
@@ -831,7 +935,7 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
     }
 
     fun dispose() {
-        stopFling()
+        stopMotion()
         stopRenderLoop()
         session.destroy()
     }
@@ -846,7 +950,7 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
      * 调用方必须拿这个返回值去更新 UI，否则按钮上会显示一个假的 ×8。
      */
     fun applyMsaa(samples: Int): Int {
-        stopFling()
+        stopMotion()
         msaaSamples = if (samples <= 0) 1 else samples
         val holder = this.holder ?: return msaaEffective
         session.detachSurface()
@@ -879,27 +983,40 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         const val CAM_DIST = 2.6f
         const val FOV_Y_RAD = (60.0 * Math.PI / 180.0).toFloat()
 
-        // 灵敏度：0.006 rad/px ≈ 0.34°/px。
-        // 拖过 1440 逻辑像素（= 屏幕上 2160 物理像素的高度）约转 130°，
-        // 拖过 900 像素约转 80° —— 一个模型转一圈在 2~3 次拖动的量级。
+        // 灵敏度：0.006 rad/px。它乘的是**手指速度**（px/s）而不是位移：
+        // 拖 1000px/s 就是目标角速度 6 rad/s。
         //
         // **没有角度上限**：姿态是四元数，上下左右都能转满 360°，
         // 也不需要 PITCH_LIMIT 那种夹取（夹取会造成"转到顶就贴墙"的错觉）。
+        // 2π 写成 Float：Kotlin 的 PI 是 Double，运算结果会升级成 Double。
+        const val TWO_PI_F = (2.0 * Math.PI).toFloat()
+
         const val ROT_PER_PX = 0.006f
+
+        // 手指速度的低通系数（1/s）。
+        // 25 大约 40ms 跟到目标：既能弹掉 MOVE 逐帧的噪声，
+        // 又不会让手指停下来之后画面还在往前冲。
+        const val FINGER_SMOOTHING = 25f
+
+        // 两个 MOVE 的间隔超过这个值（ms）就不算速度了。
+        const val MAX_SAMPLE_DT_MS = 100f
+
+        // 单帧 dt 截断（秒）：掉帧到几百毫秒时，宁可少转一点
+        // 也不要一次跳过半圈。
+        const val MAX_STEP_S = 0.05f
 
         // 缩放
         const val MIN_SCALE = 0.35f
         const val MAX_SCALE = 4.0f
 
-        // 惯性
-        // FLING_DAMPING 越大停得越快：2.2 大约 1 秒衰减到 10%，手感偏"顺滑带减速"。
+        // 惯性 / 加速度
+        // FLING_DAMPING 同时决定两件事：
+        //   1. 角速度追赶手指速度的快慢 = 加速度感的强弱；
+        //   2. 松手后减速的快慢。
+        // 2.2 大约 1 秒衰减到 10%，手感偏"顺滑带减速"。
         const val FLING_DAMPING = 2.2f
         // 低于这个速度就收尾（防止无限重绘）。
         const val MIN_FLING_SPEED = 0.02f
-        // 采样窗口太短时速度不可信（比如 10ms 抖一下），不做惯性
-        const val MIN_TRACK_MS = 20f
-        // 速度估算的滑动窗口：只看最近 100ms 的位移，反映"最后甩得多快"
-        const val FLING_WINDOW_MS = 100f
         // 角速度上限（rad/s）：约 3.3 圈/秒，再快也没意义
         const val MAX_YAW_VEL = 21f
 
