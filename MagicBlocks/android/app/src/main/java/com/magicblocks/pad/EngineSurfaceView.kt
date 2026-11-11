@@ -221,18 +221,20 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         // 记下**实际生效**的采样数（设备不支持时后端会退回 1x），UI 显示的是这个值。
         msaaEffective = session.msaaSamples()
         Log.i(MbRenderer.TAG, "MSAA 请求 ${msaaSamples}x → 实际 ${msaaEffective}x（支持: ${supportedMsaaLevels()}）")
-        // 建好交换链后立刻画一帧，避免第一屏是黑的
-        renderOnce()
-        // 再起常驻循环：切模型/转视角都要有帧；surfaceDestroyed 会把它停掉。
+        // 建好交换链后起常驻渲染线程：第一帧由它自己出，避免第一屏是黑的。
+        // 这里**不能**在主线程同步画第一帧 —— 首帧最慢（要建管线/MS 图），
+        // 同步画会让启动瞬间卡一下甚至触发 ANR。
         startRenderLoop()
     }
 
     private fun renderOnce() {
+        // 只在**渲染线程**上调用（见 renderLoopBody）。
         // 计时包住 session.render()：这段时间 = 录制 + 提交 + 等 GPU 完成 + present，
         // 也就是"这一帧让渲染线程占用了多久"。它不等于 GPU 执行时间（那是另一回事），
         // 但正是它决定渲染线程能不能跑满目标帧率。
         val t0 = System.nanoTime()
-        val ok = session.render(qx, qy, qz, qw, scale, panX, panY)
+        val p = pendingPose
+        val ok = session.render(p[0], p[1], p[2], p[3], p[4], p[5], p[6])
         val costNs = System.nanoTime() - t0
 
         val now = System.currentTimeMillis()
@@ -358,7 +360,10 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
                     handleOneFinger(event)
                 }
                 updateWindow(event)
-                renderOnce()
+                // 主线程只更新快照，真正出帧在渲染线程（见 renderLoopBody）。
+                // 这里**绝不能**再同步调 session.render() —— 那等于把手势处理和
+                // SDK 的等待绑在同一个线程上，SDK 一慢，整个 UI 跟着卡。
+                requestRender()
             }
 
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
@@ -655,7 +660,8 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         panXVel *= decay
         panYVel *= decay
 
-        renderOnce()
+        // 惯性只改姿态快照；出帧由渲染线程按自己的节奏做，主线程不等 GPU。
+        requestRender()
 
         val speed = abs(yawVel) + abs(pitchVel) + abs(panXVel) + abs(panYVel)
         if (speed > MIN_FLING_SPEED) {
@@ -671,7 +677,7 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
     fun zoomBy(factor: Float) {
         stopFling()
         scale = (scale * factor).coerceIn(MIN_SCALE, MAX_SCALE)
-        renderOnce()
+        requestRender()
     }
 
     /** 当前视觉状态，供 HUD 显示。四元数姿态直接显示，不做欧拉角分解（分解会误导）。 */
@@ -691,7 +697,7 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         scale = 1f
         panX = 0f
         panY = 0f
-        renderOnce()
+        requestRender()
     }
 
     // ------------------------------------------------------------ 渲染循环
@@ -705,29 +711,104 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
 
     private var renderLoopRunning = false
 
-    // 类型必须显式写出：`val x = FrameCallback { ... postFrameCallback(x) }`
-    // 会让类型推断撞上递归（Kotlin: TYPECHECKER_HAS_RUN_INTO_RECURSIVE_PROBLEM）。
-    private val renderLoop: Choreographer.FrameCallback = object : Choreographer.FrameCallback {
-        override fun doFrame(frameTimeNanos: Long) {
-            if (!renderLoopRunning) return
-            renderOnce()
-            choreographer.postFrameCallback(this)
+    // ------------------------------------------------------------ 专用渲染线程
+    //
+    // 为什么**必须**离开主线程：
+    //   SDK 侧 `render_frame()` 里有同步等待（acquire 的 fence、vkWaitForFences、
+    //   vkDeviceWaitIdle、模型上传 …）。这些在"平时"很快，但 SDK 一重构，
+    //   L0/L1 里任何一处多等一拍，**整条调用链就被拖长**。以前这个调用是挂在
+    //   Choreographer 上的 —— 也就是**主线程**，于是：
+    //       主线程被卡 → 输入 / 动画 / Compose 重绘全停 → 整个 UI 奇卡
+    //   这就是"UI 渲染和 SDK 明明应该独立，却一起卡"的全部原因：不是合成层
+    //   共享，而是同一个线程。
+    //
+    // 现在的分工：
+    //   * 渲染线程：只做 session.render(...)（Vulkan 提交 + 呈现）。
+    //     SurfaceView 的 buffer 由 SurfaceFlinger 直接合成，本来就不需要主线程。
+    //   * 主线程：只处理手势（改四元数/缩放/平移，纯数学，微秒级）和 Compose。
+    //     互相之间只通过 @Volatile 的姿态快照通信，没有任何等待。
+    //
+    // SDK 再慢，表现也只会是**画面掉帧**（SurfaceView 那一层的 fps 下降），
+    // 而不再是整个 App 掉帧。
+    private var renderThread: Thread? = null
+
+    /** 姿态快照：主线程写、渲染线程读。8 个 float 的可见性用 @Volatile 包一层。 */
+    @Volatile
+    private var pendingPose = floatArrayOf(0f, 0f, 0f, 1f, 1f, 0f, 0f)
+
+    private fun publishPose() {
+        pendingPose = floatArrayOf(qx, qy, qz, qw, scale, panX, panY)
+    }
+
+    private fun startRenderThread() {
+        if (renderThread != null) return
+        renderThread = Thread({ renderLoopBody() }, "mb-render").also {
+            it.priority = Thread.NORM_PRIORITY + 2
+            it.start()
         }
     }
 
-    /** 启动常驻渲染循环（幂等）。 */
-    fun startRenderLoop() {
-        if (renderLoopRunning) return
-        if (!holder.surface.isValid) return
-        renderLoopRunning = true
-        choreographer.postFrameCallback(renderLoop)
+    private fun stopRenderThread() {
+        val t = renderThread ?: return
+        renderLoopRunning = false      // 先关灯，循环下一拍自行退出
+        renderThread = null
+        // 等它真正退出：detach surface 之前必须保证没人还在用 swapchain，
+        // 否则会在渲染线程里对已销毁的 swapchain 取图（use-after-free）。
+        try {
+            t.join(2000)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
     }
 
-    /** 停止常驻渲染循环（幂等）。 */
+    private fun renderLoopBody() {
+        // 循环外**不**赌 SDK 的快慢：每一帧都按目标间隔给主线程让路，
+        // 这样即便 SDK 只花 1ms，也不会把渲染线程烧成忙等。
+        while (renderLoopRunning) {
+            val t0 = System.nanoTime()
+            val p = pendingPose
+            session.render(p[0], p[1], p[2], p[3], p[4], p[5], p[6])
+            val elapsedMs = (System.nanoTime() - t0) / 1_000_000L
+            val sleepMs = FRAME_BUDGET_MS - elapsedMs
+            if (sleepMs > 0) {
+                try {
+                    Thread.sleep(sleepMs)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    return
+                }
+            }
+            // 主线程请求重画（切模型 / 缩放按钮 / 复位）：这里只借用一次节拍，
+            // 不做任何额外的事 —— 姿态已经在 pendingPose 里了。
+            redrawRequested = false
+        }
+    }
+
+    /**
+     * 请求渲染线程重画一帧。
+     *
+     * 与从前的 renderOnce() 不同：**不阻塞调用方**。主线程点一下按钮就返回，
+     * 真正的 Vulkan 提交发生在渲染线程上。
+     */
+    private fun requestRender() {
+        publishPose()
+        redrawRequested = true
+    }
+
+    @Volatile
+    private var redrawRequested = false
+
+    /** 启动常驻渲染（幂等）。surface 就绪后才真正开跑。 */
+    fun startRenderLoop() {
+        if (!holder.surface.isValid) return
+        renderLoopRunning = true
+        startRenderThread()
+    }
+
+    /** 停止常驻渲染（幂等）。**必须在 detach surface 之前调用并等它退出。** */
     fun stopRenderLoop() {
-        if (!renderLoopRunning) return
         renderLoopRunning = false
-        choreographer.removeFrameCallback(renderLoop)
+        stopRenderThread()
     }
 
     // ------------------------------------------------------------ 预设模型
@@ -745,7 +826,7 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         } else {
             session.loadModel(item.path, item.name)
         }
-        renderOnce()
+        requestRender()
         return ok
     }
 
@@ -785,6 +866,14 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
     private companion object {
         // fps 统计窗口：短于 1 秒数值抖得没法看，长于 1 秒对"拖动时掉帧"反应太慢。
         const val FPS_WINDOW_NS = 1_000_000_000L
+
+        // 渲染线程每帧的目标预算(ms)：8 ≈ 120Hz 上限。
+        //
+        // 为什么要"目标"而不是"能多快跑多快"：这条循环和 UI 线程是**两个**线程，
+        // 但它们共享 CPU 与内存带宽。渲染线程狂飙会把 UI 线程挤到没时间片，
+        // 又变回"UI 卡"。给一个上界，SDK 再快也不会把 UI 拖死；
+        // SDK 变慢时超出预算的部分就自然表现为画面掉帧，UI 不受影响。
+        const val FRAME_BUDGET_MS = 8L
 
         // 相机
         const val CAM_DIST = 2.6f
