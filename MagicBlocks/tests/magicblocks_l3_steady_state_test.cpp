@@ -32,18 +32,18 @@
 #include <memory>
 #include <vector>
 
-#include "magicblocks/device/render_device.h"
-#include "magicblocks/primitives/batch.h"
-#include "magicblocks/primitives/camera.h"
-#include "magicblocks/primitives/mesh.h"
-#include "magicblocks/primitives/mesh_factory.h"
-#include "magicblocks/primitives/primitive_renderer.h"
-#include "magicblocks/primitives/shader_library.h"
-#include "magicblocks/primitives/types.h"
-#include "magicblocks/resources/buffer.h"
-#include "magicblocks/resources/command.h"
-#include "magicblocks/resources/memory.h"
-#include "magicblocks/resources/pipeline.h"
+#include "mb_internal/magicblocks/device/render_device.h"
+#include "mb_internal/magicblocks/primitives/batch.h"
+#include "mb_internal/magicblocks/primitives/camera.h"
+#include "mb_internal/magicblocks/primitives/mesh.h"
+#include "mb_internal/magicblocks/primitives/mesh_factory.h"
+#include "mb_internal/magicblocks/primitives/primitive_renderer.h"
+#include "mb_internal/magicblocks/primitives/shader_library.h"
+#include "mb_internal/magicblocks/primitives/types.h"
+#include "mb_internal/magicblocks/resources/buffer.h"
+#include "mb_internal/magicblocks/resources/command.h"
+#include "mb_internal/magicblocks/resources/memory.h"
+#include "mb_internal/magicblocks/resources/pipeline.h"
 #include "magicblocks_shaders.h"
 
 namespace dev = magicblocks::device;

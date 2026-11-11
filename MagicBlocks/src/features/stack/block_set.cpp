@@ -7,7 +7,7 @@
 //     **刻意的**（设计 §5.3），UI 只持有 stroke_id；
 //   - 所有对外输出（strokes_in_order / indices_of_stroke / hash）一律走真源下标序，
 //     没有任何一处遍历 `occupied_`。
-#include "magicblocks/features/stack/block_set.h"
+#include "mb_internal/magicblocks/features/stack/block_set.h"
 
 #include <algorithm>
 #include <cstring>

@@ -195,6 +195,13 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
     private val motionFrame = Choreographer.FrameCallback { frameTimeNanos -> stepMotion(frameTimeNanos) }
 
     fun ensureEngine() {
+        // ABI 版本对不上就**不建会话**:继续跑等于让 UI 按旧的结构体布局去调新库,
+        // 那属于静默读错内存,比直接黑屏严重得多。原因由 MainActivity 写进 HUD,
+        // 这里只要保证"不继续往下走"。
+        if (!MbRenderer.abiUsable) {
+            Log.e(MbRenderer.TAG, "引擎未启动(ABI 不匹配): ${MbRenderer.abiVerdict}")
+            return
+        }
         session.create()
         if (session.ready) {
             Log.i(MbRenderer.TAG, "引擎就绪")

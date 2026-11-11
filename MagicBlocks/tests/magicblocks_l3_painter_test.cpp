@@ -9,7 +9,7 @@
 #include <cmath>
 #include <vector>
 
-#include "magicblocks/primitives/painter.h"
+#include "mb_internal/magicblocks/primitives/painter.h"
 
 namespace mbp = magicblocks::primitives;
 

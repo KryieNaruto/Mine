@@ -9,7 +9,7 @@
 // 为什么在 CPU 上做而不是用几何着色器展开：
 //   G1 门控明确禁止 geometry shader（移动端支持差）。
 //   而且 CPU 展开能精确控制增量更新 —— 见下面的 append_segment。
-#include "magicblocks/primitives/painter.h"
+#include "mb_internal/magicblocks/primitives/painter.h"
 
 #include <algorithm>
 #include <cmath>

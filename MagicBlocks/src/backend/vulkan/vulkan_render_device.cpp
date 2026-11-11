@@ -310,6 +310,42 @@ Result<std::unique_ptr<ISwapchain>> VulkanRenderDevice::create_swapchain_with_ms
   return std::unique_ptr<ISwapchain>(std::move(sc));
 }
 
+// ============================================================================
+// 按交换链形状建管线 —— 归一化"交换链 → 管线"的全部取值逻辑
+// ============================================================================
+//
+// 这个函数的**存在理由**是分层:在此之前 android/scene_renderer.cpp 必须自己
+//   dynamic_cast<backend::VulkanRenderDevice*> + backend::AttachmentShape{}
+//   + 读 VulkanSwapchain::msaa_samples()
+// 才能建出与交换链兼容的管线。那意味着 UI 侧最近的一层反向依赖 backend 实现,
+// 换后端就要改 android/。G3 门控把这种写法判红;修复方向只能是"把知识搬到 backend 里",
+// 而不是给门控加白名单 —— 白名单等于承认 UI 依赖 backend。
+//
+// 取值规则(三处细节都是踩过的坑,别"顺手"简化):
+//   1. 采样数取**交换链实际生效**的值(VulkanSwapchain::msaa_samples()),不是调用方
+//      请求的值:设备不支持时后端会退回 1x,若按请求值建管线,pass 的采样数就对不上,
+//      vkCmdDraw 被**静默丢弃**(只剩清屏色,没有任何报错)。
+//      只有 chain 不是本后端实现时才退回 msaa_hint。
+//   2. color_format 取交换链的真实格式(surface 可能给 BGRA8)。
+//   3. from_swapchain 必须置真:这是 t6 的结论 —— 设备层的 pass 兼容性比较会看它,
+//      置假会复用错 pass 的 finalLayout(恒 GENERAL),vkQueuePresentKHR 报 E-01430,
+//      上屏帧被丢弃。
+Result<std::unique_ptr<resources::IPipeline>> VulkanRenderDevice::create_swapchain_pipeline(
+    const resources::PipelineDesc& desc, const ISwapchain& chain, std::uint32_t msaa_hint) {
+  std::uint32_t samples = msaa_hint > 1 ? msaa_hint : std::uint32_t{1};
+  if (const auto* vk_chain = dynamic_cast<const VulkanSwapchain*>(&chain)) {
+    samples = vk_chain->msaa_samples();
+  }
+
+  resources::AttachmentShape shape{};
+  shape.color_format = chain.format();
+  shape.has_depth = false;
+  shape.samples = samples > 1 ? samples : 1;
+  shape.from_swapchain = true;
+
+  return create_pipeline_for_shape(desc, shape);
+}
+
 Status VulkanRenderDevice::notify_lifecycle(const AppLifecycleEvent& ev) {
   (void)ev;
   return Status::Ok_();

@@ -31,13 +31,13 @@
 #include <vector>
 
 #include "backend/vulkan/vk_common.h"
-#include "magicblocks/device/result.h"
-#include "magicblocks/resources/command.h"
-#include "magicblocks/resources/handles.h"
+#include "mb_internal/magicblocks/device/result.h"
+#include "mb_internal/magicblocks/resources/command.h"
+#include "mb_internal/magicblocks/resources/handles.h"
 // VulkanContext / backend::Status 别名(见 vulkan_buffer.h 的同一条注释)。
 #include "backend/vulkan/vulkan_target.h"
-#include "magicblocks/resources/buffer.h"
-#include "magicblocks/resources/texture.h"
+#include "mb_internal/magicblocks/resources/buffer.h"
+#include "mb_internal/magicblocks/resources/texture.h"
 
 namespace magicblocks::backend {
 

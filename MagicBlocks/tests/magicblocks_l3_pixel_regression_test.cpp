@@ -1,4 +1,4 @@
-﻿// MagicBlocks L3 —— **像素级**渲染回归测试
+// MagicBlocks L3 —— **像素级**渲染回归测试
 //
 // ============================ 为什么需要这个文件 ============================
 //
@@ -35,11 +35,11 @@
 #include <memory>
 #include <vector>
 
-#include "magicblocks/device/render_device.h"
-#include "magicblocks/primitives/types.h"
-#include "magicblocks/resources/buffer.h"
-#include "magicblocks/resources/command.h"
-#include "magicblocks/resources/pipeline.h"
+#include "mb_internal/magicblocks/device/render_device.h"
+#include "mb_internal/magicblocks/primitives/types.h"
+#include "mb_internal/magicblocks/resources/buffer.h"
+#include "mb_internal/magicblocks/resources/command.h"
+#include "mb_internal/magicblocks/resources/pipeline.h"
 #include "magicblocks_shaders.h"
 
 namespace dev = magicblocks::device;

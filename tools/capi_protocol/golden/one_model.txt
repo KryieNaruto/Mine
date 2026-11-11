@@ -1,0 +1,1 @@
+err=MB_OK\ncube\n/data/user/0/com.magicblocks.pad/cache/models/cube.obj\n717\n1\n\n面板\n/data/user/0/com.magicblocks.pad/cache/models/panel.obj\n350\n0\nOBJ 里没有三角形\n

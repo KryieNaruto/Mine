@@ -19,9 +19,7 @@
 #include <algorithm>
 #include <cstring>
 
-#include "backend/vulkan/vulkan_render_device.h"
-#include "backend/vulkan/vulkan_swapchain.h"
-#include "backend/vulkan/vulkan_ui_overlay.h"
+#include "core/device_ops.h"
 
 namespace magicblocks::ui {
 
@@ -158,8 +156,9 @@ std::uint64_t ShellSurfaceSink::current_image_handle() const {
   device::IRenderTarget* target = swapchain_->current_target();
   if (!target) return 0;
   // 后端私有钩子：swapchain 实现知道自己的当前 image 是哪一张。
-  auto* probe = dynamic_cast<backend::SwapchainImageProbe*>(swapchain_.get());
-  return probe ? probe->current_image_value() : 0;
+  // t9:取"句柄值"这件事收进 core/device_ops.h 的纯值入口，本层拿到的只是一个
+  // uint64，不认识 SwapchainImageProbe，也不需要 dynamic_cast 到 backend::。
+  return core::swapchain_current_image_value(swapchain_.get());
 }
 
 bool ShellSurfaceSink::rebuild(device::Extent2D extent, std::string* error) {

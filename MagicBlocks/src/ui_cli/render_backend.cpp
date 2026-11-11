@@ -8,14 +8,14 @@
 #include <string>
 #include <vector>
 
-#include "magicblocks/device/render_target.h"
-#include "magicblocks/primitives/batch.h"
-#include "magicblocks/primitives/camera.h"
-#include "magicblocks/primitives/mesh.h"
-#include "magicblocks/primitives/model_catalog.h"
-#include "magicblocks/resources/buffer.h"
-#include "magicblocks/resources/command.h"
-#include "magicblocks/resources/pipeline.h"
+#include "mb_internal/magicblocks/device/render_target.h"
+#include "mb_internal/magicblocks/primitives/batch.h"
+#include "mb_internal/magicblocks/primitives/camera.h"
+#include "mb_internal/magicblocks/primitives/mesh.h"
+#include "mb_internal/magicblocks/primitives/model_catalog.h"
+#include "mb_internal/magicblocks/resources/buffer.h"
+#include "mb_internal/magicblocks/resources/command.h"
+#include "mb_internal/magicblocks/resources/pipeline.h"
 #include "magicblocks_shaders.h"  // kL3_sceneVert / kL3_sceneFrag
 
 namespace magicblocks::ui_cli {

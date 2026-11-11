@@ -19,10 +19,10 @@
 #include <numeric>
 #include <vector>
 
-#include "magicblocks/primitives/alloc.h"
-#include "magicblocks/primitives/batch.h"
-#include "magicblocks/primitives/world.h"
-#include "magicblocks/primitives/world_render.h"
+#include "mb_internal/magicblocks/primitives/alloc.h"
+#include "mb_internal/magicblocks/primitives/batch.h"
+#include "mb_internal/magicblocks/primitives/world.h"
+#include "mb_internal/magicblocks/primitives/world_render.h"
 
 namespace mbp = magicblocks::primitives;
 

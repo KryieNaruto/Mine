@@ -13,12 +13,12 @@
 #include <cmath>
 #include <vector>
 
-#include "magicblocks/device/events.h"
-#include "magicblocks/primitives/camera.h"
-#include "magicblocks/primitives/gizmo.h"
-#include "magicblocks/primitives/overlay2d.h"
-#include "magicblocks/primitives/picker.h"
-#include "magicblocks/primitives/types.h"
+#include "mb_internal/magicblocks/device/events.h"
+#include "mb_internal/magicblocks/primitives/camera.h"
+#include "mb_internal/magicblocks/primitives/gizmo.h"
+#include "mb_internal/magicblocks/primitives/overlay2d.h"
+#include "mb_internal/magicblocks/primitives/picker.h"
+#include "mb_internal/magicblocks/primitives/types.h"
 
 namespace mbp = magicblocks::primitives;
 namespace dev = magicblocks::device;

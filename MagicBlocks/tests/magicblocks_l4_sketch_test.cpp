@@ -13,8 +13,8 @@
 #include <vector>
 
 #include "core/image_io.h"
-#include "magicblocks/features/sketch/sketch_document.h"
-#include "magicblocks/features/sketch/sketch_pipeline.h"
+#include "mb_internal/magicblocks/features/sketch/sketch_document.h"
+#include "mb_internal/magicblocks/features/sketch/sketch_pipeline.h"
 
 namespace mb = magicblocks;
 namespace sk = magicblocks::features::sketch;

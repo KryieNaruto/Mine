@@ -8,7 +8,7 @@
 
 #include "backend/vulkan/vk_common.h"
 #include "backend/vulkan/vulkan_target.h"
-#include "magicblocks/device/swapchain.h"
+#include "mb_internal/magicblocks/device/swapchain.h"
 
 namespace magicblocks::backend {
 
@@ -53,6 +53,20 @@ class VulkanSwapchain final : public device::ISwapchain, public SwapchainImagePr
   // **backend 私有**：只有 Android 渲染层用它补偿屏幕旋转造成的
   // 宽高比失真与手势方向错位。0 表示没取到（视同 IDENTITY）。
   std::uint32_t pre_transform() const { return pre_transform_; }
+
+  // 屏幕相对 swapchain image 的旋转，**角度**（顺时针 0/90/180/270）。
+  //
+  // 这是 t3 加的解码入口：`VK_SURFACE_TRANSFORM_*` 是 Vulkan 枚举，
+  // 过去由 `src/android/scene_renderer.cpp` 自己 `&` 出来的 —— 那让 VK_ 宏
+  // 落在了 backend/ 之外（G3 的暗漏洞，见 tools/check_layer_purity.py 头注释）。
+  // 现在 Vk 位值 → 角度的映射**只在这里**发生；backend 之外拿到的是一个
+  // 平台无关的整数。
+  std::uint32_t surface_rotation_degrees() const {
+    if (pre_transform_ & VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR) return 90;
+    if (pre_transform_ & VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR) return 180;
+    if (pre_transform_ & VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR) return 270;
+    return 0;
+  }
 
   // ---- MSAA ----
   //

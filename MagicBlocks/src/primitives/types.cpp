@@ -3,7 +3,7 @@
 // 矩阵数学、包围盒、射线求交的**唯一实现**。任何别处再写一份
 // look_at / perspective / ray-AABB 都是 bug 温床(已经是 L0~L2 的教训:
 // 双份翻行导致 golden 对不上)。
-#include "magicblocks/primitives/types.h"
+#include "mb_internal/magicblocks/primitives/types.h"
 
 #include <algorithm>
 #include <limits>

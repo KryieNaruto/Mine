@@ -13,7 +13,7 @@
 #include <string>
 #include <vector>
 
-#include "magicblocks/primitives/mesh_loader.h"
+#include "mb_internal/magicblocks/primitives/mesh_loader.h"
 
 namespace mbp = magicblocks::primitives;
 

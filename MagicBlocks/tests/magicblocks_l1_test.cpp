@@ -14,12 +14,12 @@
 #include <string>
 #include <vector>
 
-#include "magicblocks/device/render_device.h"
-#include "magicblocks/resources/buffer.h"#include "magicblocks/resources/command.h"
-#include "magicblocks/resources/handles.h"
-#include "magicblocks/resources/memory.h"
-#include "magicblocks/resources/pipeline.h"
-#include "magicblocks/resources/texture.h"
+#include "mb_internal/magicblocks/device/render_device.h"
+#include "mb_internal/magicblocks/resources/buffer.h"#include "mb_internal/magicblocks/resources/command.h"
+#include "mb_internal/magicblocks/resources/handles.h"
+#include "mb_internal/magicblocks/resources/memory.h"
+#include "mb_internal/magicblocks/resources/pipeline.h"
+#include "mb_internal/magicblocks/resources/texture.h"
 
 // 测试要触达后端自检绘制与分页分配器的具体类型(同 L0 测试的做法)。
 #include "backend/vulkan/vulkan_allocator.h"

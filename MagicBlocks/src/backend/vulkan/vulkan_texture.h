@@ -26,9 +26,9 @@
 
 #include "backend/vulkan/vk_common.h"
 #include "backend/vulkan/vulkan_allocator.h"
-#include "magicblocks/device/result.h"
-#include "magicblocks/resources/memory.h"
-#include "magicblocks/resources/texture.h"
+#include "mb_internal/magicblocks/device/result.h"
+#include "mb_internal/magicblocks/resources/memory.h"
+#include "mb_internal/magicblocks/resources/texture.h"
 // VulkanContext / backend::Status 别名(见 vulkan_buffer.h 的同一条注释)。
 #include "backend/vulkan/vulkan_target.h"
 

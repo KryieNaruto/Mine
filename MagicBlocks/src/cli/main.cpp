@@ -12,16 +12,19 @@
 #include <string>
 #include <vector>
 
+#include "core/device_ops.h"
 #include "core/image_io.h"
-#include "magicblocks/device/render_device.h"
+#include "mb_internal/magicblocks/device/render_device.h"
 
-// CLI 需要触达 L0 自检绘制(离屏出图),这里直接用后端的离屏目标类型。
-// 注意:这是 **CLI 内部**依赖,不属于 SDK 公共面(公共面仍只有 IRenderTarget)。
-#include "backend/vulkan/vulkan_target.h"
+// t9:CLI 出的自检图走 core/device_ops.h 的纯值入口
+// (`draw_offscreen_selftest`),不再直接摸后端的离屏目标类型。
+// 这样 CLI 与 UI 侧用的是同一条抽象:换后端时 CLI 不用改。
 
 namespace {
 
 using namespace magicblocks::device;
+
+namespace core = magicblocks::core;
 
 void print_usage() {
   std::fprintf(stderr,
@@ -143,12 +146,9 @@ int cmd_render(int argc, char** argv) {
 
   // 自检绘制:实例化 4x4 色块(无几何着色器)。frame_index 参与实例相位,
   // 所以 --frame-index 0 与 1 的输出**必然不同**,且同 index 逐像素可复现。
-  auto* off = dynamic_cast<magicblocks::backend::OffscreenTarget*>(tgt.value().get());
-  if (!off) {
-    std::fprintf(stderr, "内部错误:离屏目标类型不符\n");
-    return 1;
-  }
-  Status ds = off->draw_selftest(frame_index);
+  // t9:走 core 的纯值入口,不再 dynamic_cast 到 backend::OffscreenTarget。
+  Status ds =
+      core::draw_offscreen_selftest(tgt.value().get(), frame_index, core::SelftestKind::kL0Default);
   if (!ds.ok()) {
     std::fprintf(stderr, "绘制失败(code=%d): %s\n", static_cast<int>(ds.code), ds.message.c_str());
     return 1;

@@ -34,11 +34,11 @@
 #include <string>
 #include <vector>
 
-#include "magicblocks/device/render_device.h"
-#include "magicblocks/primitives/mesh_loader.h"
-#include "magicblocks/primitives/model_catalog.h"
-#include "magicblocks/primitives/types.h"
-#include "magicblocks/resources/memory.h"
+#include "mb_internal/magicblocks/device/render_device.h"
+#include "mb_internal/magicblocks/primitives/mesh_loader.h"
+#include "mb_internal/magicblocks/primitives/model_catalog.h"
+#include "mb_internal/magicblocks/primitives/types.h"
+#include "mb_internal/magicblocks/resources/memory.h"
 
 namespace dev = magicblocks::device;
 namespace res = magicblocks::resources;

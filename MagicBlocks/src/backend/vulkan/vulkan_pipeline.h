@@ -33,8 +33,8 @@
 #include <vector>
 
 #include "backend/vulkan/vk_common.h"
-#include "magicblocks/device/result.h"
-#include "magicblocks/resources/pipeline.h"
+#include "mb_internal/magicblocks/device/result.h"
+#include "mb_internal/magicblocks/resources/pipeline.h"
 // VulkanContext / backend::Status 别名(见 vulkan_buffer.h 的同一条注释)。
 #include "backend/vulkan/vulkan_target.h"
 

@@ -1,4 +1,4 @@
-﻿// MagicBlocks UI 消费层 —— 壳层 surface 宿主（src/ui/ 内部使用）
+// MagicBlocks UI 消费层 —— 壳层 surface 宿主（src/ui/ 内部使用）
 //
 // 公共面（magicblocks/ui/frame_renderer.h）只暴露 `ISceneFrameSink` 抽象；
 // 这里给出一个**桌面 / 离屏场景下的落地实现**：持有 SDK 交换链，把
@@ -14,10 +14,10 @@
 #include <memory>
 #include <string>
 
-#include "magicblocks/device/render_device.h"
-#include "magicblocks/device/swapchain.h"
-#include "magicblocks/ui/frame_renderer.h"
-#include "magicblocks/ui/types.h"
+#include "mb_internal/magicblocks/device/render_device.h"
+#include "mb_internal/magicblocks/device/swapchain.h"
+#include "mb_internal/magicblocks/ui/frame_renderer.h"
+#include "mb_internal/magicblocks/ui/types.h"
 
 namespace magicblocks::ui {
 

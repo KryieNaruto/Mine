@@ -22,7 +22,7 @@
 //
 // 第 4 步**不碰任何 CPU 回读**(门控 check_ui_no_readback.py):
 //   场景命令列表由玩法/渲染特性在 SDK 侧录好,这里只把它交给壳层的 sink。
-#include "magicblocks/ui/ui_app.h"
+#include "mb_internal/magicblocks/ui/ui_app.h"
 
 #include <algorithm>
 #include <cstring>

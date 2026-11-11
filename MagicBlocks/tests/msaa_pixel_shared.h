@@ -32,11 +32,11 @@
 #include <string>
 #include <vector>
 
-#include "magicblocks/device/types.h"
-#include "magicblocks/primitives/batch.h"
-#include "magicblocks/primitives/mesh.h"
-#include "magicblocks/primitives/painter.h"
-#include "magicblocks/resources/pipeline.h"
+#include "mb_internal/magicblocks/device/types.h"
+#include "mb_internal/magicblocks/primitives/batch.h"
+#include "mb_internal/magicblocks/primitives/mesh.h"
+#include "mb_internal/magicblocks/primitives/painter.h"
+#include "mb_internal/magicblocks/resources/pipeline.h"
 
 namespace mbp = magicblocks::primitives;
 namespace mbres = ::magicblocks::resources;

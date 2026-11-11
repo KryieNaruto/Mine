@@ -9,7 +9,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "magicblocks/primitives/material.h"
+#include "mb_internal/magicblocks/primitives/material.h"
 
 namespace magicblocks::primitives {
 

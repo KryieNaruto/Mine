@@ -41,14 +41,14 @@
 #include <string>
 #include <vector>
 
-#include "magicblocks/device/render_device.h"
-#include "magicblocks/primitives/camera.h"
-#include "magicblocks/primitives/mesh.h"
-#include "magicblocks/primitives/sky.h"
-#include "magicblocks/resources/buffer.h"
-#include "magicblocks/resources/command.h"
-#include "magicblocks/resources/pipeline.h"
-#include "magicblocks/resources/texture.h"
+#include "mb_internal/magicblocks/device/render_device.h"
+#include "mb_internal/magicblocks/primitives/camera.h"
+#include "mb_internal/magicblocks/primitives/mesh.h"
+#include "mb_internal/magicblocks/primitives/sky.h"
+#include "mb_internal/magicblocks/resources/buffer.h"
+#include "mb_internal/magicblocks/resources/command.h"
+#include "mb_internal/magicblocks/resources/pipeline.h"
+#include "mb_internal/magicblocks/resources/texture.h"
 
 namespace magicblocks::ui_cli {
 

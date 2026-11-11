@@ -6,7 +6,7 @@
 // 与旧 Presenter 的关键差别：
 //   - 旧版在 Record 阶段把「场景 pass + UI pass」录进同一 command list；
 //   - 新版**只提交场景**，UI 由壳层（Compose / CMP）自己渲染与合成。
-#include "magicblocks/ui/scene_frame.h"
+#include "mb_internal/magicblocks/ui/scene_frame.h"
 
 #include <algorithm>
 #include <string>

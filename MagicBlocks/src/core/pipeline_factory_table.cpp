@@ -11,7 +11,7 @@
 //     登记进来(实现 see backend/vulkan/vulkan_pipeline_factory.cpp);
 //   - L3 只调 resources::resolve_pipeline_factory(device),拿纯虚接口;
 //   - 本文件**零** backend / Vk 符号,只有一份函数指针。
-#include "magicblocks/resources/pipeline.h"
+#include "mb_internal/magicblocks/resources/pipeline.h"
 
 namespace magicblocks::resources {
 

@@ -20,23 +20,23 @@
 #include <set>
 #include <vector>
 
-#include "magicblocks/features/stack/block_brush.h"
-#include "magicblocks/features/stack/color_mode.h"
-#include "magicblocks/features/stack/grid_overlay.h"
-#include "magicblocks/features/stack/shape_template.h"
-#include "magicblocks/features/stack/stack_command.h"
-#include "magicblocks/features/stack/stack_render.h"
-#include "magicblocks/primitives/overlay2d.h"
-#include "magicblocks/primitives/camera.h"
-#include "magicblocks/device/render_device.h"
-#include "magicblocks/device/render_target.h"
-#include "magicblocks/features/stack/block_set.h"
+#include "mb_internal/magicblocks/features/stack/block_brush.h"
+#include "mb_internal/magicblocks/features/stack/color_mode.h"
+#include "mb_internal/magicblocks/features/stack/grid_overlay.h"
+#include "mb_internal/magicblocks/features/stack/shape_template.h"
+#include "mb_internal/magicblocks/features/stack/stack_command.h"
+#include "mb_internal/magicblocks/features/stack/stack_render.h"
+#include "mb_internal/magicblocks/primitives/overlay2d.h"
+#include "mb_internal/magicblocks/primitives/camera.h"
+#include "mb_internal/magicblocks/device/render_device.h"
+#include "mb_internal/magicblocks/device/render_target.h"
+#include "mb_internal/magicblocks/features/stack/block_set.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <set>
 
-#include "magicblocks/features/stack/stack_types.h"
+#include "mb_internal/magicblocks/features/stack/stack_types.h"
 
 namespace mbst = magicblocks::features::stack;
 namespace mbp = magicblocks::primitives;

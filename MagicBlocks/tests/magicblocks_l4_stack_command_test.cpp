@@ -13,10 +13,10 @@
 #include <string>
 #include <vector>
 
-#include "magicblocks/features/stack/block_brush.h"
-#include "magicblocks/features/stack/block_set.h"
-#include "magicblocks/features/stack/stack_command.h"
-#include "magicblocks/features/stack/stack_types.h"
+#include "mb_internal/magicblocks/features/stack/block_brush.h"
+#include "mb_internal/magicblocks/features/stack/block_set.h"
+#include "mb_internal/magicblocks/features/stack/stack_command.h"
+#include "mb_internal/magicblocks/features/stack/stack_types.h"
 
 namespace mbst = magicblocks::features::stack;
 

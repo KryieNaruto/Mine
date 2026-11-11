@@ -1,12 +1,12 @@
-﻿// MagicBlocks L3 —— 合批器的单元测试（spec §4.3 / §14.2 Renderer 套件）
+// MagicBlocks L3 —— 合批器的单元测试（spec §4.3 / §14.2 Renderer 套件）
 //
 // 重点：把 §4.1 的 drawcall / 管线切换预算变成可断言的数字。
 #include <gtest/gtest.h>
 
 #include <vector>
 
-#include "magicblocks/primitives/alloc.h"
-#include "magicblocks/primitives/batch.h"
+#include "mb_internal/magicblocks/primitives/alloc.h"
+#include "mb_internal/magicblocks/primitives/batch.h"
 
 namespace mbp = magicblocks::primitives;
 

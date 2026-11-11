@@ -1,5 +1,5 @@
 // MagicBlocks L4 —— 颜色模式实现（设计 §11）
-#include "magicblocks/features/stack/color_mode.h"
+#include "mb_internal/magicblocks/features/stack/color_mode.h"
 
 #include <cmath>
 

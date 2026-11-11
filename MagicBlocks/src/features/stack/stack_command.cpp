@@ -3,7 +3,7 @@
 // 实现顺序刻意与"从真源倒推"相反：这里**先**定义序列化格式，再让录制器
 // 往这个格式上写。理由：序列化格式是录制态唯一的对外表示，先定它能让
 // "回放必须原样恢复 stroke_id"变成格式的硬约束，而不是靠实现记得。
-#include "magicblocks/features/stack/stack_command.h"
+#include "mb_internal/magicblocks/features/stack/stack_command.h"
 
 #include <cerrno>
 #include <cstdio>

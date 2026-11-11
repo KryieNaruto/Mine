@@ -15,9 +15,9 @@
 #include <vector>
 
 #include "core/image_io.h"
-#include "magicblocks/device/events.h"
-#include "magicblocks/device/lifecycle.h"
-#include "magicblocks/device/render_device.h"
+#include "mb_internal/magicblocks/device/events.h"
+#include "mb_internal/magicblocks/device/lifecycle.h"
+#include "mb_internal/magicblocks/device/render_device.h"
 
 // 测试需要触达 L0 自检绘制(与 CLI 同一通路)。这是后端私有头,
 // 只在测试/CLI 内使用,不属于 SDK 公共面。
@@ -96,6 +96,52 @@ bool render_offscreen(dev::IRenderDevice* d, dev::u32 w, dev::u32 h, mb::ImageRg
 }
 
 std::string golden_path(const char* name) { return std::string(MB_GOLDEN_DIR) + "/" + name; }
+
+// 测试自己的输出目录。
+//
+// 旧实现是 `MB_GOLDEN_DIR + "/../../build/cli_out"` —— MB_GOLDEN_DIR 是**源**
+// 目录(<src>/tests/data),于是路径钉死在源码树里的 build/,`-B build-xxx`
+// 完全不起作用:换了构建目录,产物仍写回旧位置,残留的 build/ 一删就红,
+// 而红的原因和被测逻辑毫无关系。
+//
+// 现在从**本测试可执行文件所在目录**推,不假设任何目录名:
+//   <exe_dir>/cli_out
+// 测试 exe 由 CMake 放在构建目录里,所以这个路径天然跟着构建目录走 ——
+// 换 -B 就换目录,不需要往 CMake 里加任何宏。
+//
+// ⚠ 不要写成 <exe_dir>/../cli_out:这个 exe 就落在构建**根**上
+//   (build-xxx/magicblocks_test.exe),再往上跳一级会跳出构建目录、
+//   落到源码树旁边。第一版正是这么写的,于是产物又跑回了源码树。
+//   直接取 exe 目录就是构建目录本身,这才是"和构建同源"。
+//
+// 若外部想显式指定(CI 想在别处落盘),用环境变量 **MB_CLI_OUT_DIR** 覆盖,
+// 无需重编:运行时读,不是编译期宏。
+// 目录不存在就先建(CLI 不负责建父目录)。
+//
+// ⚠ GetModuleFileNameA 与拼接都在**字节**层面做:路径里带中文时,
+//   ANSI 版本按当前代码页取字节,再拼到 fopen 的 ANSI 路径上,两端同一
+//   代码页 —— 这种"取字节又原样喂回去"的用法是安全的,不要改成宽字符混拼。
+std::string test_cli_out_dir() {
+  const char* override_dir = std::getenv("MB_CLI_OUT_DIR");
+  if (override_dir && *override_dir) {
+    CreateDirectoryA(override_dir, nullptr);  // 已存在时返回 FALSE,无害
+    return std::string(override_dir);
+  }
+  std::string dir;
+  char buf[MAX_PATH] = {0};
+  const DWORD n = ::GetModuleFileNameA(nullptr, buf, MAX_PATH);
+  if (n > 0 && n < MAX_PATH) {
+    dir = buf;
+    const std::size_t cut = dir.find_last_of("\\/");
+    if (cut != std::string::npos) dir.resize(cut);   // = exe 目录 = 构建目录
+    dir += "/cli_out";
+  } else {
+    // 取不到 exe 路径(理论上不会发生):退到当前工作目录下的 cli_out。
+    dir = "./cli_out";
+  }
+  CreateDirectoryA(dir.c_str(), nullptr);
+  return dir;
+}
 
 // 跑 CLI 并返回退出码 + stdout
 int run_cli(const std::string& args, std::string* out) {
@@ -597,7 +643,7 @@ TEST(Offscreen, MatchesGoldenSingleBaseline) {
 
 TEST(Offscreen, FrameIndexChangesOutput) {
   std::string out0, out1, out0b;
-  const std::string tmp = std::string(MB_GOLDEN_DIR) + "/../../build/cli_out";
+  const std::string tmp = test_cli_out_dir();
   run_cli("render --width 64 --height 48 --frame-index 0 --output " + tmp + "/f0.png", &out0);
   run_cli("render --width 64 --height 48 --frame-index 1 --output " + tmp + "/f1.png", &out1);
   run_cli("render --width 64 --height 48 --frame-index 0 --output " + tmp + "/f0b.png", &out0b);

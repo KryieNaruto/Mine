@@ -9,8 +9,8 @@
 #include <set>
 #include <vector>
 
-#include "magicblocks/primitives/mesh.h"
-#include "magicblocks/primitives/mesh_factory.h"
+#include "mb_internal/magicblocks/primitives/mesh.h"
+#include "mb_internal/magicblocks/primitives/mesh_factory.h"
 
 namespace mbp = magicblocks::primitives;
 

@@ -64,24 +64,24 @@
 #include <string>
 #include <vector>
 
-#include "magicblocks/device/render_device.h"
+#include "mb_internal/magicblocks/device/render_device.h"
 // ⚠️ 头文件顺序有依赖：stack_render.h 用到 IGridOverlay / IOverlay2D 却没自己 include，
 // 所以必须先 include grid_overlay.h + overlay2d.h，否则 stack_render.h 里那两个
 // 指针成员会编译失败（C2143/C2039）。这条是既有 header 的问题，不是在测例里能改的。
-#include "magicblocks/features/stack/grid_overlay.h"
-#include "magicblocks/primitives/overlay2d.h"
-#include "magicblocks/features/stack/stack_render.h"
-#include "magicblocks/primitives/batch.h"
-#include "magicblocks/primitives/camera.h"
-#include "magicblocks/primitives/mesh.h"
-#include "magicblocks/primitives/mesh_factory.h"
-#include "magicblocks/primitives/overlay2d.h"
-#include "magicblocks/primitives/painter.h"
-#include "magicblocks/resources/buffer.h"
-#include "magicblocks/resources/command.h"
-#include "magicblocks/resources/memory.h"
-#include "magicblocks/resources/pipeline.h"
-#include "magicblocks/ui/overlay.h"
+#include "mb_internal/magicblocks/features/stack/grid_overlay.h"
+#include "mb_internal/magicblocks/primitives/overlay2d.h"
+#include "mb_internal/magicblocks/features/stack/stack_render.h"
+#include "mb_internal/magicblocks/primitives/batch.h"
+#include "mb_internal/magicblocks/primitives/camera.h"
+#include "mb_internal/magicblocks/primitives/mesh.h"
+#include "mb_internal/magicblocks/primitives/mesh_factory.h"
+#include "mb_internal/magicblocks/primitives/overlay2d.h"
+#include "mb_internal/magicblocks/primitives/painter.h"
+#include "mb_internal/magicblocks/resources/buffer.h"
+#include "mb_internal/magicblocks/resources/command.h"
+#include "mb_internal/magicblocks/resources/memory.h"
+#include "mb_internal/magicblocks/resources/pipeline.h"
+#include "mb_internal/magicblocks/ui/overlay.h"
 #include "magicblocks_shaders.h"
 #include "core/image_io.h"
 

@@ -1,8 +1,8 @@
-﻿// MagicBlocks L3 —— 合批器实现（spec §4.3）
+// MagicBlocks L3 —— 合批器实现（spec §4.3）
 //
 // 排序 → 相邻合并 → 产出 BatchDraw。全部在预分配好的缓冲区上做，
 // 稳态帧不做堆分配（§4.1）。
-#include "magicblocks/primitives/batch.h"
+#include "mb_internal/magicblocks/primitives/batch.h"
 
 #include <algorithm>
 #include <cstring>

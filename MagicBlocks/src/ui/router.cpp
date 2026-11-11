@@ -3,7 +3,7 @@
 // 栈深度刻意限制为 1 层玩法(HomeScreen 恒为根,不入栈):
 // spec §9 明确「多窗口/多 surface 不做」,demo 期也没有"玩法里再进玩法"的需求,
 // 限制住栈深度可以让 pop() 的语义无歧义,也让 G7(切后台)的状态保存只有一个出口。
-#include "magicblocks/ui/router.h"
+#include "mb_internal/magicblocks/ui/router.h"
 
 #include <algorithm>
 #include <cstdio>

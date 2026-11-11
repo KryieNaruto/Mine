@@ -15,8 +15,8 @@
 #include <cmath>
 #include <vector>
 
-#include "magicblocks/primitives/mesh_factory.h"
-#include "magicblocks/primitives/types.h"
+#include "mb_internal/magicblocks/primitives/mesh_factory.h"
+#include "mb_internal/magicblocks/primitives/types.h"
 
 namespace {
 

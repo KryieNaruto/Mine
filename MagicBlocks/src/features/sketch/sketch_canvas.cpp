@@ -2,7 +2,7 @@
 //
 // 见头文件顶部：本文件**零投影数学**，屏幕↔世界的正反变换只调 L3 的
 // `ICamera::screen_to_ray` 与 `primitives::intersect_ray_plane`。
-#include "magicblocks/features/sketch/sketch_canvas.h"
+#include "mb_internal/magicblocks/features/sketch/sketch_canvas.h"
 
 #include <cmath>
 

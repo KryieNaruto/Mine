@@ -10,7 +10,7 @@
 //   3. **撤销靠快照回滚**，不靠重放反操作。`begin_stroke` 拷一份真源，`end_stroke`
 //      成功后丢掉；撤销 = 把快照写回新真源。因此"撤销后"与"从未画过"逐字节相同。
 //   4. 不碰设备、不碰 Vulkan、不读时钟（G3/G4/G8）。
-#include "magicblocks/features/stack/stack_session.h"
+#include "mb_internal/magicblocks/features/stack/stack_session.h"
 
 #include <algorithm>
 #include <cstdio>

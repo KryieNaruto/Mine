@@ -17,7 +17,7 @@
 // "数量与实体数同阶、频繁 acquire/release、地址必须稳定"的典型，用它最合适。
 // 因此 set_node_pool() 注入了 IObjectPool<NodeSlot>，槽位类型是 24 字节的 NodeSlot。
 // 不注入时退回内部 std::deque（单元测试与冷路径；deque 的稳定性要 per-element）。
-#include "magicblocks/primitives/world.h"
+#include "mb_internal/magicblocks/primitives/world.h"
 
 #include <algorithm>
 #include <array>
@@ -29,8 +29,8 @@
 #include <utility>
 #include <vector>
 
-#include "magicblocks/primitives/alloc.h"
-#include "magicblocks/scene/scene.h"
+#include "mb_internal/magicblocks/primitives/alloc.h"
+#include "mb_internal/magicblocks/scene/scene.h"
 #include "primitives/world_storage.h"
 
 namespace magicblocks::primitives {

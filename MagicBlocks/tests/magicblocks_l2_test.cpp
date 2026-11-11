@@ -21,14 +21,14 @@
 
 #include "magicblocks_shaders.h"
 #include "core/image_io.h"
-#include "magicblocks/device/render_device.h"
-#include "magicblocks/scene/command_stream.h"
-#include "magicblocks/scene/feature.h"
-#include "magicblocks/scene/recorder.h"
-#include "magicblocks/scene/render_graph.h"
-#include "magicblocks/scene/scene.h"
-#include "magicblocks/scene/submit_queue.h"
-#include "magicblocks/scene/types.h"
+#include "mb_internal/magicblocks/device/render_device.h"
+#include "mb_internal/magicblocks/scene/command_stream.h"
+#include "mb_internal/magicblocks/scene/feature.h"
+#include "mb_internal/magicblocks/scene/recorder.h"
+#include "mb_internal/magicblocks/scene/render_graph.h"
+#include "mb_internal/magicblocks/scene/scene.h"
+#include "mb_internal/magicblocks/scene/submit_queue.h"
+#include "mb_internal/magicblocks/scene/types.h"
 #include "scene/scene_internal.h"
 
 // 仅 golden 用例需要:出图必须走真实的 backend 绘制路径(与 CLI 完全同一条),

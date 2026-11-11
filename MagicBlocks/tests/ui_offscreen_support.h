@@ -12,7 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "magicblocks/device/render_target.h"
+#include "mb_internal/magicblocks/device/render_target.h"
 
 namespace magicblocks::ui::test {
 

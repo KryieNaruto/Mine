@@ -2,7 +2,7 @@
 //
 // 逐条实现 stack_render.h 顶部的契约。这里刻意**不**引入任何后端私有头：
 // 建管线只用公共 `create_pipeline(desc)`，深度行为全靠 DepthState/RasterState。
-#include "magicblocks/features/stack/stack_render.h"
+#include "mb_internal/magicblocks/features/stack/stack_render.h"
 
 #include <algorithm>
 #include <cassert>
@@ -10,9 +10,9 @@
 #include <cstdio>
 #include <cstring>
 
-#include "magicblocks/primitives/mesh.h"
-#include "magicblocks/primitives/mesh_factory.h"
-#include "magicblocks/primitives/types.h"
+#include "mb_internal/magicblocks/primitives/mesh.h"
+#include "mb_internal/magicblocks/primitives/mesh_factory.h"
+#include "mb_internal/magicblocks/primitives/types.h"
 // 生成出来的着色器字节（与 l3_cli 用的是同一份，保证像素口径一致）。
 #include "magicblocks_shaders.h"
 

@@ -2,16 +2,16 @@
 //
 // 一律使用公共接口：建管线走 create_pipeline(desc)，收集走 IOverlay2D，
 // 录制走 ICommandList 的标准序列。没有任何后端私有头。
-#include "magicblocks/features/stack/grid_overlay.h"
+#include "mb_internal/magicblocks/features/stack/grid_overlay.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <vector>
 
-#include "magicblocks/primitives/alloc.h"
-#include "magicblocks/resources/command.h"
-#include "magicblocks/resources/pipeline.h"
+#include "mb_internal/magicblocks/primitives/alloc.h"
+#include "mb_internal/magicblocks/resources/command.h"
+#include "mb_internal/magicblocks/resources/pipeline.h"
 #include "magicblocks_shaders.h"
 
 namespace magicblocks::features::stack {

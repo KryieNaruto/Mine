@@ -8,10 +8,10 @@
 #include <cmath>
 #include <set>
 
-#include "magicblocks/primitives/camera.h"
-#include "magicblocks/primitives/material.h"
-#include "magicblocks/primitives/shader_library.h"
-#include "magicblocks/primitives/types.h"
+#include "mb_internal/magicblocks/primitives/camera.h"
+#include "mb_internal/magicblocks/primitives/material.h"
+#include "mb_internal/magicblocks/primitives/shader_library.h"
+#include "mb_internal/magicblocks/primitives/types.h"
 
 namespace mbp = magicblocks::primitives;
 using mbp::ICamera;

@@ -12,7 +12,7 @@
 #include <cstring>
 #include <vector>
 
-#include "backend/vulkan/vulkan_ui_overlay.h"
+#include "core/device_ops.h"
 #include "overlay_impl.h"
 #include "ui_app_internal.h"
 
@@ -21,7 +21,7 @@ namespace magicblocks::ui {
 OffscreenTargetRenderer::OffscreenTargetRenderer() = default;
 OffscreenTargetRenderer::~OffscreenTargetRenderer() = default;
 
-bool OffscreenTargetRenderer::attach(backend::VulkanFrameRenderer* renderer) {
+bool OffscreenTargetRenderer::attach(core::OffscreenFrameRenderer* renderer) {
   if (!renderer) return false;
   renderer_ = renderer;
   return true;
@@ -42,7 +42,7 @@ bool OffscreenTargetRenderer::present(UiApp& app, u32 width, u32 height, std::ui
   // **必须检查 append_* 的返回值**:实例容量不足时后端会返回 Unsupported。
   // 曾经这里忽略返回值,于是容量为 0 时每一帧的图元全部被静默丢弃,
   // 离屏出图是纯透明空图,而调用方毫无察觉。
-  auto& pass = renderer_->overlay_pass();
+  auto& pass = *renderer_;
   pass.reset_instances();
   for (const auto& p : internal->overlay().primitives()) {
     const float r = static_cast<float>(p.color.r) / 255.f;

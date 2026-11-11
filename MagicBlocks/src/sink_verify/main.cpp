@@ -13,19 +13,17 @@
 #include <string>
 #include <vector>
 
-#include "backend/vulkan/vulkan_render_device.h"
-#include "backend/vulkan/vulkan_target.h"
-#include "backend/vulkan/vulkan_ui_overlay.h"
+#include "core/device_ops.h"
 #include "core/image_io.h"
-#include "magicblocks/device/render_device.h"
-#include "magicblocks/resources/command.h"
-#include "magicblocks/ui/frame_renderer.h"
-#include "magicblocks/ui/ui_app.h"
+#include "mb_internal/magicblocks/device/render_device.h"
+#include "mb_internal/magicblocks/resources/command.h"
+#include "mb_internal/magicblocks/ui/frame_renderer.h"
+#include "mb_internal/magicblocks/ui/ui_app.h"
 #include "ui/offscreen_target.h"
 
 namespace ui = magicblocks::ui;
 namespace dev = magicblocks::device;
-namespace backend = magicblocks::backend;
+namespace core = magicblocks::core;
 
 namespace {
 
@@ -37,9 +35,13 @@ dev::DeviceDesc software_device() {
 }
 
 // 真实的外部 surface：由"壳层"持有，SDK 只往里画，不拥有它的生命周期。
+//
+// t9：这里以前直接收 `backend::OffscreenTarget*`，于是验证工具反向依赖后端实现类。
+// 现在只收 `dev::IRenderTarget*` —— `extent()` / `color_format()` 本来就在公共面上，
+// 它需要的正是这两件事，没有任何理由认识具体后端。
 class VerifySurfaceSink final : public ui::ISceneFrameSink {
  public:
-  VerifySurfaceSink(dev::IRenderDevice* device, backend::OffscreenTarget* target)
+  explicit VerifySurfaceSink(dev::IRenderDevice* device, dev::IRenderTarget* target)
       : device_(device), target_(target) {}
 
   dev::Extent2D extent() const override { return target_->extent(); }
@@ -77,7 +79,7 @@ class VerifySurfaceSink final : public ui::ISceneFrameSink {
 
  private:
   dev::IRenderDevice* device_;
-  backend::OffscreenTarget* target_;
+  dev::IRenderTarget* target_;
   ui::u64 next_id_ = 0;
 };
 
@@ -107,22 +109,22 @@ int main(int argc, char** argv) {
   }
   std::unique_ptr<dev::IRenderTarget> target = tgt_r.take();
 
-  auto* off = dynamic_cast<backend::OffscreenTarget*>(target.get());
-  if (!off) {
-    std::fprintf(stderr, "FAIL: 离屏目标类型不符\n");
+  // t9:离屏帧渲染器由 core 的工厂返回不透明句柄,本工具不认识后端类型。
+  auto renderer_r = core::create_offscreen_frame_renderer(device.get(), target.get());
+  if (!renderer_r.ok()) {
+    std::fprintf(stderr, "FAIL: 创建离屏帧渲染器失败: %s\n", renderer_r.message().c_str());
     return 1;
   }
-  auto ctx = static_cast<backend::VulkanRenderDevice*>(device.get())->context();
-  backend::VulkanFrameRenderer renderer(ctx, off);
+  std::unique_ptr<core::OffscreenFrameRenderer> renderer = renderer_r.take();
   // 离屏出图走正规路径：OffscreenTargetRenderer 会把 UiApp 产出的图元交给后端。
   ui::OffscreenTargetRenderer offscreen_host;
-  if (!offscreen_host.attach(&renderer)) {
+  if (!offscreen_host.attach(renderer.get())) {
     std::fprintf(stderr, "FAIL: OffscreenTargetRenderer::attach\n");
     return 1;
   }
 
   // 3) 壳层侧的 sink 实现
-  VerifySurfaceSink sink(device.get(), off);
+  VerifySurfaceSink sink(device.get(), target.get());
 
   // 4) UiApp 走完整路径
   ui::UiAppConfig cfg;

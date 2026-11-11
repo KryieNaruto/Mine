@@ -7,7 +7,7 @@
 
 #include <vector>
 
-#include "magicblocks/primitives/primitive_renderer.h"
+#include "mb_internal/magicblocks/primitives/primitive_renderer.h"
 
 namespace mbp = magicblocks::primitives;
 

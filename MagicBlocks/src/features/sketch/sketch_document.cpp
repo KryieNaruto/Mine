@@ -1,5 +1,5 @@
 // MagicBlocks L4 —— 魔法涂鸦：文档模型实现（F-SK 基座）
-#include "magicblocks/features/sketch/sketch_document.h"
+#include "mb_internal/magicblocks/features/sketch/sketch_document.h"
 
 #include <cmath>
 #include <cstring>

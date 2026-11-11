@@ -127,41 +127,69 @@ elseif(UNIX AND NOT APPLE)
     src/backend/vulkan/vulkan_swapchain_win32_stub.cpp)
 endif()
 
-add_library(magicblocks STATIC
-  include/magicblocks/device/types.h
-  include/magicblocks/device/result.h
-  include/magicblocks/device/events.h
-  include/magicblocks/device/lifecycle.h
-  include/magicblocks/device/render_device.h
-  include/magicblocks/device/swapchain.h
-  include/magicblocks/device/render_target.h
-  include/magicblocks/device/frame_sync.h
-  include/magicblocks/resources/handles.h
-  include/magicblocks/resources/memory.h
-  include/magicblocks/resources/buffer.h
-  include/magicblocks/resources/texture.h
-  include/magicblocks/resources/pipeline.h
-  include/magicblocks/resources/command.h
+# ============================================================================
+# 【UI 边界】—— 这一段定义"UI 能看到什么"，是本文件里唯一与 UI⇄SDK 拆分
+# 相关的部分。判据是老板的一句话：
+#
+#     "UI 只依赖 DLL + 一个 include 头文件。UI 更新和 SDK 更新无关。"
+#
+# 落地成三个目标，职责严格分开：
+#
+#   magicblocks_objects  OBJECT  —— 全部 SDK 内部 TU，只编一次。
+#                                  include 面全是 PRIVATE：UI 拿不到任何内部头。
+#
+#   magicblocks_shared   SHARED  —— ★ UI 的唯一产物 ★
+#                                  = objects + C ABI 实装(capi/android)
+#                                  PUBLIC include 只有 include/magicblocks/
+#                                  （里面只有一个 mb_capi.h）
+#                                  导出面 = mb_capi.h 里的 27 个 MB_API 裸名
+#                                  → Windows: magicblocks.dll + magicblocks.lib
+#                                  → Android: 由 magicblocks_jni 产出同名 .so
+#
+#   magicblocks          STATIC  —— 白盒测试/CLI 用的静态变体。
+#                                  **不是 UI 的产物**：它没有导出面限制，
+#                                  586 条测试要够到 SDK 内部，只能链它。
+#
+# 为什么必须拆成 OBJECT 而不是让 SHARED/STATIC 各写一份源文件列表：
+#   两份列表会在第一次有人只改其中一份时悄悄分叉（今天改 A、明天改 B），
+#   于是"UI 用的 DLL"和"测试用的静态库"编译的不是同一份代码 —— 那种分叉
+#   不会编译失败，只会让测试绿而 DLL 坏。OBJECT 库保证物理上只有一份目标文件。
+# ============================================================================
+
+add_library(magicblocks_objects OBJECT
+  include/mb_internal/magicblocks/device/types.h
+  include/mb_internal/magicblocks/device/result.h
+  include/mb_internal/magicblocks/device/events.h
+  include/mb_internal/magicblocks/device/lifecycle.h
+  include/mb_internal/magicblocks/device/render_device.h
+  include/mb_internal/magicblocks/device/swapchain.h
+  include/mb_internal/magicblocks/device/render_target.h
+  include/mb_internal/magicblocks/device/frame_sync.h
+  include/mb_internal/magicblocks/resources/handles.h
+  include/mb_internal/magicblocks/resources/memory.h
+  include/mb_internal/magicblocks/resources/buffer.h
+  include/mb_internal/magicblocks/resources/texture.h
+  include/mb_internal/magicblocks/resources/pipeline.h
+  include/mb_internal/magicblocks/resources/command.h
   # --- L2 场景层(spec §4 L2 S1-S9):公开头 ---
-  include/magicblocks/scene/types.h
-  include/magicblocks/scene/scene.h
-  include/magicblocks/scene/submit_queue.h
-  include/magicblocks/scene/render_graph.h
-  include/magicblocks/scene/command_stream.h
-  include/magicblocks/scene/feature.h
-  include/magicblocks/scene/recorder.h
+  include/mb_internal/magicblocks/scene/types.h
+  include/mb_internal/magicblocks/scene/scene.h
+  include/mb_internal/magicblocks/scene/submit_queue.h
+  include/mb_internal/magicblocks/scene/render_graph.h
+  include/mb_internal/magicblocks/scene/command_stream.h
+  include/mb_internal/magicblocks/scene/feature.h
+  include/mb_internal/magicblocks/scene/recorder.h
   # --- UI 消费层(spec ui-consumer-design §2):公开头 ---
-  include/magicblocks/ui/types.h
-  include/magicblocks/ui/sdk_stub.h
-  include/magicblocks/ui/scene_stub.h
-  include/magicblocks/ui/overlay.h
-  include/magicblocks/ui/frame_renderer.h
-  include/magicblocks/ui/input.h
-  include/magicblocks/ui/hud.h
-  include/magicblocks/ui/router.h
-  include/magicblocks/ui/perf.h
-  include/magicblocks/ui/frame_renderer.h
-  include/magicblocks/ui/ui_app.h
+  include/mb_internal/magicblocks/ui/types.h
+  include/mb_internal/magicblocks/ui/sdk_stub.h
+  include/mb_internal/magicblocks/ui/scene_stub.h
+  include/mb_internal/magicblocks/ui/overlay.h
+  include/mb_internal/magicblocks/ui/frame_renderer.h
+  include/mb_internal/magicblocks/ui/input.h
+  include/mb_internal/magicblocks/ui/hud.h
+  include/mb_internal/magicblocks/ui/router.h
+  include/mb_internal/magicblocks/ui/perf.h
+  include/mb_internal/magicblocks/ui/ui_app.h
   src/backend/vulkan/vk_common.h
   src/backend/vulkan/vulkan_instance.h
   src/backend/vulkan/vulkan_instance.cpp
@@ -241,12 +269,16 @@ add_library(magicblocks STATIC
   src/primitives/picker.cpp
   src/primitives/gizmo.cpp
   # L3 方向背景(sky):相机朝向相关的通用原语(不含玩法语义)
-  include/magicblocks/primitives/sky.h
+  include/mb_internal/magicblocks/primitives/sky.h
   src/primitives/sky.cpp
   # L3 预设模型目录:扫描/加载/上传(模型名是数据,UI 不认识)
-  include/magicblocks/primitives/model_catalog.h
+  include/mb_internal/magicblocks/primitives/model_catalog.h
   src/primitives/model_catalog.cpp
   src/core/device_factory.cpp
+  # core 对"后端私有能力"的唯一转发面(按采样数建链/按交换链形状建管线/实际采样数/旋转角)。
+  # 它同时也是 G3 唯一允许出现 backend:: 的非 backend 文件(见 tools/check_layer_purity.py)。
+  src/core/device_ops.h
+  src/core/device_ops.cpp
   src/core/image_io.h
   src/core/image_io.cpp
   # L1: pipeline-factory indirection (G8) - plain value table, no backend/Vk symbols
@@ -265,7 +297,31 @@ add_library(magicblocks STATIC
   src/features/stack/stack_command.cpp
   src/features/stack/stack_session.cpp
   ${MB_SHADER_HEADER})
-target_include_directories(magicblocks PUBLIC include PRIVATE src ${CMAKE_CURRENT_BINARY_DIR} ${MB_VMA_INCLUDE})
+
+# ⚠️ include/ 整棵只出现在 PRIVATE 面。
+#    PUBLIC 里**没有** include/ 整棵 —— 这是"UI 看不到内部头"的物理保证：
+#    内部头在 include/mb_internal/ 下，只有 MB_COMMON_INCLUDE_DIRS
+#    （= OBJECT 库 / STATIC / JNI 的 PRIVATE 面）才够得到，
+#    那个变量绝不被任何 UI 目标继承。
+#
+# ⚠️ 这里为什么还要写 Vulkan 的 include 目录：
+#    vk_common.h 里是 `#include <vulkan/vulkan.h>`（尖括号）。
+#    Vulkan::Vulkan 的 INTERFACE_INCLUDE_DIRECTORIES 是 SYSTEM 属性，
+#    MSVC 会把它翻译成 /external:I，而 /external:I **只**在显式加了
+#    /external:anglebrackets 时才被尖括号搜索。不加就会得到
+#    "C1083: 无法打开包括文件: vulkan/vulkan.h"。
+#    PUBLIC 的 Vulkan::Vulkan 链接方式下方仍然保留（给消费者传链接依赖），
+#    但编译期头搜索路径这里用普通 -I 补一遍。
+set(MB_VULKAN_INCLUDE "")
+if(NOT ANDROID AND TARGET Vulkan::Vulkan)
+  get_target_property(_vk_interface_incs Vulkan::Vulkan INTERFACE_INCLUDE_DIRECTORIES)
+  if(_vk_interface_incs)
+    set(MB_VULKAN_INCLUDE ${_vk_interface_incs})
+  endif()
+endif()
+
+# tess2：网格三角化（mesh_factory.cpp 用 `#include <tesselator.h>`）。
+# 这一节必须在 magicblocks_objects 之前：OBJECT 库的源码里直接 include 了它。
 # Android：池里的 tess2 是 Windows 二进制，不能链进 arm64。直接从源码编。
 if(ANDROID)
   set(_tess2_root "${MINE_ROOT}/third_party/_src/libtess2-v1.0.2")
@@ -303,28 +359,143 @@ if(NOT ANDROID)
   endif()
 endif()
 
-if(ANDROID)
-  target_link_libraries(magicblocks PUBLIC vulkan PRIVATE ${_tess2_lib})
-else()
-  target_link_libraries(magicblocks PUBLIC Vulkan::Vulkan PRIVATE ${_tess2_lib})
-endif()
-target_include_directories(magicblocks PRIVATE ${_tess2_inc})
+# 内部头搜索面：OBJECT 库、STATIC、SHARED 的 PRIVATE 面、JNI 目标共用这一份，
+# 避免四处列表各自演化。里面**全是** UI 不该看到的东西：
+#   include/            ← 契约头本身（mb_internal/ 是它的子目录）
+#   include/mb_internal ← 62 个内部头的物理落点
+#   src/                ← 后端/场景/原语的所有私有头
+# 这个变量**绝不会**被挂到任何 PUBLIC/INTERFACE 上 —— 那是本文件的核心约束。
+set(MB_COMMON_INCLUDE_DIRS
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/include/mb_internal
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_BINARY_DIR}
+  ${MB_VMA_INCLUDE}
+  ${MB_VULKAN_INCLUDE}
+  ${_tess2_inc})
 
-# 平台 surface:VK_USE_PLATFORM_* 决定实例层追加哪个 surface 扩展
+# --- 平台 surface 编译宏：OBJECT 库和两个变体都要 ---------------------------
+# ⚠️ 这几条宏**必须**落在 magicblocks_objects 上：
+#   vulkan.h 里 `#ifdef VK_USE_PLATFORM_WIN32_KHR #include "vulkan_win32.h"` ——
+#   宏没定义时 create_win32_surface 的函数体整个被 #if 编掉，
+#   于是 OBJECT 里一个符号都不产生，最终 SHARED 链接报 LNK2019。
+#   只在 SHARED/STATIC 上定义是**不够**的：那两个目标只是转述链接依赖，
+#   真正的 TU 归属于 OBJECT 库。
+# VK_USE_PLATFORM_* 决定实例层追加哪个 surface 扩展。
 if(ANDROID)
   # ANativeWindow 来自 NDK sysroot；surface 扩展在 backend/vulkan/vulkan_swapchain_android.cpp
   # MB_ANDROID_USE_NDK 是**编译宏**（决定走真实 NDK 路径还是 stub 声明），
   # 与同名 CMake 变量是两回事：只传 -D 变量不会让源码看到它。
-  target_compile_definitions(magicblocks PRIVATE
-    VK_USE_PLATFORM_ANDROID_KHR
-    MB_ANDROID_USE_NDK)
+  set(MB_SURFACE_PLATFORM_DEFS VK_USE_PLATFORM_ANDROID_KHR MB_ANDROID_USE_NDK)
 elseif(WIN32)
-  target_compile_definitions(magicblocks PRIVATE VK_USE_PLATFORM_WIN32_KHR)
+  set(MB_SURFACE_PLATFORM_DEFS VK_USE_PLATFORM_WIN32_KHR)
 elseif(UNIX AND NOT APPLE)
-  target_compile_definitions(magicblocks PRIVATE VK_USE_PLATFORM_XCB_KHR)
+  set(MB_SURFACE_PLATFORM_DEFS VK_USE_PLATFORM_XCB_KHR)
 else()
   message(FATAL_ERROR "MagicBlocks 本轮只支持 Windows / Linux / Android(iOS 只做设计考虑)")
 endif()
+# 非 Android 平台若显式 -DMB_ANDROID_USE_NDK=ON，也切到真实 NDK 声明路径。
+if(MB_ANDROID_USE_NDK AND NOT ANDROID)
+  list(APPEND MB_SURFACE_PLATFORM_DEFS MB_ANDROID_USE_NDK)
+endif()
+
+target_include_directories(magicblocks_objects PRIVATE ${MB_COMMON_INCLUDE_DIRS})
+target_compile_definitions(magicblocks_objects PRIVATE ${MB_SURFACE_PLATFORM_DEFS})
+
+# --- SHARED：UI 的唯一产物 ------------------------------------------------
+# 只有两个来源：
+#   ① magicblocks_objects 的全部对象（同一份目标文件，不重编）
+#   ② C ABI 边界那一层：mb_capi.cpp(27 个入口实装) + android 壳
+# 导出面由 mb_capi.h 的 MB_API 决定（库内侧 = dllexport / visibility default），
+# 因此这里**必须**定义 MB_CAPI_BUILDING_LIBRARY，否则 MB_API 会解析成
+# dllimport，链接期直接 LNK2001/LNK2019。
+add_library(magicblocks_shared SHARED
+  src/capi/mb_capi.cpp
+  src/android/scene_renderer.cpp
+  $<TARGET_OBJECTS:magicblocks_objects>)
+
+# 产物名：桌面 Windows = magicblocks.dll + magicblocks.lib，
+# 与 Android 侧 magicblocks_jni 的 libmagicblocks.so 同名 ——
+# UI 侧无论哪个平台看到的都是"一个叫 magicblocks 的动态库"。
+set_target_properties(magicblocks_shared PROPERTIES OUTPUT_NAME "magicblocks")
+
+# ★ UI 边界：PUBLIC include 只有 include/magicblocks/ 这一个子目录。
+#   刻意**不写** `include`（整棵）——写成整棵就等于把 include/mb_internal/
+#   一起送给 UI，门控 tools/check_ui_isolation.py 会判红（is_whole_include_dir：
+#   只要片段以 "include" 结尾就红）。
+#   ${CMAKE_CURRENT_SOURCE_DIR}/include/magicblocks 下只有 mb_capi.h 一个文件。
+#
+#   ⚠️ 配套约束：CMake 的 PUBLIC 面是 include/magicblocks，所以**构建期**消费
+#   本工程 target 的 TU 写 `#include "mb_capi.h"`；而**出厂**给 UI 的导出面
+#   （tools/ui_isolation.ps1 + check_ui_isolation.py 的 UI_CONSUMER）是
+#   `<导出面>/magicblocks/mb_capi.h` + `-I <导出面>`，写的是
+#   `#include "magicblocks/mb_capi.h"`。两种写法指向同一个文件，
+#   后者才是"UI 拿到 dll + include 树"时的真实形态。
+target_include_directories(magicblocks_shared
+  PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/magicblocks
+  PRIVATE
+    ${MB_COMMON_INCLUDE_DIRS})
+
+# 库内侧：MB_API → dllexport / __attribute__((visibility("default")))
+target_compile_definitions(magicblocks_shared PRIVATE MB_CAPI_BUILDING_LIBRARY)
+
+# 只导出 MB_API 标注过的东西。Windows 上**关掉** WINDOWS_EXPORT_ALL_SYMBOLS：
+# 那是"把每个全局符号都导出"的开关，等于把 SDK 内部面整个送给 UI。
+if(WIN32)
+  set_target_properties(magicblocks_shared PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS OFF)
+endif()
+# 非 Windows：默认隐藏，只有显式 visibility("default")（= MB_API）才导出。
+# 少了这一句，libmagicblocks.so 会把所有 extern 符号导出去。
+set_target_properties(magicblocks_shared PROPERTIES
+  CXX_VISIBILITY_PRESET hidden
+  C_VISIBILITY_PRESET hidden
+  VISIBILITY_INLINES_HIDDEN ON)
+
+# --- STATIC：白盒测试 / CLI 的变体（**不是** UI 的产物）-------------------
+# 同一批对象 + 同样的 C ABI TU。它没有导出面限制：586 条测试要够到 SDK
+# 内部符号（IRenderDevice/VulkanRenderDevice/...），只能链静态库。
+#
+# ⚠️ 目标名是 magicblocks_static，**产物名**仍是 magicblocks.lib —— 但这样会和
+#    DLL 的导入库 magicblocks.lib 撞名（ninja: multiple rules generate ...）。
+#    所以产物名退成 magicblocks_static.lib，而**目标名 magicblocks** 由下面的
+#    ALIAS 保留：所有既有的 target_link_libraries(... magicblocks) 一行都不用改。
+add_library(magicblocks_static STATIC
+  src/capi/mb_capi.cpp
+  src/android/scene_renderer.cpp
+  $<TARGET_OBJECTS:magicblocks_objects>)
+# 兼容别名：382 处既有 target_link_libraries(xxx magicblocks) 继续有效。
+# ALIAS 只能用于链接，不能 get_target_property/set_target_properties ——
+# 所以下面所有属性设置都写在 magicblocks_static 上。
+add_library(magicblocks ALIAS magicblocks_static)
+# 静态库不产生导出面，MB_CAPI_BUILDING_LIBRARY 仍然要定义：
+# mb_capi.cpp 是实装侧，不能让 MB_API 退化成 dllimport。
+target_compile_definitions(magicblocks_static PRIVATE MB_CAPI_BUILDING_LIBRARY)
+target_include_directories(magicblocks_static PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/include/mb_internal
+  PRIVATE
+  ${MB_COMMON_INCLUDE_DIRS})
+
+# --- 共享的链接/编译要求：SHARED 和 STATIC 都要 ------------------------------
+# 两个变体编的是同一批源码，依赖也必须一模一样 —— 否则会出现"测试绿的静态库
+# 能链、UI 用的 DLL 链不过"这种只有真实消费者才发现的偏差。
+# 用一个函数集中一次，两个目标各自调用，避免两处列表再次分叉。
+# 注意：这里**只**给链接依赖与平台宏的转述。真正的 TU 属于 magicblocks_objects，
+# 那边的平台宏在上面已经一次性给全了（少了它 create_win32_surface 会被 #if 编掉）。
+function(mb_apply_vulkan_requirements _target)
+  if(ANDROID)
+    target_link_libraries(${_target} PUBLIC vulkan PRIVATE ${_tess2_lib})
+  else()
+    target_link_libraries(${_target} PUBLIC Vulkan::Vulkan PRIVATE ${_tess2_lib})
+  endif()
+  target_include_directories(${_target} PRIVATE ${_tess2_inc})
+  # 自身也编 C ABI TU（mb_capi.cpp / scene_renderer.cpp），它们同样 include vulkan.h。
+  target_compile_definitions(${_target} PRIVATE ${MB_SURFACE_PLATFORM_DEFS})
+endfunction()
+
+mb_apply_vulkan_requirements(magicblocks_shared)
+mb_apply_vulkan_requirements(magicblocks_static)
 
 # --- Android TU 编译校验(A7 / Swapchain.AndroidTuCompiles) ---
 # vulkan_swapchain_android.cpp **始终**参与 magicblocks 的编译(见上面的源码列表),
@@ -333,10 +504,6 @@ endif()
 #   - 无 NDK → src/backend/vulkan/stub/anativewindow.h 提供 ANativeWindow 前置声明
 # 不需要额外的 object 目标:该 TU 已经在库里,编译失败会直接让整个 SDK 构建失败。
 # 非 Android 平台若显式 -DMB_ANDROID_USE_NDK=ON，也切到真实 NDK 声明路径。
-if(MB_ANDROID_USE_NDK AND NOT ANDROID)
-  target_compile_definitions(magicblocks PRIVATE MB_ANDROID_USE_NDK)
-endif()
-
 option(MB_ANDROID_TU_COMPILE_CHECK "断言 vulkan_swapchain_android.cpp 参与编译校验" ON)
 if(NOT MB_ANDROID_TU_COMPILE_CHECK)
   message(FATAL_ERROR "MB_ANDROID_TU_COMPILE_CHECK=OFF 会让 Android 分支失去编译校验(违反 A7),本轮不允许关闭")
@@ -455,23 +622,64 @@ endif()
 
 endif()  # NOT ANDROID（桌面可执行程序）
 
+# ============================================================================
+# 【UI 边界 · 消费者探针】—— 边界是否真的存在，由这个可执行文件证明。
+#
+# tools/uisplit/probe_consumer.cpp 扮演"第三方 UI"：
+#   - 源码里只有一句 #include "magicblocks/mb_capi.h"
+#   - 它 **只** 链 magicblocks_shared（动态库），不链 STATIC，不拿 src/，
+#     也**不**手动加 include 目录 —— 头文件搜索路径完全由
+#     magicblocks_shared 的 PUBLIC include 面提供。
+#     这一条是关键：如果哪天有人手滑把 include/ 整棵挂回 PUBLIC，
+#     探针自己不会红（它照样编得过），但 check_ui_isolation.py 会红；
+#     反过来若 PUBLIC 面被删空，探针立刻编不过。
+#   - 它不装 DLL：ctest 用 $<TARGET_FILE_DIR:magicblocks_shared> 当工作目录，
+#     这就是"UI 拿到 dll + .h 就能跑"的最小复现。
+# ============================================================================
+add_executable(magicblocks-capi-probe tools/uisplit/probe_consumer.cpp)
+target_link_libraries(magicblocks-capi-probe PRIVATE magicblocks_shared)
+if(NOT WIN32)
+  # Linux：让探针在构建目录里直接跑起来（Android 侧不走这条可执行程序）
+  target_link_options(magicblocks-capi-probe PRIVATE
+    "-Wl,-rpath,$<TARGET_FILE_DIR:magicblocks_shared>")
+endif()
+
 # --- Android：JNI 层 .so（给 pad 上的 Compose/SurfaceView 用）---
 if(ANDROID)
+  # 【UI 边界 · Android 侧】
+  #   桌面上 UI 的产物是 magicblocks.dll（magicblocks_shared）。
+  #   Android 上同名产物由本目标交付：libmagicblocks.so。
+  #   为什么不直接复用 magicblocks_shared：两者 OUTPUT_NAME 都是 "magicblocks"，
+  #   同一个 ABI 目录里会出现两个 libmagicblocks.so，构建期即冲突。
+  #   本目标**内联**编译 C ABI 实装（src/capi/mb_capi.cpp）而不是链 shared，
+  #   所以它的导出面同样只有 mb_capi.h 里的 MB_API 裸名 —— 对内不用 dllexport，
+  #   它自己就是那一层。
   add_library(magicblocks_jni SHARED
+    src/capi/mb_capi.cpp
     src/android/scene_renderer.cpp
     src/android/jni_bridge.cpp)
+  # ⚠️ PRIVATE only：Android UI(Kotlin) 拿到的是**预编译 .so + mb_capi.h 的拷贝**，
+  #    不是 CMake 的 include 面。这里一旦挂 PUBLIC/INTERFACE include，
+  #    tools/check_ui_isolation.py 的 check_cmake_public_includes 会直接判红。
   target_include_directories(magicblocks_jni PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${CMAKE_CURRENT_BINARY_DIR})
-  target_link_libraries(magicblocks_jni PRIVATE magicblocks android log)
+    ${MB_COMMON_INCLUDE_DIRS}
+    ${_tess2_inc})
+  target_link_libraries(magicblocks_jni PRIVATE magicblocks android vulkan ${_tess2_lib})
   # MB_ANDROID_USE_NDK 必须给到 JNI target：jni_bridge.cpp 里
   # nativeWindowFromSurface 用 #if defined(MB_ANDROID_USE_NDK) 才调用真的
   # ANativeWindow_fromSurface；上层的同名编译定义只作用于 magicblocks target，
   # 不会传染到顶层可执行/库，所以这里必须重复一次。
+  # MB_CAPI_BUILDING_LIBRARY：mb_capi.cpp 在本目标里是实装侧，
+  # 否则 MB_API 退化成 dllimport，链接期 LNK2019。
   target_compile_definitions(magicblocks_jni PRIVATE
     VK_USE_PLATFORM_ANDROID_KHR
-    MB_ANDROID_USE_NDK)
-  set_target_properties(magicblocks_jni PROPERTIES OUTPUT_NAME "magicblocks")
+    MB_ANDROID_USE_NDK
+    MB_CAPI_BUILDING_LIBRARY)
+  set_target_properties(magicblocks_jni PROPERTIES
+    OUTPUT_NAME "magicblocks"
+    CXX_VISIBILITY_PRESET hidden
+    C_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON)
 endif()
 
 if(MB_BUILD_TESTS)
@@ -522,7 +730,14 @@ add_executable(magicblocks_test
   # 而 Vk* 类型只允许出现在 src/backend/**(G3),所以它住在 src 下。
   src/backend/vulkan/msaa_render_pass_test.cpp)
 target_link_libraries(magicblocks_test PRIVATE magicblocks GTest::gtest GTest::gtest_main)
-target_include_directories(magicblocks_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_BINARY_DIR})
+# 白盒测试够内部头：include/mb_internal/ 是**显式**要来的，不是从 magicblocks
+# 继承来的。magicblocks(STATIC) 的 PUBLIC 面本来就给这两个目录，
+# 这里写死一份是为了让"测试能 include 内部头"这件事在测试目标上可见，
+# 而不是隐式依赖静态库的 usage requirements。
+target_include_directories(magicblocks_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/include/mb_internal
+  ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_BINARY_DIR})
 if(WIN32)
   target_compile_definitions(magicblocks_test PRIVATE VK_USE_PLATFORM_WIN32_KHR)
 elseif(UNIX AND NOT APPLE)
@@ -571,6 +786,21 @@ add_test(NAME magicblocks_gate_uig2_single_submit
   COMMAND ${MB_PY} ${MINE_ROOT}/tools/check_ui_single_submit.py --root ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME magicblocks_gate_ui_scripts_selftest
   COMMAND ${MB_PY} -m unittest discover -s ${MINE_ROOT}/tools/tests -p "test_ui_check_scripts.py")
+
+# --- UI 边界门控:C ABI 隔离(阶段 5 的验收本体) ---
+# ⚠️ 脚本在 **MagicBlocks/tools/** 下,不在仓根 tools/ —— 其余门控脚本
+#    (check_layer_purity.py 等)在仓根,两条路径别抄错。写错了 ctest 报的是
+#    "can't open file",看起来像门控不通过,其实是路径不存在。
+add_test(NAME magicblocks_gate_ui_isolation
+  COMMAND ${MB_PY} ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_ui_isolation.py
+          --magicblocks ${CMAKE_CURRENT_SOURCE_DIR}
+          --build-dir ${CMAKE_CURRENT_BINARY_DIR})
+# 消费者探针:只 include mb_capi.h、只链动态库、在 dll 旁边跑通一次完整握手。
+# 这是"UI 只依赖 DLL + 一个头文件"的运行期证据,不是静态扫描。
+add_test(NAME magicblocks_capi_probe
+  COMMAND magicblocks-capi-probe)
+set_tests_properties(magicblocks_capi_probe PROPERTIES
+  WORKING_DIRECTORY $<TARGET_FILE_DIR:magicblocks_shared>)
 
 # --- CLI 级 CTest:端到端(无窗口离屏) ---
 set(MB_CLI_OUT "${CMAKE_CURRENT_BINARY_DIR}/cli_out")

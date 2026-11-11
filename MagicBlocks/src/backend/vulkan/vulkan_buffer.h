@@ -33,9 +33,9 @@
 
 #include "backend/vulkan/vk_common.h"
 #include "backend/vulkan/vulkan_allocator.h"
-#include "magicblocks/device/result.h"
-#include "magicblocks/resources/buffer.h"
-#include "magicblocks/resources/memory.h"
+#include "mb_internal/magicblocks/device/result.h"
+#include "mb_internal/magicblocks/resources/buffer.h"
+#include "mb_internal/magicblocks/resources/memory.h"
 // VulkanContext / backend::Status 别名来自 L0 的后端公共头(必须在 resources 头之后,
 // 这样 backend::Status 才不会抢在 device::Status 的声明之前被当成类型使用)。
 #include "backend/vulkan/vulkan_target.h"

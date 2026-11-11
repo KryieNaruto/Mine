@@ -21,13 +21,13 @@
 #include <cstring>
 #include <vector>
 
-#include "magicblocks/device/events.h"
-#include "magicblocks/features/sketch/sketch_canvas.h"
-#include "magicblocks/features/sketch/sketch_document.h"
-#include "magicblocks/features/sketch/sketch_pipeline.h"
-#include "magicblocks/primitives/camera.h"
-#include "magicblocks/primitives/painter.h"
-#include "magicblocks/primitives/types.h"
+#include "mb_internal/magicblocks/device/events.h"
+#include "mb_internal/magicblocks/features/sketch/sketch_canvas.h"
+#include "mb_internal/magicblocks/features/sketch/sketch_document.h"
+#include "mb_internal/magicblocks/features/sketch/sketch_pipeline.h"
+#include "mb_internal/magicblocks/primitives/camera.h"
+#include "mb_internal/magicblocks/primitives/painter.h"
+#include "mb_internal/magicblocks/primitives/types.h"
 
 namespace mb = magicblocks;
 namespace sk = magicblocks::features::sketch;

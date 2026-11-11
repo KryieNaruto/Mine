@@ -11,13 +11,13 @@
 //
 // 手势在"抬起"那一刻成型,结果**自包含**(只含数值,不含指针/时间引用),
 // 可直接进命令流;原始时间戳同时保留,满足 spec §7「手势结果 + 原始事件」。
-#include "magicblocks/ui/input.h"
+#include "mb_internal/magicblocks/ui/input.h"
 
 #include <algorithm>
 #include <cmath>
 #include <unordered_map>
 
-#include "magicblocks/ui/hud.h"
+#include "mb_internal/magicblocks/ui/hud.h"
 
 namespace magicblocks::ui {
 

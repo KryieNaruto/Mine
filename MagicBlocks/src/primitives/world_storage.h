@@ -19,7 +19,7 @@
 #include <string>
 #include <vector>
 
-#include "magicblocks/primitives/world.h"
+#include "mb_internal/magicblocks/primitives/world.h"
 
 namespace magicblocks::primitives {
 namespace detail {

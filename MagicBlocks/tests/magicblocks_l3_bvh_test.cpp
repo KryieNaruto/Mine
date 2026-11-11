@@ -19,9 +19,9 @@
 #include <memory>
 #include <vector>
 
-#include "magicblocks/primitives/camera.h"
-#include "magicblocks/primitives/picker.h"
-#include "magicblocks/primitives/types.h"
+#include "mb_internal/magicblocks/primitives/camera.h"
+#include "mb_internal/magicblocks/primitives/picker.h"
+#include "mb_internal/magicblocks/primitives/types.h"
 
 namespace mbp = magicblocks::primitives;
 

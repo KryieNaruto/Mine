@@ -20,14 +20,14 @@
 
 #include "backend/vulkan/vulkan_target.h"
 #include "core/image_io.h"
-#include "magicblocks/device/render_device.h"
-#include "magicblocks/primitives/camera.h"
-#include "magicblocks/primitives/sky.h"
-#include "magicblocks/primitives/types.h"
-#include "magicblocks/resources/buffer.h"
-#include "magicblocks/resources/command.h"
-#include "magicblocks/resources/memory.h"
-#include "magicblocks/resources/pipeline.h"
+#include "mb_internal/magicblocks/device/render_device.h"
+#include "mb_internal/magicblocks/primitives/camera.h"
+#include "mb_internal/magicblocks/primitives/sky.h"
+#include "mb_internal/magicblocks/primitives/types.h"
+#include "mb_internal/magicblocks/resources/buffer.h"
+#include "mb_internal/magicblocks/resources/command.h"
+#include "mb_internal/magicblocks/resources/memory.h"
+#include "mb_internal/magicblocks/resources/pipeline.h"
 #include "magicblocks_shaders.h"
 
 namespace dev = magicblocks::device;

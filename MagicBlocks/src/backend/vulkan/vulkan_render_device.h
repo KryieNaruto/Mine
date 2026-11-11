@@ -11,7 +11,7 @@
 #include "backend/vulkan/vulkan_instance.h"
 #include "backend/vulkan/vulkan_pipeline.h"
 #include "backend/vulkan/vulkan_target.h"
-#include "magicblocks/device/render_device.h"
+#include "mb_internal/magicblocks/device/render_device.h"
 namespace magicblocks::backend {
 
 // 前置声明：bind_known_buffers 只需要引用，不需要完整类型；
@@ -53,6 +53,30 @@ class VulkanRenderDevice final : public device::IRenderDevice {
   // G8 / t13: expose the shaped-pipeline factory to L3 through the L0 abstraction.
   // L1 keeps the resolver table (src/core/pipeline_factory_table.cpp); this device
   // only has to say "which factory belongs to me", so no static object is needed.
+  // ============================================================================
+  // 按交换链形状建管线(把 `backend::` / `VK_` 从**所有**调用方赶回 backend 内部)
+  // ============================================================================
+  //
+  // 为什么需要这条入口(G3 分层纯度门控抓出来的真实问题,不是洁癖):
+  //   src/android/scene_renderer.cpp 里原本要写
+  //       auto* vkdev = dynamic_cast<backend::VulkanRenderDevice*>(device.get());
+  //       backend::AttachmentShape shape{}; shape.from_swapchain = true; ...
+  //       vkdev->create_pipeline_for_shape(desc, shape);
+  //   也就是 android/ 这一层反向依赖了 backend/ 的实现类型与命名空间 ——
+  //   而 android/ 是最靠近 UI 的一层,它恰恰最不该知道"谁在实现渲染"。
+  //   G3 门控把这几行判红是对的:只要放开一次,后台一换后端就得改 UI 侧代码。
+  //
+  // 现在调用方只说一句"按这条交换链的形状建管线",形状怎么填(颜色格式/
+  // 采样数/from_swapchain/pass 的 initial-final layout)全在 backend 里决定。
+  // 参数:
+  //   desc        —— 管线描述(调用方给,不含附件形状)
+  //   chain       —— 交换链;实际生效的采样数由它自己报告(设备回退过就是回退值)
+  //   msaa_hint   —— 调用方**请求**的采样数,仅在 chain 不是本后端类型时用作兜底
+  //                  0/1 视为关闭 MSAA
+  device::Result<std::unique_ptr<resources::IPipeline>> create_swapchain_pipeline(
+      const resources::PipelineDesc& desc, const device::ISwapchain& chain,
+      std::uint32_t msaa_hint = 0);
+
   resources::IPipelineFactory* pipeline_factory() override {
     return resources::resolve_pipeline_factory(this);
   }

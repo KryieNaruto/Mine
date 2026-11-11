@@ -8,7 +8,7 @@
 //   3. **无文本图集就画文本占位条**:spec §9 明确不做系统键盘,字体图集是后续
 //      待办(本轮无 L3 纹理)。`label` 每字符一条短横线占位,保证"有文字的地方
 //      有可见且确定性的像素",golden 才能锁住布局。
-#include "magicblocks/ui/hud.h"
+#include "mb_internal/magicblocks/ui/hud.h"
 
 #include <algorithm>
 #include <cmath>

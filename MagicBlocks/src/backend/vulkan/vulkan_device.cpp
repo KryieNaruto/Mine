@@ -14,7 +14,7 @@
 #include <vector>
 
 #include "backend/vulkan/vulkan_resource_common.h"  // 按格式复核采样数(见 collect_msaa)
-#include "magicblocks/device/render_device.h"
+#include "mb_internal/magicblocks/device/render_device.h"
 
 namespace magicblocks::backend {
 

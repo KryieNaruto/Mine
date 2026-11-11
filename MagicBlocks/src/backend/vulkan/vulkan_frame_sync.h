@@ -6,7 +6,7 @@
 #include <vector>
 
 #include "backend/vulkan/vk_common.h"
-#include "magicblocks/device/frame_sync.h"
+#include "mb_internal/magicblocks/device/frame_sync.h"
 
 namespace magicblocks::backend {
 

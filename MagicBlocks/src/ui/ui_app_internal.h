@@ -11,7 +11,7 @@
 
 #include <cstdint>
 
-#include "magicblocks/ui/ui_app.h"
+#include "mb_internal/magicblocks/ui/ui_app.h"
 #include "overlay_impl.h"
 
 namespace magicblocks::ui {

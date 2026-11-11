@@ -1,9 +1,9 @@
 // MagicBlocks L3 —— 网格实现
-#include "magicblocks/primitives/mesh.h"
+#include "mb_internal/magicblocks/primitives/mesh.h"
 
 #include <cstring>
 
-#include "magicblocks/resources/pipeline.h"
+#include "mb_internal/magicblocks/resources/pipeline.h"
 
 namespace magicblocks::primitives {
 

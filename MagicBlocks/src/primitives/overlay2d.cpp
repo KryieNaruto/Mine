@@ -1,4 +1,4 @@
-﻿// MagicBlocks L3 —— IOverlay2D 实现（spec §13.13）
+// MagicBlocks L3 —— IOverlay2D 实现（spec §13.13）
 //
 // 设计要点：
 //   1. 收集期只往 vector 里 push 图元描述，**不做三角化**；
@@ -8,7 +8,7 @@
 //   3. 线段三角化用**无对齐的薄四边形**（不按像素网格吸附）：
 //      对齐会让线在不同角度下粗细跳变，反而不如不吸附。
 
-#include "magicblocks/primitives/overlay2d.h"
+#include "mb_internal/magicblocks/primitives/overlay2d.h"
 
 #include <algorithm>
 #include <cmath>

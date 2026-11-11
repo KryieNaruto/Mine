@@ -1,5 +1,5 @@
 // MagicBlocks L3 —— 图元网格生成（纯 CPU，可无设备单测）
-#include "magicblocks/primitives/mesh_factory.h"
+#include "mb_internal/magicblocks/primitives/mesh_factory.h"
 
 #include <tesselator.h>
 

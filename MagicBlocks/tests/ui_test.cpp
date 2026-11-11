@@ -21,15 +21,16 @@
 #include "backend/vulkan/vulkan_render_device.h"
 #include "backend/vulkan/vulkan_target.h"
 #include "backend/vulkan/vulkan_ui_overlay.h"
+#include "core/device_ops.h"
 #include "core/image_io.h"
-#include "magicblocks/device/render_device.h"
+#include "mb_internal/magicblocks/device/render_device.h"
 #include "ui_offscreen_support.h"
-#include "magicblocks/ui/hud.h"
-#include "magicblocks/ui/input.h"
-#include "magicblocks/ui/perf.h"
-#include "magicblocks/ui/scene_frame.h"
-#include "magicblocks/ui/router.h"
-#include "magicblocks/ui/ui_app.h"
+#include "mb_internal/magicblocks/ui/hud.h"
+#include "mb_internal/magicblocks/ui/input.h"
+#include "mb_internal/magicblocks/ui/perf.h"
+#include "mb_internal/magicblocks/ui/scene_frame.h"
+#include "mb_internal/magicblocks/ui/router.h"
+#include "mb_internal/magicblocks/ui/ui_app.h"
 #include "ui/offscreen_target.h"
 #include "ui/ui_app_internal.h"
 
@@ -1438,7 +1439,7 @@ namespace {
 struct SwEnv {
   std::unique_ptr<dev::IRenderDevice> device;
   std::unique_ptr<dev::IRenderTarget> target;
-  std::unique_ptr<mb::backend::VulkanFrameRenderer> renderer;
+  std::unique_ptr<mb::core::OffscreenFrameRenderer> renderer;
   std::unique_ptr<ui::OffscreenTargetRenderer> host;
   std::unique_ptr<ui::UiApp> app;
   std::unique_ptr<ui::MemoryStateStore> store;
@@ -1472,17 +1473,15 @@ struct SwEnv {
       return false;
     }
     target = t.take();
-    auto* off = dynamic_cast<mb::backend::OffscreenTarget*>(target.get());
-    if (!off) {
-      ADD_FAILURE() << "离屏目标类型不符";
+    // t9:OffscreenTargetRenderer::attach 收的是 core 的不透明句柄。
+    // 测试仍可用 backend 类型做白盒断言(tests/ 门控放行 backend::),但**装配**
+    // 走与 CLI 相同的工厂,这样"CLI 与测试用同一条路径出图"是结构上成立的。
+    auto renderer_r = mb::core::create_offscreen_frame_renderer(device.get(), target.get());
+    if (!renderer_r.ok()) {
+      ADD_FAILURE() << "创建离屏帧渲染器失败: " << renderer_r.message();
       return false;
     }
-    auto* vkdev = dynamic_cast<mb::backend::VulkanRenderDevice*>(device.get());
-    if (!vkdev) {
-      ADD_FAILURE() << "设备类型不符";
-      return false;
-    }
-    renderer = std::make_unique<mb::backend::VulkanFrameRenderer>(vkdev->context(), off);
+    renderer = renderer_r.take();
     host = std::make_unique<ui::OffscreenTargetRenderer>();
     if (!host->attach(renderer.get())) {
       ADD_FAILURE() << "离屏后端 attach 失败";

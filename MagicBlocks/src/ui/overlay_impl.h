@@ -13,8 +13,8 @@
 #include <memory>
 #include <vector>
 
-#include "magicblocks/ui/overlay.h"
-#include "magicblocks/ui/types.h"
+#include "mb_internal/magicblocks/ui/overlay.h"
+#include "mb_internal/magicblocks/ui/types.h"
 
 namespace magicblocks::ui::detail {
 

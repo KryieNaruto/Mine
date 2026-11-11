@@ -1,5 +1,5 @@
 // MagicBlocks L4 —— 魔法涂鸦：文档 → 3D 实体管线实现（F-SK 基座）
-#include "magicblocks/features/sketch/sketch_pipeline.h"
+#include "mb_internal/magicblocks/features/sketch/sketch_pipeline.h"
 
 #include <algorithm>
 #include <cmath>

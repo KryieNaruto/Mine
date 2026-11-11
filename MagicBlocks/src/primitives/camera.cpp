@@ -9,7 +9,7 @@
 #include <algorithm>
 #include <cmath>
 
-#include "magicblocks/primitives/camera.h"
+#include "mb_internal/magicblocks/primitives/camera.h"
 
 namespace magicblocks::primitives {
 

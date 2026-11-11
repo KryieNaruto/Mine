@@ -1,0 +1,3 @@
+﻿# check_kotlin_abi.py --via-gradle 的中间产物:内容是本机 SDK/gradle 缓存绝对路径,
+# 换机器即失效,不入库。
+classpath_debug.txt

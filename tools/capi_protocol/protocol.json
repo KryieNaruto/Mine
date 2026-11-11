@@ -1,0 +1,296 @@
+{
+  "_comment": [
+    "MagicBlocks UI ⇄ SDK 的**文本协议唯一事实来源**。",
+    "",
+    "谁读它:",
+    "  MagicBlocks/src/android/jni_bridge.cpp               产出侧(C++),字段/分隔符/首行全部从这里生成过去;",
+    "  MagicBlocks/android/.../MbAbiProtocol.kt             解析侧(Kotlin),同上;",
+    "  tools/capi_protocol/gen_abi_table.py                 生成 golden 语料 + 校验 Kotlin 硬编码与 JNI 符号表;",
+    "  MagicBlocks/tests/capi_protocol/golden_cases.h       (生成物)同一批字节进桌面程序。",
+    "",
+    "为什么不是随便挑一个文件当事实来源:它不是 C++ 头也不是 Kotlin 文件,所以任何一侧",
+    "都不能\"顺手就改对\"而另一侧不知道 —— 改协议必须改这个文件,然后 --check 会让所有",
+    "没跟上的生成物/Kotlin 字面量同时变红。t3 那次 nativeListModels 漂移(grep: 'err=')",
+    "就是因为两侧各写了一份约定。"
+  ],
+
+  "abi": {
+    "_comment": "与 MagicBlocks/include/magicblocks/mb_capi.h §0 完全一致;gen_abi_table.py --check 会把 MbAbi.kt 逐项对上。",
+    "major": 1,
+    "minor": 0,
+    "patch": 0,
+    "required": 10000,
+    "_required_comment": "requiredVersion = MAJOR*stride0 + MINOR*stride1 + 0 —— UI 要求的最低版本;PATCH 位对 UI 无意义所以固定 0。生成器会验这个数等于公式的算术结果。",
+    "bit_stride": [10000, 100],
+    "_bit_stride_comment": "位宽二元组:[MAJOR 位乘数, MINOR 位乘数]。stride_idents 是 MbAbi.kt 里对应的常量名。",
+    "stride_idents": ["BIT_STRIDE_MAJOR", "BIT_STRIDE_MINOR"]
+  },
+
+  "protocol_id": "mb.model_list",
+  "protocol_version": 1,
+  "_parser_id_comment": "Kotlin 侧的解析器标识。PARSER_ID 会出现在每条解析成功的诊断里,所以它能被断言工具从外部核对,而不是只靠本文件自说自话。",
+  "_parser_id_ident": "PARSER_ID",
+  "_parser_id_tpl": "MbAbiProtocol/%d",
+  "parser_id": "MbAbiProtocol/1",
+  "_protocol_version_comment": [
+    "**返回文本自己的**版本号,与 ABI 版本(mb_abi_version())是两件事:",
+    "  ABI 版本管的是 27 个 C 入口的名字/签名/结构体;",
+    "  协议版本管的是 nativeListModels 这一个字符串里的标记/分隔/字段顺序。",
+    "可以只 bump 协议而不 bump ABI(例如改 sanitize 规则),但反过来改了协议不 bump 就是",
+    "t3 那个 bug。首行恒有 err=,版本通过一个显式入口 mb_model_list_protocol_version() 问。"
+  ],
+
+  "status_prefix": "err=",
+  "err_ok": "MB_OK",
+  "line_sep": "\n",
+  "field_sep": "\t",
+  "fields": ["name", "path", "bytes", "ok", "message"],
+
+  "newline_sanitized": {
+    "_comment": "定长字段里若出现换行/制表符会破坏行结构,SDK 侧统一换成空格;Kotlin 侧不做反转义(信息已丢失,反转义等于编造)。",
+    "chars": "\r\n\t",
+    "char": " "
+  },
+
+  "err_names": [
+    "MB_OK",
+    "MB_E_INVALID_ARG",
+    "MB_E_NOT_INITIALIZED",
+    "MB_E_NO_SURFACE",
+    "MB_E_SURFACE_LOST",
+    "MB_E_OUT_OF_DATE",
+    "MB_E_DEVICE_LOST",
+    "MB_E_UNSUPPORTED",
+    "MB_E_OUT_OF_MEMORY",
+    "MB_E_IO",
+    "MB_E_NOT_FOUND",
+    "MB_E_BUSY",
+    "MB_E_VERSION_MISMATCH",
+    "MB_E_INTERNAL"
+  ],
+
+  "cases": [
+    {
+      "key": "empty_dir",
+      "kind": "ok",
+      "_comment": "合法但无模型:首行 err=MB_OK 且没有任何条目。**不能**塌成 Failed —— 界面要说\"目录里没有 OBJ\"。",
+      "entries": []
+    },
+    {
+      "key": "one_model",
+      "kind": "ok",
+      "_comment": "一好一坏两条:坏条目要能显示引擎给的原因,而不是整列表失败。",
+      "entries": [
+        {
+          "name": "cube",
+          "path": "/data/user/0/com.magicblocks.pad/cache/models/cube.obj",
+          "bytes": 717,
+          "ok": true,
+          "message": ""
+        },
+        {
+          "name": "面板",
+          "path": "/data/user/0/com.magicblocks.pad/cache/models/panel.obj",
+          "bytes": 350,
+          "ok": false,
+          "message": "OBJ 里没有三角形"
+        }
+      ]
+    },
+    {
+      "key": "not_found",
+      "kind": "err",
+      "err": "MB_E_NOT_FOUND",
+      "_comment": "目录不存在:与 empty_dir **必须**在界面上可区分。"
+    },
+    {
+      "key": "io_error",
+      "kind": "err",
+      "err": "MB_E_IO"
+    }
+  ],
+
+  "kotlin_synthetic_cases": [
+    {
+      "key": "legacy_ok_first_line",
+      "expect_prefix": "failed",
+      "_comment": "t3 那次事故的原样输入:首行是裸 \"ok\"(改协议前的老格式)。解析器**必须**判 failed —— 若这条变绿,说明解析器又回到比对 \"ok\",那真机上模型列表会永远为空。"
+    },
+    {
+      "key": "status_prefix_only",
+      "expect_prefix": "failed"
+    },
+    {
+      "key": "shorter_than_prefix",
+      "expect_prefix": "failed",
+      "_comment": "首行比 \"err=\" 还短(空首行)。契约是\"任何输入都只得到 Ok/Failed\",所以这里**必须**是 failed 而不是 throw —— 曾经用 substring(prefix.length) 实现,这种输入直接 StringIndexOutOfBounds 把界面崩掉。"
+    },
+    {
+      "key": "unknown_err_name",
+      "expect_prefix": "failed"
+    },
+    {
+      "key": "dangling_record",
+      "expect_prefix": "failed"
+    },
+    {
+      "key": "field_sep_injected",
+      "expect_prefix": "failed"
+    },
+    {
+      "key": "empty_string",
+      "expect_prefix": "failed"
+    },
+    {
+      "key": "bytes_not_integer",
+      "expect_prefix": "failed"
+    },
+    {
+      "key": "ok_flag_not_0_1",
+      "expect_prefix": "failed"
+    },
+    {
+      "key": "empty_name_falls_back_to_path",
+      "expect_prefix": "ok"
+    }
+  ],
+  "kotlin_literal_whitelist": {
+    "_comment": [
+      "允许在 Kotlin 里直接出现的协议字面量(其余一律视为\"手动拼协议\"并判红)。",
+      "这份清单必须**恰好**覆盖实际出现的那些:登记的没出现 = 死规则,同样判红。",
+      "每一项都要写清为什么它必须留在 Kotlin 侧。"
+    ],
+    "err=": "MbAbiProtocol.STATUS_PREFIX 的定义处。**唯一**允许出现它的一条字符串。",
+    "MB_OK": "MbAbiProtocol.STATUS_OK 的定义处 + ERR_REASONS 表的键(给人看的文案表,不是解析逻辑)。",
+    "MB_E_NOT_FOUND": "ERR_REASONS 的键。UI 只在这张表里认识错误码名,别处不再认。",
+    "MB_E_IO": "ERR_REASONS 的键。",
+    "MB_E_INVALID_ARG": "ERR_REASONS 的键。",
+    "MB_E_NOT_INITIALIZED": "ERR_REASONS 的键。",
+    "MB_E_OUT_OF_MEMORY": "ERR_REASONS 的键。",
+    "MB_E_UNSUPPORTED": "ERR_REASONS 的键。",
+    "MB_E_INTERNAL": "ERR_REASONS 的键。"
+  },
+
+  "jni_entries": [
+    {
+      "name": "nativeCreate",
+      "ret": "jlong",
+      "params": ["JNIEnv*env", "jclass"],
+      "capi": ["mb_session_desc_default", "mb_session_create", "mb_err_str"],
+      "abi_min": "1.0",
+      "_entry_comment": "建会话。**失败也返回非 0 句柄**(唯一能让 nativeStatus 读到原因的方式)。"
+    },
+    {
+      "name": "nativeSurfaceCreated",
+      "ret": "jboolean",
+      "params": ["JNIEnv*env", "jclass", "jlong handle", "jlong window", "jint width", "jint height"],
+      "capi": ["mb_session_attach_surface"],
+      "abi_min": "1.0",
+      "_entry_comment": "把 ANativeWindow* 挂上去建交换链;失败返回 false 且旧 surface 保持可用。"
+    },
+    {
+      "name": "nativeSurfaceDestroyed",
+      "ret": "void",
+      "params": ["JNIEnv*", "jclass", "jlong handle"],
+      "capi": ["mb_session_detach_surface"],
+      "abi_min": "1.0",
+      "_entry_comment": "卸载 surface;返回后 SDK 保证不再碰它。"
+    },
+    {
+      "name": "nativeRenderFrame",
+      "ret": "jboolean",
+      "params": ["JNIEnv*env", "jclass", "jlong handle", "jfloat qx", "jfloat qy", "jfloat qz", "jfloat qw", "jfloat scale", "jfloat pan_x", "jfloat pan_y"],
+      "capi": ["mb_session_render"],
+      "abi_min": "1.0",
+      "_entry_comment": "渲染并呈现一帧。设计为在**单一**渲染线程上调用(见 mb_capi.h §线程模型)。"
+    },
+    {
+      "name": "nativeStatus",
+      "ret": "jstring",
+      "params": ["JNIEnv*env", "jclass", "jlong handle"],
+      "capi": ["mb_session_status_text"],
+      "abi_min": "1.0",
+      "_entry_comment": "状态文本(两段式缓冲区协议);仅供显示,格式不保证。"
+    },
+    {
+      "name": "nativeDestroy",
+      "ret": "void",
+      "params": ["JNIEnv*", "jclass", "jlong handle"],
+      "capi": ["mb_session_destroy"],
+      "abi_min": "1.0",
+      "_entry_comment": "销毁会话。对 NULL/已销毁句柄是 no-op。"
+    },
+    {
+      "name": "nativeSetMsaa",
+      "ret": "void",
+      "params": ["JNIEnv*", "jclass", "jlong handle", "jint samples"],
+      "capi": ["mb_session_set_msaa"],
+      "abi_min": "1.0",
+      "_entry_comment": "设置**请求**采样数,生效时机是下一次 attach。"
+    },
+    {
+      "name": "nativeMsaaSamples",
+      "ret": "jint",
+      "params": ["JNIEnv*", "jclass", "jlong handle"],
+      "capi": ["mb_session_msaa_effective"],
+      "abi_min": "1.0",
+      "_entry_comment": "**实际生效**的采样数,UI 必须显示这个值而不是请求值。"
+    },
+    {
+      "name": "nativeSupportedMsaa",
+      "ret": "jstring",
+      "params": ["JNIEnv*env", "jclass", "jlong handle"],
+      "capi": ["mb_session_msaa_supported"],
+      "abi_min": "1.0",
+      "_entry_comment": "设备支持的档位,逗号分隔(如 \"1,4,8\");空则给 \"1\"。"
+    },
+    {
+      "name": "nativeListModels",
+      "ret": "jstring",
+      "params": ["JNIEnv*env", "jclass", "jstring directory"],
+      "capi": ["mb_session_scan_models", "mb_model_list_count", "mb_model_list_get", "mb_model_list_free", "mb_err_str"],
+      "abi_min": "1.0",
+      "_entry_comment": "**本协议文档管的就是它**。首行恒为 err=<MB_E_*>,此后每模型 5 行,每行一个字段。"
+    },
+    {
+      "name": "nativeLoadModel",
+      "ret": "jboolean",
+      "params": ["JNIEnv*env", "jclass", "jlong handle", "jstring path", "jstring name"],
+      "capi": ["mb_session_load_model"],
+      "abi_min": "1.0",
+      "_entry_comment": "切换模型;失败时渲染保持原状(不回落立方体)。"
+    },
+    {
+      "name": "nativeClearModel",
+      "ret": "void",
+      "params": ["JNIEnv*", "jclass", "jlong handle"],
+      "capi": ["mb_session_clear_model"],
+      "abi_min": "1.0",
+      "_entry_comment": "切回内置立方体。"
+    },
+    {
+      "name": "nativeWindowFromSurface",
+      "ret": "jlong",
+      "params": ["JNIEnv*env", "jclass", "jobject surface"],
+      "capi": [],
+      "abi_min": "1.0",
+      "_entry_comment": "Surface -> ANativeWindow*。**唯一不经 mb_capi 的入口**:它只碰 Android 平台类型((env, jobject)),而 mb_capi 刻意不认识 jobject。详见 MbRenderer.kt 的 ABI 表。"
+    },
+    {
+      "name": "nativeAbiVersion",
+      "ret": "jint",
+      "params": ["JNIEnv*", "jclass"],
+      "capi": ["mb_abi_version"],
+      "abi_min": "1.0",
+      "_entry_comment": "运行时库的打包 ABI 版本;Kotlin 在 loadLibrary 之后第一个调的就是它。"
+    },
+    {
+      "name": "nativeModelListProtocolVersion",
+      "ret": "jint",
+      "params": ["JNIEnv*", "jclass"],
+      "capi": ["mb_model_list_protocol_version"],
+      "abi_min": "1.0",
+      "_entry_comment": "nativeListModels 返回文本的协议版本(与 ABI 版本是两件事)。"
+    }
+  ]
+}

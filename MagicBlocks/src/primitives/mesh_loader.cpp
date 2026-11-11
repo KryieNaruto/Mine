@@ -15,7 +15,7 @@
 // 将来要支持 mtl/groups/多对象时再接 —— 那时它的信息损失才值得付。
 //
 // ============================================================================
-#include "magicblocks/primitives/mesh_loader.h"
+#include "mb_internal/magicblocks/primitives/mesh_loader.h"
 
 #include <algorithm>
 #include <cmath>

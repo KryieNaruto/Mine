@@ -6,7 +6,7 @@
 // 实测约定：所有扩容都记进 IFrameStats::add_heap_alloc，
 // 这样门控 G9 能对**整帧**求和断言 §4.1 的"堆分配 0 次"，
 // 而不是逐个模块猜哪个偷偷分配了。
-#include "magicblocks/primitives/alloc.h"
+#include "mb_internal/magicblocks/primitives/alloc.h"
 
 #include <algorithm>
 

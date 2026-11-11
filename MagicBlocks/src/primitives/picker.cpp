@@ -3,7 +3,7 @@
 // 全部是纯 CPU 数学，**不碰 GPU**。这是刻意的：GPU 拾取要 readback，
 // 会 stall 整帧（C-L3-c 禁止在热路径读回）。
 
-#include "magicblocks/primitives/picker.h"
+#include "mb_internal/magicblocks/primitives/picker.h"
 
 #include <algorithm>
 #include <cmath>

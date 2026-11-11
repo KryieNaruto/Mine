@@ -3,11 +3,11 @@
 
 #include <memory>
 
-#include "magicblocks/scene/feature.h"
-#include "magicblocks/scene/recorder.h"
-#include "magicblocks/scene/render_graph.h"
-#include "magicblocks/scene/scene.h"
-#include "magicblocks/scene/submit_queue.h"
+#include "mb_internal/magicblocks/scene/feature.h"
+#include "mb_internal/magicblocks/scene/recorder.h"
+#include "mb_internal/magicblocks/scene/render_graph.h"
+#include "mb_internal/magicblocks/scene/scene.h"
+#include "mb_internal/magicblocks/scene/submit_queue.h"
 
 namespace magicblocks::scene {
 

@@ -11,10 +11,10 @@
 #include <unordered_map>
 #include <vector>
 
-#include "magicblocks/primitives/shader_library.h"
+#include "mb_internal/magicblocks/primitives/shader_library.h"
 
 // t6 / R9b:按形状派生管线的**公共**入口(不引入任何 backend:: / Vk* 头)。
-#include "magicblocks/resources/pipeline.h"
+#include "mb_internal/magicblocks/resources/pipeline.h"
 
 namespace magicblocks::primitives {
 

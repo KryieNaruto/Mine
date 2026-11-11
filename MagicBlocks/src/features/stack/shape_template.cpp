@@ -1,5 +1,5 @@
 // MagicBlocks L4 —— 形状模板实现（设计 §12）
-#include "magicblocks/features/stack/shape_template.h"
+#include "mb_internal/magicblocks/features/stack/shape_template.h"
 
 #include <algorithm>
 #include <deque>

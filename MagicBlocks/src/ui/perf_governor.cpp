@@ -8,7 +8,7 @@
 //   - 降级快(degrade_after_frames 连续超预算帧);
 //   - 恢复慢(recover_after_frames 连续低负载帧,且低负载阈值只有预算的一半)。
 // 这是为了不让 UI 在临界线附近来回抖 —— 抖动的帧率比稳定低一档更难受。
-#include "magicblocks/ui/perf.h"
+#include "mb_internal/magicblocks/ui/perf.h"
 
 #include <algorithm>
 #include <cstdio>

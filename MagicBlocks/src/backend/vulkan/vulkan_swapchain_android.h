@@ -2,7 +2,7 @@
 #pragma once
 
 #include "backend/vulkan/vulkan_target.h"
-#include "magicblocks/device/types.h"
+#include "mb_internal/magicblocks/device/types.h"
 
 namespace magicblocks::backend {
 

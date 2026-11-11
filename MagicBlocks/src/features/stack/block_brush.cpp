@@ -3,7 +3,7 @@
 // 算法逐条对应 block_brush.h 顶部的三条纪律，且**每一步都能单独测**：
 //   snap_ray_to_cell / pick_layer_for_ray / supercover_cells 都是纯函数。
 // 这样"斜线漏格"这类问题可以在 DDA 层面直接定位，而不必走完整条渲染链。
-#include "magicblocks/features/stack/block_brush.h"
+#include "mb_internal/magicblocks/features/stack/block_brush.h"
 
 #include <algorithm>
 #include <cmath>

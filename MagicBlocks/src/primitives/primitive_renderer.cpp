@@ -3,7 +3,7 @@
 // 这个文件是 **L3 唯一会调用 ICommandList 的地方**，所以两个纪律必须守住：
 //   1. 只调录制接口，绝不 submit（一帧一次提交由调用方负责，UIG2 门控）；
 //   2. 不读时钟、不分配大块内存（帧内数组用成员缓冲复用）。
-#include "magicblocks/primitives/primitive_renderer.h"
+#include "mb_internal/magicblocks/primitives/primitive_renderer.h"
 
 #include <cstring>
 #include <memory>

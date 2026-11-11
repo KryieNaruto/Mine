@@ -28,14 +28,14 @@
 #include <string>
 #include <vector>
 
-#include "backend/vulkan/vulkan_target.h"
+#include "core/device_ops.h"
 #include "core/image_io.h"
-#include "magicblocks/device/render_device.h"
-#include "magicblocks/scene/command_stream.h"
-#include "magicblocks/scene/recorder.h"
-#include "magicblocks/scene/render_graph.h"
-#include "magicblocks/scene/scene.h"
-#include "magicblocks/scene/submit_queue.h"
+#include "mb_internal/magicblocks/device/render_device.h"
+#include "mb_internal/magicblocks/scene/command_stream.h"
+#include "mb_internal/magicblocks/scene/recorder.h"
+#include "mb_internal/magicblocks/scene/render_graph.h"
+#include "mb_internal/magicblocks/scene/scene.h"
+#include "mb_internal/magicblocks/scene/submit_queue.h"
 #include "scene/scene_internal.h"
 
 // 内嵌 shader(由 glslc + embed_shaders.py 生成,在二进制目录里)。
@@ -48,6 +48,7 @@ namespace {
 namespace sc = magicblocks::scene;
 namespace dev = magicblocks::device;
 namespace res = magicblocks::resources;
+namespace core = magicblocks::core;
 
 void print_usage() {
   std::fprintf(stderr,
@@ -548,14 +549,10 @@ int cmd_record(const Args& args) {
       return 1;
     }
     dev::IRenderTarget* pix_target = pix_r.value().get();
-    auto* off = dynamic_cast<::magicblocks::backend::OffscreenTarget*>(pix_target);
-    if (off == nullptr) {
-      std::fprintf(stderr, "内部错误:离屏目标不是 backend::OffscreenTarget\n");
-      return 1;
-    }
-    dev::Status ds = off->draw_selftest(
-        args.frame_index & ~static_cast<dev::u64>(1u),
-        ::magicblocks::backend::OffscreenTarget::SelftestKind::kL2Scene);
+    // t9:走 core 的纯值入口,不再 dynamic_cast 到 backend::OffscreenTarget,
+    // 也不再把后端的 SelftestKind 枚举名写进 CLI。
+    dev::Status ds = core::draw_offscreen_selftest(
+        pix_target, args.frame_index & ~static_cast<dev::u64>(1u), core::SelftestKind::kL2Scene);
     if (!ds.ok()) {
       std::fprintf(stderr, "绘制失败(code=%d): %s\n", static_cast<int>(ds.code),
                    ds.message.c_str());

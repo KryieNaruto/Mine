@@ -20,9 +20,9 @@
 
 #include "backend/vulkan/vk_common.h"
 #include "backend/vulkan/vulkan_target.h"  // Status 别名 + VulkanContext(与 L0 后端同口径)
-#include "magicblocks/device/types.h"
-#include "magicblocks/resources/handles.h"
-#include "magicblocks/resources/memory.h"
+#include "mb_internal/magicblocks/device/types.h"
+#include "mb_internal/magicblocks/resources/handles.h"
+#include "mb_internal/magicblocks/resources/memory.h"
 
 namespace magicblocks::backend {
 

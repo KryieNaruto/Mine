@@ -27,13 +27,14 @@
 #include "backend/vulkan/vulkan_render_device.h"
 #include "backend/vulkan/vulkan_target.h"
 #include "backend/vulkan/vulkan_ui_overlay.h"
+#include "core/device_ops.h"
 #include "core/image_io.h"
-#include "magicblocks/device/render_device.h"
-#include "magicblocks/primitives/model_catalog.h"
-#include "magicblocks/resources/memory.h"
-#include "magicblocks/ui/hud.h"
-#include "magicblocks/ui/router.h"
-#include "magicblocks/ui/ui_app.h"
+#include "mb_internal/magicblocks/device/render_device.h"
+#include "mb_internal/magicblocks/primitives/model_catalog.h"
+#include "mb_internal/magicblocks/resources/memory.h"
+#include "mb_internal/magicblocks/ui/hud.h"
+#include "mb_internal/magicblocks/ui/router.h"
+#include "mb_internal/magicblocks/ui/ui_app.h"
 #include "render_backend.h"
 #include "ui/offscreen_target.h"
 #include "ui/ui_app_internal.h"
@@ -42,6 +43,7 @@ namespace {
 
 namespace ui = magicblocks::ui;
 namespace dev = magicblocks::device;
+namespace core = magicblocks::core;
 namespace mbp = magicblocks::primitives;
 namespace res = magicblocks::resources;
 namespace ui_cli = magicblocks::ui_cli;
@@ -234,7 +236,7 @@ dev::DeviceDesc sw_desc() {
 struct Session {
   std::unique_ptr<dev::IRenderDevice> device;
   std::unique_ptr<dev::IRenderTarget> target;
-  std::unique_ptr<magicblocks::backend::VulkanFrameRenderer> renderer;
+  std::unique_ptr<core::OffscreenFrameRenderer> renderer;
   std::unique_ptr<ui::UiApp> app;
   std::unique_ptr<ui::OffscreenTargetRenderer> offscreen_host;
 
@@ -328,14 +330,14 @@ bool build_session(const Args& args, Session* s) {
   }
   s->target = tgt_r.take();
 
-  auto* off = dynamic_cast<magicblocks::backend::OffscreenTarget*>(s->target.get());
-  if (!off) {
-    std::fprintf(stderr, "内部错误:离屏目标类型不符\n");
+  // t9:离屏帧渲染器由 core 的工厂返回不透明句柄(`core::OffscreenFrameRenderer`),
+  // 本文件不再 dynamic_cast 到 backend::OffscreenTarget、也不再拿 VulkanContext。
+  auto renderer_r = core::create_offscreen_frame_renderer(s->device.get(), s->target.get());
+  if (!renderer_r.ok()) {
+    std::fprintf(stderr, "内部错误:创建离屏帧渲染器失败: %s\n", renderer_r.message().c_str());
     return false;
   }
-
-  auto ctx = static_cast<magicblocks::backend::VulkanRenderDevice*>(s->device.get())->context();
-  s->renderer = std::make_unique<magicblocks::backend::VulkanFrameRenderer>(ctx, off);
+  s->renderer = renderer_r.take();
   s->offscreen_host = std::make_unique<ui::OffscreenTargetRenderer>();
   if (!s->offscreen_host->attach(s->renderer.get())) {
     std::fprintf(stderr, "内部错误:离屏后端 attach 失败\n");

@@ -33,7 +33,7 @@
 #include "backend/vulkan/vk_common.h"
 #include "backend/vulkan/vulkan_allocator.h"
 #include "backend/vulkan/vulkan_target.h"
-#include "magicblocks/resources/texture.h"
+#include "mb_internal/magicblocks/resources/texture.h"
 
 namespace magicblocks::backend {
 

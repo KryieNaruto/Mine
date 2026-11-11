@@ -10,7 +10,7 @@
 
 #include "backend/vulkan/vk_common.h"
 #include "backend/vulkan/vulkan_frame_target.h"
-#include "magicblocks/device/render_target.h"
+#include "mb_internal/magicblocks/device/render_target.h"
 
 namespace magicblocks::backend {
 

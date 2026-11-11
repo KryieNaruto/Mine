@@ -112,6 +112,29 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         Log.i(MbRenderer.TAG, "MainActivity.onCreate")
 
+        // ABI 版本校验：**必须在任何引擎调用之前**。
+        //
+        // 放在这里而不是 MbRenderer 的 init 里,是因为校验失败时要写进 HUD 和 logcat
+        // (见下面 statusText 的分支),那两个东西都不该由一个 JNI 绑定对象去碰。
+        // 校验本身不创建会话、不碰 GPU,只读两个版本号,所以放首行是安全的。
+        //
+        // 为什么要做这件事:UI 和 libmagicblocks.so 是两个可以**独立**替换的产物
+        // (APK 里带 so、或者直接换 jniLibs 下的文件)。版本对不上时,老 UI 会在
+        // 某个深层调用里拿到一个看不出原因的错误,或者(更糟)按旧结构体布局读写
+        // 新库——那已经不是"报错"而是"静默读错内存"。所以宁可在第一屏就把话说清楚:
+        // 谁的版本是多少、差在哪、该换哪一边。
+        val abiOk = try {
+            MbRenderer.checkAbiVersion()
+        } catch (t: Throwable) {
+            // checkAbiVersion 内部已经兜住 UnsatisfiedLinkError;走到这里说明是别的问题
+            // (例如 so 根本加载不进来),同样要变成一句人能看懂的话,而不是闪退。
+            Log.e(MbRenderer.TAG, "ABI 校验本身异常", t)
+            false
+        }
+        if (!abiOk) {
+            Log.e(MbRenderer.TAG, "=== ABI 版本不匹配,引擎不会启动 ===")
+        }
+
         // 全屏沉浸 + edge-to-edge。
         //
         // 这里**必须**同时做三件事，否则底部会留一条 96px 的黑色导航栏：
@@ -231,7 +254,12 @@ class MainActivity : ComponentActivity() {
         setContentView(root)
 
         // 资源解包 + 目录扫描放在首帧之后：它会读 assets 字节，别拖慢第一屏。
-        root.post { loadModelList() }
+        // ABI 不匹配时**不扫**:协议版本都可能不对,扫出来的东西没有意义。
+        if (abiOk) {
+            root.post { loadModelList() }
+        } else {
+            statusText = abiErrorMessage()
+        }
     }
 
     override fun onResume() {
@@ -252,6 +280,15 @@ class MainActivity : ComponentActivity() {
         }
         surfaceView.setDisplayRotation(rotation)
     }
+
+    /**
+     * ABI 不匹配时给 HUD 的一句话。
+     *
+     * 复用 [MbRenderer.abiVerdict] 而不是在这里另写一套说法:logcat 里打的、HUD 上
+     * 显示的必须是**同一句**话,否则排查时两边对不上(而且两份文案迟早会分叉)。
+     */
+    private fun abiErrorMessage(): String =
+        "引擎版本不匹配，已停用。" + (MbRenderer.abiVerdict ?: "原因未知")
 
     /**
      * 扫一遍预设模型目录。

@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <vector>
 
-#include "magicblocks/primitives/alloc.h"
+#include "mb_internal/magicblocks/primitives/alloc.h"
 
 namespace mbp = magicblocks::primitives;
 

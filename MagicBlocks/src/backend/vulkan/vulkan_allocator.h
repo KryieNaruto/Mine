@@ -30,8 +30,8 @@
 #include <memory>
 #include <vector>
 
-#include "magicblocks/resources/handles.h"
-#include "magicblocks/resources/memory.h"
+#include "mb_internal/magicblocks/resources/handles.h"
+#include "mb_internal/magicblocks/resources/memory.h"
 
 namespace magicblocks::backend {
 

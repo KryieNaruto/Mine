@@ -27,8 +27,8 @@
 
 #include "backend/vulkan/vk_common.h"
 #include "backend/vulkan/vulkan_target.h"
-#include "magicblocks/resources/memory.h"
-#include "magicblocks/ui/frame_renderer.h"
+#include "mb_internal/magicblocks/resources/memory.h"
+#include "mb_internal/magicblocks/ui/frame_renderer.h"
 
 namespace magicblocks::backend {
 

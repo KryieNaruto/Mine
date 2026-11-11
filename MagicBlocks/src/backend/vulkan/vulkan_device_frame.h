@@ -33,8 +33,8 @@
 
 #include "backend/vulkan/vk_common.h"
 #include "backend/vulkan/vulkan_target.h"
-#include "magicblocks/device/result.h"
-#include "magicblocks/resources/command.h"
+#include "mb_internal/magicblocks/device/result.h"
+#include "mb_internal/magicblocks/resources/command.h"
 
 namespace magicblocks::backend {
 

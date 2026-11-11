@@ -10,7 +10,7 @@
 #define NOMINMAX
 #endif
 
-#include "magicblocks/primitives/sky.h"
+#include "mb_internal/magicblocks/primitives/sky.h"
 
 #include <cmath>
 #include <cstdio>

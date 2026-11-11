@@ -1,4 +1,4 @@
-﻿// MagicBlocks L3 —— IGizmoSystem 实现（spec §10）
+// MagicBlocks L3 —— IGizmoSystem 实现（spec §10）
 //
 // 显式状态机（可断言，见 §10.4）：
 //
@@ -9,7 +9,7 @@
 // 全部状态集中在 `state_` 一个结构里，任何时刻都能 `snapshot()` 出来，
 // 因此这个状态机是可测试、可回放的 —— 而不是散在若干 bool 里。
 
-#include "magicblocks/primitives/gizmo.h"
+#include "mb_internal/magicblocks/primitives/gizmo.h"
 
 #include <algorithm>
 #include <cmath>

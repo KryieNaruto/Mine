@@ -4,7 +4,7 @@
 //
 // **本文件不读时钟**(D13 门控 check_scene_no_clock.py 机械保证),
 // **不含任何 Vulkan 类型**(G3)。
-#include "magicblocks/scene/command_stream.h"
+#include "mb_internal/magicblocks/scene/command_stream.h"
 
 #include <bit>
 #include <cmath>

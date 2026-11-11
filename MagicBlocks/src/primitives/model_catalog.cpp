@@ -4,7 +4,7 @@
 //
 // 本文件**不碰 GPU 之外的东西**:扫描用 <filesystem>,加载用 IMeshLoader,
 // 上传用 IBuffer。没有 Vk*(G3),也没有玩法名(G7)。
-#include "magicblocks/primitives/model_catalog.h"
+#include "mb_internal/magicblocks/primitives/model_catalog.h"
 
 #include <algorithm>
 #include <cctype>
