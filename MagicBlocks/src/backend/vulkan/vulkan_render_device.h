@@ -126,6 +126,18 @@ class VulkanRenderDevice final : public device::IRenderDevice {
   // 所以这里用 unique_ptr 并在 ~VulkanRenderDevice 里显式先 reset,
   // 保证 "先销毁 fence、再销毁 VkDevice" 的顺序。
   std::unique_ptr<VulkanFrameSync> frame_sync_;
+  // 逐帧提交用的 fence 池(见 vulkan_device_frame.cpp 的 submit_device_frame)。
+  //
+  // 为什么放在这里而不是 VulkanContext 里:VulkanContext 是纯句柄容器,会被
+  // 广泛按值传递;把需要 vkCreateFence/vkDestroyFence 的拥有型资源塞进去,
+  // 会让"谁负责销毁"变得含糊。放在 device 里则生命周期天然等于 VkDevice。
+  //
+  // 为什么不是 thread_local 缓存:VkDevice 句柄地址会被驱动复用 —— 销毁旧设备
+  // 再建新设备,新设备完全可能拿到同一个地址,"地址相同"会被误判成"同一个设备",
+  // 于是拿已销毁的 VkFence 去 vkResetFences → 无效对象 + 崩溃(实测过一次)。
+  static constexpr std::uint32_t kSubmitFenceSlots = 4;
+  VkFence submit_fences_[kSubmitFenceSlots] = {};
+  std::uint32_t submit_fence_next_ = 0;
   bool logical_ready_ = false;
   // ResourceId → 缓冲实现指针(见 bind_known_buffers 的说明)。
   // 设备不拥有这些对象(所有权在调用方的 unique_ptr),这里只存裸指针;

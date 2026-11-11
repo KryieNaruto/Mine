@@ -65,7 +65,8 @@ struct DeviceFrameStats {
 //
 // 失败语义(D8 不静默降级):任何一条命令无法翻译都返回非 Ok,不提交半帧。
 device::Status submit_device_frame(const VulkanContext& ctx, const VulkanCommandList& list,
-                                   DeviceFrameStats* out_stats);
+                                   DeviceFrameStats* out_stats,
+                                                   VkFence* reusable_fence = nullptr);
 
 // ---------------------------------------------------------------- 目标缓存
 //

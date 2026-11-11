@@ -378,12 +378,30 @@ bool SceneRenderer::record_into(dev::IRenderTarget* target, float yaw, float pit
 
   // 模型矩阵：先 pitch（绕 X）再 yaw（绕 Y）—— 即"拖动旋转"。
   //
-  // 注意旋转屏幕下两个轴要互换：手指在屏幕上左右滑，产生的是屏幕空间的 dX，
-  // 而这个 dX 在**未旋转的 image 空间**里是纵向。若不互换，就会出现
-  // "左右拖像上下转、上下拖像左右转"（用户反馈的问题 1）。
-  // Kotlin 侧统一按"屏幕坐标系"上报（x=屏幕右，y=屏幕下），这里做轴映射。
-  const float rot_x = rot90 ? pitch : yaw;   // 绕 X 轴（屏幕左右滑 → 上下翻）
-  const float rot_y = rot90 ? yaw : pitch;   // 绕 Y 轴（屏幕上下滑 → 左右转）
+  // ==========================================================================
+  // 轴映射：yaw **恒**绕 Y（左右转），pitch **恒**绕 X（上下转），不随屏幕旋转互换
+  // ==========================================================================
+  //
+  // 这里曾经按 `rot90 ? 互换 : 不互换` 做映射，注释的理由是"image 空间被转了 90°，
+  // 屏幕的 dX 在 image 里是纵向"。那个推理是错的，实测（真机 MDP1221，ROTATE_90）
+  // 表现为**左右拖 → 上下转、上下拖 → 左右转**，正好是用户反馈的那个 bug：
+  //
+  //   * 渲染始终发生在**未旋转的 image 空间**里：yaw 绕世界 Y 轴转，画面上就是绕
+  //     竖直轴转，呈现出来就是"左右转"；pitch 绕世界 X 轴转，就是"上下翻"。
+  //   * 设备把 image 旋转 90° 后铺到屏幕上，旋转矩阵是 [0,0,1; 0,-1,0] —— 它只
+  //     作用于**最终像素**，对"哪根轴在画面上显得竖直"没有影响。
+  //   * 手指的 dX/dY 是**屏幕空间**的，而 Kotlin 侧已经把屏幕坐标换算成了"绕世界 Y
+  //     多少弧度 / 绕世界 X 多少弧度"（EngineSurfaceView.rotateByScreenPixels），
+  //     这里拿到的 yaw/pitch 已经是**世界轴**的量。
+  //
+  //   因此这里若再交换一次，就是在已经正确的量上又转了一次 → 两个方向同时错位。
+  //   宽高比那里仍然要用 rot90（那是关于"屏幕像素密度"的，与轴向无关，见上）。
+  //
+  // 若以后要支持"投射方向固定"（Activity 改成 sensorLandscape），需要的是把屏幕
+  // 上的物理方向换算成逻辑方向（Kotlin 侧按 Display.rotation 做），而不是在这里
+  // 交换轴 —— 因为输出空间可能被翻转（ROTATE_180 也是 FLIP_H|FLIP_V）。
+  const float rot_x = pitch;  // 绕 X 轴：上下翻
+  const float rot_y = yaw;    // 绕 Y 轴：左右转
 
   const prim::Mat4 rot_pitch =
       prim::make_rotation_quat(std::sin(rot_x * 0.5f), 0.f, 0.f, std::cos(rot_x * 0.5f));
@@ -419,6 +437,24 @@ bool SceneRenderer::record_into(dev::IRenderTarget* target, float yaw, float pit
   sc.height = static_cast<dev::u32>(height_);
   if (auto s = cmd->set_scissor(sc); !s.ok()) return fail("set_scissor: " + s.message);
 
+  // 画哪一层：选了预设模型就画模型，否则画内置立方体。两者的顶点布局一致
+  // （位置/法线/颜色各 3 个 float），所以共用同一条管线 —— 模型没有顶点色时
+  // cube.frag 会退化成按法线算的灰白，不会黑成一片（见 shaders/cube.vert 注释）。
+  //
+  // 注意 OBJ 没有顶点色：loader 填的是白色，片元着色器最终按法线明暗成灰白
+  // —— 能看清形状，只是不上色。给模型单独做一条配色管线是后话，这里不假装做了。
+  const res::IBuffer* vb = vertex_buffer_.get();
+  const res::IBuffer* ib = index_buffer_.get();
+  std::uint32_t draw_indices = index_count_;
+  if (model_ != nullptr) {
+    const prim::IMesh* mesh = model_->mesh();
+    if (mesh != nullptr && mesh->vertex_buffer() != nullptr && mesh->index_buffer() != nullptr) {
+      vb = mesh->vertex_buffer();
+      ib = mesh->index_buffer();
+      draw_indices = mesh->index_count();
+    }
+  }
+
   if (auto s = cmd->bind_pipeline(pipeline_.get(), pipeline_hash_); !s.ok()) {
     return fail("bind_pipeline: " + s.message);
   }
@@ -428,15 +464,15 @@ bool SceneRenderer::record_into(dev::IRenderTarget* target, float yaw, float pit
   if (auto s = cmd->push_constants(kStageVertex | kStageFragment, 0, sizeof(pc), &pc); !s.ok()) {
     return fail("push_constants: " + s.message);
   }
-  if (auto s = cmd->bind_vertex_buffer(vertex_buffer_->id(), 0, 0); !s.ok()) {
+  if (auto s = cmd->bind_vertex_buffer(vb->id(), 0, 0); !s.ok()) {
     return fail("bind_vertex_buffer: " + s.message);
   }
-  if (auto s = cmd->bind_index_buffer(index_buffer_->id(), res::IndexFormat::UInt32, 0); !s.ok()) {
+  if (auto s = cmd->bind_index_buffer(ib->id(), res::IndexFormat::UInt32, 0); !s.ok()) {
     return fail("bind_index_buffer: " + s.message);
   }
 
   res::DrawArgs da{};
-  da.index_count = index_count_;
+  da.index_count = draw_indices;
   da.instance_count = 1;
   if (auto s = cmd->draw_indexed(da); !s.ok()) return fail("draw_indexed: " + s.message);
   if (auto s = cmd->end_pass(); !s.ok()) return fail("end_pass: " + s.message);
@@ -491,6 +527,51 @@ bool SceneRenderer::render_frame(float yaw, float pitch, float scale, float pan_
   return true;
 }
 
+// ---------------------------------------------------------------- 预设模型
+
+bool SceneRenderer::load_model(const std::string& path, const std::string& name,
+                               std::string* err) {
+  std::lock_guard<std::mutex> lk(mutex_);
+  auto fail = [&](const std::string& m) {
+    if (err) *err = m;
+    last_error_ = m;
+    return false;
+  };
+
+  if (!device_) return fail("load_model: 设备未初始化");
+  if (path.empty()) return fail("load_model: 路径为空");
+
+  // 上传要落库的分配器页：Vertex / Index / Staging 各预取一页（L1 既定契约，
+  // 与 create_resources 同口径）。缺页时 device 会返回 OOM 并给出明确数字，
+  // 这里再补一次是保证"第一次点列表就能成功"，而不是要点两次。
+  res::IMemoryAllocator* alloc = device_->memory_allocator();
+  for (res::MemoryKind kind :
+       {res::MemoryKind::Vertex, res::MemoryKind::Index, res::MemoryKind::Staging}) {
+    if (auto s = alloc->reserve_pages(kind, 1); !s.ok()) {
+      return fail("load_model: 预取内存页失败: " + s.message);
+    }
+  }
+
+  // 归一化口径与 L3 预设目录一致（包围盒对角线 → 1.0）：pad 上列表里几个模型
+  // 的原始尺寸差 1~2 个数量级，不归一化的话切到球体就只剩一个像素点。
+  // 失败时**不**改动现有 model_：用户点了个坏文件，画面应该保持原样。
+  auto loaded = prim::load_and_upload_model(*device_, path, name.empty() ? path : name,
+                                            prim::ModelNormalize{});
+  if (!loaded.ok()) {
+    return fail("load_model(" + name + ") 失败: " + loaded.message());
+  }
+  model_ = loaded.take();
+  model_name_ = name;
+  last_error_.clear();
+  return true;
+}
+
+void SceneRenderer::clear_model() {
+  std::lock_guard<std::mutex> lk(mutex_);
+  model_.reset();
+  model_name_.clear();
+}
+
 std::vector<std::uint32_t> SceneRenderer::supported_msaa_levels() const {
   // 直接转发设备 caps：这是驱动 vkGetPhysicalDeviceImageFormatProperties
   // 查出来的真实结果，不是猜的。UI 拿它来循环切换，就不会点到不支持的档位。
@@ -504,6 +585,8 @@ std::string SceneRenderer::status_text() const {
   std::string s = "frames=" + std::to_string(frame_count_);
   s += " size=" + std::to_string(width_) + "x" + std::to_string(height_);
   s += swapchain_ ? " surface=ok" : " surface=none";
+  s += " rot=" + std::to_string(rotation_deg_);  // 调试用：验证手势轴向时要看它
+  s += " model=" + (model_ ? model_name_ : std::string("cube"));
   if (!last_error_.empty()) s += " last_error=" + last_error_;
   return s;
 }

@@ -163,8 +163,8 @@ SDK 的 L1/L2/L3 还在别处同步落地,UI 层运行时只有 L0。桩的纪�
 - **上屏归壳层**:SDK 不调用 `vkQueuePresentKHR`。`ShellSurfaceSink::present_image()`
   对 L0 只是"记下这一帧录完了"并返回成功 —— 真正的呈现由壳层做。这一点在代码里
   有明确注释,不假装 SDK 自己上屏了。
-- **壳层实现尚未落地**:Windows 侧用 `magicblocks-sink-verify` 验证了接口可用
-  (见 §8),Android/Compose 侧的壳层实现不在本轮范围。
+- **壳层实现**:Windows 侧用 `magicblocks-sink-verify` 验证了接口可用(见 §8);
+  Android/Compose 侧的壳层**已落地**(见 §10),不再属于"本轮不做"。
 - **无文本图集**:标签用占位短横线绘制(`hud.cpp`),spec §9 记的待办。
 - **玩法内容**:`UiApp` 只提供 `IFeatureHost` 骨架与 `FeatureId` 路由,
   不含任何玩法名或玩法逻辑(spec §2 命名纪律)。
@@ -219,4 +219,61 @@ run_frame -> status=Ok phase=Presented submits=0 acquired=1 presented=1
    修法:在 `VulkanFrameRenderer` 构造里调 `init()`,并让调用方检查 `append_*` 返回值。
 2. **`PerfGovernor` 的提交规则过严**:`submit_count != 1` 会把合法的 0 次提交
    (离屏/后台帧)记成违规。改为 `submit_count > 1`。
+
+## 10. Android 壳层(MDP1221 平板)
+
+### 10.1 视图结构
+
+`MainActivity` 的布局是 `FrameLayout` 里的**兄弟节点**,不是嵌套:
+
+```
+FrameLayout
+  ├── EngineSurfaceView   (SDK 的 Vulkan 输出,独立合成层,不参与 Compose 重绘)
+  └── ComposeView         (壳层 UI:左右两个侧栏 + 居中 HUD 文本)
+```
+
+`SurfaceView` 走 `setZOrderMediaOverlay` 之外的默认层级,Compose 只画在两侧
+**不透明面板**上(各 232dp),中间整块区域保持透明,触摸直接落到 `EngineSurfaceView`。
+**不要把 SurfaceView 塞进 Compose 的 `AndroidView`** —— 那会把它变成 Compose
+子节点,合成层被吞进 Compose,输入与帧率都会退化。
+
+### 10.2 左右分栏
+
+| 区域 | 内容 |
+|---|---|
+| 左栏「预设模型」 | `LazyColumn`:内置立方体 + `assets/res/models/*.obj` 扫描结果;空/扫描中/失败三态 + 「重新扫描」 |
+| 右栏「功能」 | 缩放 −/+、复位视角、隐藏/显示信息、按设备能力枚举的 MSAA 档位 |
+| 中间 | 一行 HUD 文本(旋转角、当前模型、帧率) |
+
+模型扫描在**后台线程**做(`ModelCatalog.scan`),结果回到主线程;失败返回
+`ModelScan.Failed(reason)` 而不是抛异常。
+
+### 10.3 资源管线
+
+`assets/res/` 与 `*.obj` 被 `assets/.gitignore` 排除。`tools/fetch-assets.ps1`
+按 `assets.lock.json`(sha256 校验)从本地 RayTracing 安装目录填充;
+`android/app/build.gradle` 增加了 `checkPresetModels` 任务并在 `preBuild` 前跑,
+缺 `.obj` 时**直接让构建失败**,不静默出一个没有模型的 APK。
+
+`sdk` 侧加载路径:`ModelCatalog.materialize()` 把 asset 解压到 `cacheDir/models`,
+用 APK 的 `lastUpdateTime` 做 `.stamp`,按长度比对逐文件校验,并清理旧版本的残留
+文件;之后 `nativeLoadModel(path, name)` 走 `prim::load_and_upload_model`。
+
+### 10.4 手势轴向(重要)
+
+平板面板物理竖屏、Activity 锁横屏,所以 `Display.getRotation() == ROTATION_90`,
+逻辑坐标窗口 2160x1440、物理屏 1440x2160。**`MotionEvent` 的 x/y 是逻辑坐标**,
+必须映射到视觉(物理)坐标之后才能驱动旋转,否则"左右滑"会变成"上下转"。
+
+映射只存在于 `EngineSurfaceView.applyRotationDelta` 一处:
+
+```
+rot=90/270 时先交换 dx/dy,然后
+  yaw   += vx * ROT_PER_PX   // 左右滑 → 绕世界 Y 轴(左右转)
+  pitch += vy * ROT_PER_PX   // 上下滑 → 绕世界 X 轴(上下翻),夹在 ±1.4835 rad
+```
+
+C++ 侧(`scene_renderer.cpp`)**恒**按 `yaw→Y、pitch→X` 组装旋转矩阵,不随
+`rot90` 交换 —— 上一次的 bug 正是两边都各交换了一次,叠成两次错误。
+`rot90` 在 C++ 里只保留给宽高比补偿(那是像素密度问题,与轴向无关)。
 

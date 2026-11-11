@@ -5,6 +5,7 @@ import android.content.Context
 import android.util.Log
 import android.view.Choreographer
 import android.view.MotionEvent
+import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import kotlin.math.abs
@@ -25,8 +26,9 @@ import kotlin.math.tan
  *     而且 SurfaceView 的 buffer 由 SurfaceFlinger 直接合成 —— 引擎写进去的
  *     像素**不经过** CPU，也不经过 Compose 重绘。
  *
- * 交互：
- *   单指拖动  → 旋转（水平拖 yaw，垂直拖 pitch）
+ * 交互（方向按用户看到的物理屏幕算，见 [applyRotationDelta]）：
+ *   单指左右拖 → 左右转（yaw，绕世界 Y 轴）
+ *   单指上下拖 → 上下转（pitch，绕世界 X 轴）
  *   松手      → 惯性：按松手瞬间的角速度继续转，速度指数衰减到 0
  *   双指捏合  → 缩放
  *   双指拖动  → 平移
@@ -56,6 +58,63 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
     /** 给外面（Compose 状态栏）读的统计信息。 */
     var onStatus: ((String) -> Unit)? = null
     private var lastStatusAt = 0L
+
+    // ---------------------------------------------------------------- 性能统计(fps HUD)
+    //
+    // 为什么不直接数 Choreographer 的回调次数：那测的是"UI 线程有没有被叫醒"，
+    // 而这里要的是"引擎真的把画面交给合成器了几次"。所以只在 session.render()
+    // **成功返回**时计数 —— 失败帧不进 fps，而是进 renderFailCount，
+    // 否则渲染全挂的时候 HUD 反而会显示一个漂亮的 fps。
+    //
+    // 窗口取 1 秒：短于 1 秒数值抖得没法看，长于 1 秒对"拖动时掉帧"反应太慢。
+    private var frameCount = 0
+    private var frameTotal = 0L
+    private var renderFailCount = 0
+
+    /** 最近一个统计窗口内的帧渲染耗时累加(ns)，用于算平均。 */
+    private var frameCostAccNs = 0L
+    private var frameCostMaxNs = 0L
+    private var windowStartNs = 0L
+
+    /** 引擎侧一次采样的性能快照，供 Compose 状态栏展示。 */
+    data class PerfSnapshot(
+        val fps: Float,
+        val frameMsAvg: Float,
+        val frameMsMax: Float,
+        val renderFailRate: Float,
+        val msaa: Int,
+    )
+
+    private var perf = PerfSnapshot(0f, 0f, 0f, 0f, 1)
+
+    /** 最近一次 [PerfSnapshot]。UI 线程直接读，值由渲染线程发布。 */
+    fun currentPerf(): PerfSnapshot = perf
+
+    // ================================================================ 屏幕朝向
+    //
+    // Activity 是 landscape 锁定的，但设备可以是"逻辑横屏 + 物理竖屏"（ROTATE_90）
+    // 或"逻辑横屏 + 物理横屏"（ROTATE_0）。两种情况下 MotionEvent 的坐标系不同：
+    // 前者事件 x/y 是逻辑横屏轴，而用户看到的画面沿物理竖屏排布 ——
+    // 手势方向必须换算，否则"左右拖"会变成"上下转"（真机上复现过）。
+    //
+    // 由 Activity 通过 [setRotationListener] 注入，避免这里自己去拿 Display
+    // （View 可能还没 attach，getDisplay 会返回 null）。
+    private var displayRotation: Int = Surface.ROTATION_0
+    private var rotationListener: ((Int) -> Unit)? = null
+
+    /** 注册"屏幕朝向变化"回调，参数是 Display.getRotation()。立即回调一次当前值。 */
+    fun setRotationListener(listener: (Int) -> Unit) {
+        rotationListener = listener
+        listener(displayRotation)
+    }
+
+    /** 以 Display.getRotation() 语义设定当前屏幕朝向。 */
+    fun setDisplayRotation(rotation: Int) {
+        if (rotation == displayRotation) return
+        displayRotation = rotation
+        Log.i(MbRenderer.TAG, "屏幕朝向 rotation=$rotation（旋转轴映射已随之切换）")
+        rotationListener?.invoke(rotation)
+    }
 
     // ================================================================ MSAA
     //
@@ -136,6 +195,7 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
     override fun surfaceDestroyed(holder: SurfaceHolder) {
         Log.i(MbRenderer.TAG, "surfaceDestroyed")
         stopFling()
+        stopRenderLoop()
         session.detachSurface()
     }
 
@@ -151,11 +211,53 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         Log.i(MbRenderer.TAG, "MSAA 请求 ${msaaSamples}x → 实际 ${msaaEffective}x（支持: ${supportedMsaaLevels()}）")
         // 建好交换链后立刻画一帧，避免第一屏是黑的
         renderOnce()
+        // 再起常驻循环：切模型/转视角都要有帧；surfaceDestroyed 会把它停掉。
+        startRenderLoop()
     }
 
     private fun renderOnce() {
+        // 计时包住 session.render()：这段时间 = 录制 + 提交 + 等 GPU 完成 + present，
+        // 也就是"这一帧让渲染线程占用了多久"。它不等于 GPU 执行时间（那是另一回事），
+        // 但正是它决定渲染线程能不能跑满目标帧率。
+        val t0 = System.nanoTime()
         val ok = session.render(yaw, pitch, scale, panX, panY)
+        val costNs = System.nanoTime() - t0
+
         val now = System.currentTimeMillis()
+        if (ok) {
+            ++frameCount
+            ++frameTotal
+            frameCostAccNs += costNs
+            if (costNs > frameCostMaxNs) frameCostMaxNs = costNs
+        } else {
+            ++renderFailCount
+        }
+
+        // 1 秒一个窗口：算出 fps / 平均耗时 / 峰值耗时 / 失败率，然后清零重新累计。
+        val nowNs = System.nanoTime()
+        if (windowStartNs == 0L) windowStartNs = nowNs
+        val windowNs = nowNs - windowStartNs
+        if (windowNs >= FPS_WINDOW_NS) {
+            val fps = frameCount * 1e9f / windowNs
+            val failRate = if (frameCount + renderFailCount > 0) {
+                renderFailCount * 100f / (frameCount + renderFailCount)
+            } else {
+                0f
+            }
+            perf = PerfSnapshot(
+                fps = fps,
+                frameMsAvg = if (frameCount > 0) (frameCostAccNs.toDouble() / frameCount / 1e6).toFloat() else 0f,
+                frameMsMax = frameCostMaxNs / 1e6f,
+                renderFailRate = failRate,
+                msaa = session.msaaSamples(),
+            )
+            frameCount = 0
+            renderFailCount = 0
+            frameCostAccNs = 0L
+            frameCostMaxNs = 0L
+            windowStartNs = nowNs
+        }
+
         if (now - lastStatusAt > 500) {
             lastStatusAt = now
             onStatus?.invoke(session.status())
@@ -227,19 +329,49 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         return true
     }
 
-    /** 单指：拖动 = 旋转。 */
+    /**
+     * 单指：拖动 = 旋转。
+     *
+     * 映射约定（**屏幕**方向 → **视觉**方向，与 MainActivity 的横屏锁定配套）：
+     *   屏幕左右滑 → 左右转（yaw，绕世界 Y 轴）
+     *   屏幕上下滑 → 上下转（pitch，绕世界 X 轴）
+     *
+     * 为什么方向按"物理屏幕"算而不是直接拿 MotionEvent 的 x/y：
+     * 这台 pad 是横屏应用但面板物理竖置（SurfaceFlinger 会做 ROTATE_90）。
+     * SurfaceView 挂在 ROTATE_90 的窗口下时，MotionEvent 的 x/y 是**逻辑横屏**
+     * 坐标系，而用户看到的画面是**物理竖屏**排布 —— 手指在物理屏上左右滑，
+     * 事件里给出的却是一截 dY。不做换算，就会出现"左右拖像上下转"。
+     * 换算表由 [displayRotation] 给出（Activity 用 [setRotationListener] 同步）。
+     */
     private fun handleOneFinger(event: MotionEvent) {
         val dx = event.x - lastX
         val dy = event.y - lastY
-        // 0.006 rad/px：拖过整个屏幕宽度大约转半圈
-        yaw += dx * ROT_PER_PX
-        pitch += dy * ROT_PER_PX
-        pitch = pitch.coerceIn(-PITCH_LIMIT, PITCH_LIMIT)
+        applyRotationDelta(dx, dy)
         lastX = event.x
         lastY = event.y
         // 单指阶段不产生平移，但焦点要跟着走，否则从双指切回来时会跳
         lastFocusX = event.x
         lastFocusY = event.y
+    }
+
+    /**
+     * 把一截**逻辑坐标**下的位移换算成视觉上的旋转量。
+     *
+     * displayRotation 是 Display.getRotation()：
+     *   0/180（逻辑横屏，与物理排布一致）→ 直接用
+     *   90/270（图片被转了 90°，事件仍按逻辑横屏上报）→ 交换 x/y
+     *
+     * 交换的理由见 [handleOneFinger]。这里只交换坐标，**不**在 C++ 侧做任何轴互换
+     * —— 轴向映射只写一处，写两遍迟早会互相抵消出一个新 bug。
+     */
+    private fun applyRotationDelta(dx: Float, dy: Float) {
+        val swapped = displayRotation == Surface.ROTATION_90 || displayRotation == Surface.ROTATION_270
+        val vx = if (swapped) dy else dx   // 视觉水平位移
+        val vy = if (swapped) dx else dy   // 视觉垂直位移
+        // ROT_PER_PX 是弧度/像素：拖过整个屏幕宽度大约转半圈
+        yaw += vx * ROT_PER_PX
+        pitch += vy * ROT_PER_PX
+        pitch = pitch.coerceIn(-PITCH_LIMIT, PITCH_LIMIT)
     }
 
     /** 双指：距离变化 = 缩放，焦点移动 = 平移。 */
@@ -454,8 +586,64 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         renderOnce()
     }
 
+    // ------------------------------------------------------------ 渲染循环
+    //
+    // 为什么需要它：换了预设模型之后必须**主动**出一帧，否则屏幕停在上一帧
+    // （旧实现只在触摸时渲染，切换模型会看起来"什么都没发生"）。
+    // 常驻循环的代价是持续出帧，但这条路径没有任何 CPU 回读，GPU 只写自己的
+    // buffer；而且这正是 demo 要展示的东西 —— 模型一直在转、帧率是真的。
+    //
+    // 前后台：surfaceDestroyed / dispose 停，surfaceCreated（attach）时再起。
+
+    private var renderLoopRunning = false
+
+    // 类型必须显式写出：`val x = FrameCallback { ... postFrameCallback(x) }`
+    // 会让类型推断撞上递归（Kotlin: TYPECHECKER_HAS_RUN_INTO_RECURSIVE_PROBLEM）。
+    private val renderLoop: Choreographer.FrameCallback = object : Choreographer.FrameCallback {
+        override fun doFrame(frameTimeNanos: Long) {
+            if (!renderLoopRunning) return
+            renderOnce()
+            choreographer.postFrameCallback(this)
+        }
+    }
+
+    /** 启动常驻渲染循环（幂等）。 */
+    fun startRenderLoop() {
+        if (renderLoopRunning) return
+        if (!holder.surface.isValid) return
+        renderLoopRunning = true
+        choreographer.postFrameCallback(renderLoop)
+    }
+
+    /** 停止常驻渲染循环（幂等）。 */
+    fun stopRenderLoop() {
+        if (!renderLoopRunning) return
+        renderLoopRunning = false
+        choreographer.removeFrameCallback(renderLoop)
+    }
+
+    // ------------------------------------------------------------ 预设模型
+
+    /**
+     * 切到 `item` 指定的预设模型；`null` = 切回内置立方体。
+     *
+     * 失败返回 false（原因由引擎写进 status_text，会出现在 HUD 里），
+     * 并且**画面保持原状** —— 不会因为点了个坏文件就掉回立方体。
+     */
+    fun selectModel(item: ModelItem?): Boolean {
+        val ok = if (item == null) {
+            session.clearModel()
+            true
+        } else {
+            session.loadModel(item.path, item.name)
+        }
+        renderOnce()
+        return ok
+    }
+
     fun dispose() {
         stopFling()
+        stopRenderLoop()
         session.destroy()
     }
 
@@ -487,6 +675,9 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
     fun requestedMsaaSamples(): Int = msaaSamples
 
     private companion object {
+        // fps 统计窗口：短于 1 秒数值抖得没法看，长于 1 秒对"拖动时掉帧"反应太慢。
+        const val FPS_WINDOW_NS = 1_000_000_000L
+
         // 相机
         const val CAM_DIST = 2.6f
         const val FOV_Y_RAD = (60.0 * Math.PI / 180.0).toFloat()

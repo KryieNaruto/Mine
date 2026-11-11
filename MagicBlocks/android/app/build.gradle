@@ -50,7 +50,45 @@ android {
     packaging {
         jniLibs { useLegacyPackaging = false }
     }
+
+    // 预设模型：直接打进 APK 的 assets/res/models。
+    //
+    // 源目录沿用 `assets/`（与桌面 CLI / L3 预设模型目录是**同一份**文件，
+    // 由 tools/fetch-assets.ps1 按 assets.lock.json 校验），不在这里另存一份，
+    // 否则桌面上看到的模型和 pad 上看到的会悄悄分叉。
+    // 该目录下的 OBJ 不入 git（见 assets/.gitignore），所以缺文件时构建先拦下来，
+    // 而不是让 APK 里悄悄少两个模型。
+    sourceSets {
+        main {
+            assets.srcDirs += file('../../assets')
+        }
+    }
 }
+
+// 构建前检查：assets/res/models 必须存在且至少有一个 .obj。
+// 缺的时候 fail 掉，而不是让 App 跑起来后显示一个空列表（那是两个完全不同的 bug）。
+tasks.register('checkPresetModels') {
+    def modelDir = file('../../assets/res/models')
+    def dstDir = file("$buildDir/generated/presetModelManifest")
+    outputs.dir(dstDir)
+    doLast {
+        def objs = modelDir.exists() ? (modelDir.listFiles() ?: []).findAll {
+            it.isFile() && it.name.toLowerCase().endsWith('.obj') && it.length() > 0
+        } : []
+        if (objs.isEmpty()) {
+            throw new GradleException(
+                "预设模型目录为空或不存在: ${modelDir}\n" +
+                "先执行 MagicBlocks/tools/fetch-assets.ps1 拉取模型（按 assets.lock.json 校验）。")
+        }
+        // 既有文件检查，也顺手写一份清单：打包后可以直接对照 APK 里该有哪些模型。
+        dstDir.mkdirs()
+        new File(dstDir, "preset_models.txt").text =
+            objs.collect { "${it.name}\t${it.length()}" }.sort().join("\n") + "\n"
+        logger.lifecycle("预设模型 ${objs.size()} 个: " + objs.collect { it.name }.sort().join(", "))
+    }
+}
+
+tasks.named('preBuild').configure { dependsOn 'checkPresetModels' }
 
 dependencies {
     implementation 'androidx.core:core-ktx:1.13.1'

@@ -200,7 +200,7 @@ VkRenderPass create_pass(VkDevice device, const PassShape& shape, std::string* e
 }  // namespace
 
 Status submit_device_frame(const VulkanContext& ctx, const VulkanCommandList& list,
-                           DeviceFrameStats* out_stats) {
+                           DeviceFrameStats* out_stats, VkFence* reusable_fence) {
   DeviceFrameStats stats{};
   if (ctx.device == VK_NULL_HANDLE || ctx.queue == VK_NULL_HANDLE) {
     return Status::InitFailed("submit_device_frame: 设备未初始化");
@@ -665,24 +665,66 @@ Status submit_device_frame(const VulkanContext& ctx, const VulkanCommandList& li
   }
 
   if (s.ok()) {
-    VkFenceCreateInfo fci{};
-    fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    // 这个等待**必须**保留:紧随其后的 cleanup() 会销毁本帧的 framebuffer /
+    // imageView / renderPass,调用方在函数返回后也会立刻丢弃命令列表。
+    // 丢掉等待就是 use-after-free + VUID。
+    //
+    // 但不该每帧 vkCreateFence + vkDestroyFence,也不该 UINT64_MAX 无界等:
+    //   * 调用方(VulkanRenderDevice)可以传入同一个可复用的 fence(reusable_fence),
+    //     池的建立与销毁归它自己,生命周期严格绑定 VkDevice。
+    //   * 等待改成有界超时。上个月那个 1fps 事故正是那次无界等待的表现:
+    //     acquire 拿不到 fence 时进程静默空转,CPU 0%、没有任何报错。
+    //     有界超时把"默默卡死"变成一条能查的错误。
+    constexpr std::uint64_t kSubmitTimeoutNs = 1'000'000'000ull;  // 1s
+
     VkFence fence = VK_NULL_HANDLE;
-    vr = vkCreateFence(ctx.device, &fci, nullptr, &fence);
-    if (vr != VK_SUCCESS) {
-      s = Status::InitFailed(fmt_err("submit_device_frame: vkCreateFence", vr));
+    // "池"是否存在,决定谁负责销毁:
+    //   reusable_fence == nullptr -> 临时 fence,本函数建、本函数销毁;
+    //   否则 -> fence 归调用方的池,本函数**绝不**销毁(哪怕这一帧是它刚建出来的),
+    //   否则池里会留下悬垂句柄,后续帧复用即无效对象 + 崩溃。
+    const bool pool_owned_by_caller = (reusable_fence != nullptr);
+    const bool need_create = (!pool_owned_by_caller || *reusable_fence == VK_NULL_HANDLE);
+    if (!need_create) {
+      // 复用同个还处于 signaled 的 fence:提交前必须先复位,否则 vkWaitForFences
+      // 会立刻返回,等于没等(这正是 1fps 事故的形态)。
+      fence = *reusable_fence;
+      vr = vkResetFences(ctx.device, 1, &fence);
+      if (vr != VK_SUCCESS) {
+        s = Status::InitFailed(fmt_err("submit_device_frame: vkResetFences", vr));
+      }
     } else {
+      VkFenceCreateInfo fci{};
+      fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+      vr = vkCreateFence(ctx.device, &fci, nullptr, &fence);
+      if (vr != VK_SUCCESS) {
+        s = Status::InitFailed(fmt_err("submit_device_frame: vkCreateFence", vr));
+      } else if (reusable_fence != nullptr) {
+        *reusable_fence = fence;  // 交给调用方保管,不在本函数销毁
+      }
+    }
+
+    if (s.ok()) {
       VkSubmitInfo si{};
       si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
       si.commandBufferCount = 1;
       si.pCommandBuffers = &cmd;
       vr = vkQueueSubmit(ctx.queue, 1, &si, fence);
-      if (vr == VK_SUCCESS) vr = vkWaitForFences(ctx.device, 1, &fence, VK_TRUE, UINT64_MAX);
+      if (vr != VK_SUCCESS) {
+        s = Status::InitFailed(fmt_err("submit_device_frame: 提交", vr));
+      } else {
+        vr = vkWaitForFences(ctx.device, 1, &fence, VK_TRUE, kSubmitTimeoutNs);
+        if (vr == VK_TIMEOUT) {
+          s = Status::DeviceLost("submit_device_frame: 等待本帧 GPU 完成超时(1s)");
+        } else if (vr != VK_SUCCESS) {
+          s = Status::InitFailed(fmt_err("submit_device_frame: 等待本帧完成", vr));
+        }
+      }
+    }
+    // 只有自己建的 fence 才在这里销毁;复用池里的归调用方。
+    if (!pool_owned_by_caller && fence != VK_NULL_HANDLE) {
       vkDestroyFence(ctx.device, fence, nullptr);
-      if (vr != VK_SUCCESS) s = Status::InitFailed(fmt_err("submit_device_frame: 提交", vr));
     }
   }
-
   cleanup();
   if (s.ok() && out_stats != nullptr) *out_stats = stats;
   return s;

@@ -18,9 +18,11 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "magicblocks/device/render_device.h"
 #include "magicblocks/device/swapchain.h"
+#include "magicblocks/primitives/model_catalog.h"
 #include "magicblocks/primitives/types.h"
 #include "magicblocks/resources/buffer.h"
 #include "magicblocks/resources/command.h"
@@ -62,7 +64,9 @@ class SceneRenderer {
 
   // 渲染一帧并直接呈现到 Surface。全程无 CPU 回读。
   //
-  // yaw/pitch : 单位弧度，绕 Y / X 轴的旋转。
+  // 轴向约定（见 record_into 里的说明，别再改回去）：
+  //   yaw   : 绕世界 Y 轴（视觉上的**左右**转）  ← 屏幕左右滑
+  //   pitch : 绕世界 X 轴（视觉上的**上下**转，夹在 ±85°）← 屏幕上下滑
   // scale     : 缩放（双指捏合），本质是相机拉近拉远。
   // pan_x/y   : 平移（双指拖动），单位是**世界空间**的偏移量 ——
   //             由 Kotlin 侧按"屏幕像素 / 当前可视宽度"换算好再传进来，
@@ -71,6 +75,22 @@ class SceneRenderer {
                     std::string* err);
 
   bool surface_ready() const { return swapchain_ != nullptr; }
+
+  // ---------------------------------------------------------------- 预设模型
+  //
+  // 场景里的物体默认是内置立方体；Kotlin 侧从列表里选中某个预设 OBJ 后，
+  // 后续每一帧都画它（覆盖内置立方体）。"画哪一层"由这里决定，Kotlin 只给路径。
+
+  // 切到 `path` 指定的 OBJ。成功返回 true；失败返回 false 且**保持原状**
+  // （不静默切回立方体，也不留半成品网格）。`name` 只用于日志/状态文本。
+  //
+  // 必须在 UI 线程调用（与 render_frame 同一个线程）：内部要建 GPU 缓冲。
+  bool load_model(const std::string& path, const std::string& name, std::string* err);
+
+  // 切回内置立方体（释放已加载的模型）。
+  void clear_model();
+
+  bool has_model() const { return model_ != nullptr; }
 
   // MSAA 采样数（1=关闭）。必须在 attach_window **之前**设置 ——
   // 采样数决定交换链建几张什么规格的 MS 图，也决定管线按几采样建。
@@ -105,6 +125,11 @@ class SceneRenderer {
   std::unique_ptr<res::IPipeline> pipeline_;
   std::uint64_t pipeline_hash_ = 0;
   std::uint32_t index_count_ = 0;
+
+  // 当前选中的预设模型（null = 画内置立方体）。所有权归这里：加载成功才替换，
+  // 失败时旧模型原样保留 —— 用户点了列表里一个坏文件，画面不该跟着变黑。
+  std::unique_ptr<prim::ILoadedModel> model_;
+  std::string model_name_;
 
   // ANativeWindow 引用：attach 时持有，detach 时释放（引用由 JNI 层的
   // ANativeWindow_fromSurface 产生，见 jni_bridge.cpp）。

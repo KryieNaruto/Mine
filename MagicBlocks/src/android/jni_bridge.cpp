@@ -6,12 +6,14 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #if defined(MB_ANDROID_USE_NDK)
 #include <android/native_window.h>
 #include <android/native_window_jni.h>
 #endif
 
+#include "magicblocks/primitives/model_catalog.h"
 #include "scene_renderer.h"
 
 namespace {
@@ -137,6 +139,82 @@ Java_com_magicblocks_pad_MbRenderer_nativeSupportedMsaa(JNIEnv* env, jclass, jlo
   }
   if (s.empty()) s = "1";
   return env->NewStringUTF(s.c_str());
+}
+
+// ---- 预设模型列表 ----
+//
+// 列表数据来自 `primitives::scan_model_dir`（只列目录、读文件大小，不解析 OBJ），
+// 由**资源代理**（Kotlin 的 ModelCatalog）把 APK assets 解到缓存目录后把路径传进来。
+//
+// 返回格式：每行一个条目，字段用 '\t' 分隔，顺序固定
+//     name \t path \t bytes \t ok(0/1) \t message
+// 首行为 "ok" 或 "err\t<原因>"：目录不存在/不可读时**必须**能与"空目录"区分开。
+
+JNIEXPORT jstring JNICALL
+Java_com_magicblocks_pad_MbRenderer_nativeListModels(JNIEnv* env, jclass, jstring directory) {
+  if (!directory) return env->NewStringUTF("err\t目录为 null");
+  const char* raw = env->GetStringUTFChars(directory, nullptr);
+  if (!raw) return env->NewStringUTF("err\t读取路径失败");
+  const std::string dir(raw);
+  env->ReleaseStringUTFChars(directory, raw);
+
+  const auto scanned = magicblocks::primitives::scan_model_dir(dir);
+  std::string out;
+  if (!scanned.ok()) {
+    out = "err\t" + scanned.message();
+  } else {
+    out = "ok\n";
+    for (const auto& m : scanned.value()) {
+      out += m.name;
+      out += '\t';
+      out += m.path;
+      out += '\t';
+      out += std::to_string(m.bytes);
+      out += '\t';
+      out += m.ok ? '1' : '0';
+      out += '\t';
+      out += m.message;
+      out += '\n';
+    }
+  }
+  return env->NewStringUTF(out.c_str());
+}
+
+// 切到某个预设模型。成功返回 true；失败返回 false（原因写进 status_text）。
+// 失败时渲染器**保持原状** —— 这条契约由 SceneRenderer::load_model 保证。
+JNIEXPORT jboolean JNICALL
+Java_com_magicblocks_pad_MbRenderer_nativeLoadModel(JNIEnv* env, jclass, jlong handle,
+                                                    jstring path, jstring name) {
+  auto* r = unpack(handle);
+  if (!r) return JNI_FALSE;
+  if (!path) return JNI_FALSE;
+
+  const char* raw_path = env->GetStringUTFChars(path, nullptr);
+  if (!raw_path) return JNI_FALSE;
+  const std::string p(raw_path);
+  env->ReleaseStringUTFChars(path, raw_path);
+
+  std::string n;
+  if (name) {
+    const char* raw_name = env->GetStringUTFChars(name, nullptr);
+    if (raw_name) {
+      n = raw_name;
+      env->ReleaseStringUTFChars(name, raw_name);
+    }
+  }
+
+  std::string err;
+  if (!r->load_model(p, n, &err)) {
+    log_native(env, err);
+    return JNI_FALSE;
+  }
+  return JNI_TRUE;
+}
+
+// 切回内置立方体。
+JNIEXPORT void JNICALL
+Java_com_magicblocks_pad_MbRenderer_nativeClearModel(JNIEnv*, jclass, jlong handle) {
+  if (auto* r = unpack(handle)) r->clear_model();
 }
 
 // Surface -> ANativeWindow*。ANativeWindow_fromSurface 会给引用计数 +1，

@@ -74,6 +74,14 @@ VulkanRenderDevice::~VulkanRenderDevice() {
   // 顺序关键:fence 必须在 VkDevice 之前销毁;
   // 分配器要在 VkDevice 之前销毁(VMA 持有 VkDevice),但晚于所有资源。
   frame_sync_.reset();
+  // 逐帧提交的 fence 池同样必须在 VkDevice 之前销毁,否则 VUID-vkDestroyDevice-device-05137
+  // (leaked objects: VkFence)。上面那句 vkDeviceWaitIdle 已保证没有在飞的帧。
+  for (std::uint32_t fi = 0; fi < kSubmitFenceSlots; ++fi) {
+    if (submit_fences_[fi] != VK_NULL_HANDLE) {
+      vkDestroyFence(ctx_.device, submit_fences_[fi], nullptr);
+      submit_fences_[fi] = VK_NULL_HANDLE;
+    }
+  }
   if (ctx_.cmd_pool) vkDestroyCommandPool(ctx_.device, ctx_.cmd_pool, nullptr);
   allocator_.reset();
   ctx_.allocator = nullptr;
@@ -627,7 +635,11 @@ Status VulkanRenderDevice::submit_command_list(resources::ICommandList& list) {
   // 统计只用于本地断言:录了命令却一个 draw 都没下发属于配置错误,要报出来,
   // 而不是返回成功让上层去翻一张空图。
   DeviceFrameStats stats{};
-  Status s = submit_device_frame(ctx_, *cmd, &stats);
+  // fence 池轮转:每帧复用同一个 slot,避免每帧 vkCreateFence/vkDestroyFence。
+  // 这里的 fence 语义是"本帧提交完成",所以池只需保证不重叠使用即可。
+  const std::uint32_t fence_slot = submit_fence_next_;
+  submit_fence_next_ = (submit_fence_next_ + 1) % kSubmitFenceSlots;
+  Status s = submit_device_frame(ctx_, *cmd, &stats, &submit_fences_[fence_slot]);
   // 提交(fence 已等到)后,立刻丢弃本列表在 begin_pass 期间顺带建的
   // VkCommandBuffer / framebuffer / render pass / image view:
   // submit_device_frame 用的是它自己的命令缓冲,这一套从未被使用,
