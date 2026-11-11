@@ -39,3 +39,9 @@ MagicBlocks/tests/data/_out_*.png
 MagicBlocks/android/.gradle/
 MagicBlocks/android/app/.cxx/
 MagicBlocks/android/local.properties
+
+.agent-teams/
+.agents/
+build-*/
+tmp_*/
+MagicBlocks/diffout.txt
