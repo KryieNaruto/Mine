@@ -88,7 +88,7 @@ std::vector<std::uint32_t> build_indices() {
   return idx;
 }
 
-res::PipelineDesc cube_pipeline_desc() {
+res::PipelineDesc cube_pipeline_desc(res::u32 samples) {
   res::PipelineDesc desc;
 
   res::VertexInputBinding binding{};
@@ -134,6 +134,10 @@ res::PipelineDesc cube_pipeline_desc() {
   desc.depth.depthTest = false;
   desc.depth.depthWrite = false;
   desc.push_constant_bytes = static_cast<res::u32>(sizeof(PushConstants));
+  // 管线的采样数**必须**与交换链 render pass 的采样数逐项相同,否则
+  // create_pipeline_for_shape 会直接拒绝(形状 samples=4 与 desc samples=1 不一致)。
+  // 以前这里漏了赋值 → 恒为 1 → 开 ×4 必然建管线失败。
+  desc.samples = samples;
   return desc;
 }
 }  // namespace
@@ -207,8 +211,8 @@ bool SceneRenderer::create_resources(std::string* err) {
   index_count_ = static_cast<std::uint32_t>(inds.size());
   index_buffer_->flush_pending();
 
-  // 管线
-  auto pr = device_->create_pipeline(cube_pipeline_desc());
+  // 管线(attach 之前的初始管线永远是 1x:此时还没有交换链)
+  auto pr = device_->create_pipeline(cube_pipeline_desc(1));
   if (!pr.ok()) return fail("创建管线失败: " + pr.message());
   pipeline_ = pr.take();
   pipeline_hash_ = pipeline_->hash();
@@ -310,7 +314,7 @@ bool SceneRenderer::rebuild_pipeline_for_swapchain(std::string* err) {
   // 上屏帧被丢掉。现在两边同口径，pass_compatible() 也会比较它。
   shape.from_swapchain = true;
 
-  auto pr = vkdev->create_pipeline_for_shape(cube_pipeline_desc(), shape);
+  auto pr = vkdev->create_pipeline_for_shape(cube_pipeline_desc(effective_msaa_samples_), shape);
   if (!pr.ok()) return fail("按交换链形状建管线失败: " + pr.message());
   pipeline_ = pr.take();
   pipeline_hash_ = pipeline_->hash();

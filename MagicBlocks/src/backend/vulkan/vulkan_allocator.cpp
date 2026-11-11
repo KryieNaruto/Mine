@@ -181,6 +181,15 @@ struct VulkanPagingAllocator::Impl {
     u64 idle_frames = 0;    // 连续空置帧数
     bool in_flight = false; // 有在途帧引用 → 不得退回 VMA
     bool host_mapped = false;
+    // **本页当前有几个 vmaMapMemory 建立的映射**(VMA 内部 m_MapCount 的副本)。
+    // VMA 的 unmap 不幂等:多还一次 → BlockAllocUnmap 断言;少还一次 →
+    // ~VmaAllocation_T 断言。两者都 abort 进程(真机表现为启动即闪退)。
+    //
+    // 注意 VMA_ALLOCATION_CREATE_MAPPED_BIT 走的是 **FLAG_PERSISTENT_MAP**,
+    // 它**不**增加 m_MapCount(见 vk_mem_alloc.h 的 InitBlockAllocation /
+    // GetMappedData:"m_MapCount != 0 || IsPersistentMap()")。所以持久映射
+    // 不占计数、释放时也不需要 unmap —— 只有我们需要显式 vmaMapMemory 时才 +1。
+    int vma_map_count = 0;
     // 图像页(G4 替代 L0 裸分配的专用页):整页绑一张 VkImage,不参与桶内切分与 LRU。
     // 生命周期由 allocate_image_page / release_image_page 显式管理。
     bool image_bound = false;
@@ -489,6 +498,7 @@ struct VulkanPagingAllocator::Impl {
     if (p->page_kind == resources::PageKind::HostVisible) {
       p->host_ptr = static_cast<std::uint8_t*>(info.pMappedData);
       p->host_mapped = info.pMappedData != nullptr;
+      // MAPPED_BIT = FLAG_PERSISTENT_MAP,**不计入** m_MapCount,这里保持 0。
     }
     return Status::Ok_();
   }
@@ -499,16 +509,25 @@ struct VulkanPagingAllocator::Impl {
       p->host_storage.shrink_to_fit();
       p->host_ptr = nullptr;
       p->host_mapped = false;
+      p->vma_map_count = 0;
       ++stats.vma_free_count;
       return;
     }
     if (p->vma_allocation != VK_NULL_HANDLE) {
+      // 释放前把还活着的映射**精确**还清:vmaFreeMemory 不会替我们 unmap,
+      // 而 VMA 的 unmap 既不幂等、又对残留映射直接 abort。按 vma_map_count
+      // 逐次还,一次不多一次不少。
+      while (p->vma_map_count > 0) {
+        vmaUnmapMemory(vma, p->vma_allocation);
+        --p->vma_map_count;
+      }
       vmaFreeMemory(vma, p->vma_allocation);
       ++stats.vma_free_count;  // M5:只有真正调用了 vma* 才 +1
     }
     p->vma_allocation = VK_NULL_HANDLE;
     p->host_ptr = nullptr;
     p->host_mapped = false;
+    p->vma_map_count = 0;
   }
 
   // 建一张新页(软件状态 + 物理存储)。**只有 reserve_pages 调它** ——
@@ -942,6 +961,7 @@ void* VulkanPagingAllocator::map_page(u32 page_id) {
   if (vmaMapMemory(m.vma, page->vma_allocation, &mapped) != VK_SUCCESS) return nullptr;
   page->host_ptr = static_cast<std::uint8_t*>(mapped);
   page->host_mapped = mapped != nullptr;
+  if (mapped != nullptr) ++page->vma_map_count;
   return mapped;
 }
 
@@ -953,7 +973,11 @@ device::Status VulkanPagingAllocator::unmap_page(u32 page_id) {
   if (!m.vma_ready || m.vma == VK_NULL_HANDLE) return Status::Ok_();
   if (page->vma_allocation == VK_NULL_HANDLE) return Status::Ok_();
   if (!page->host_mapped) return Status::Ok_();
+  // 只还我们 vmaMapMemory 出来的那一次。持久映射(MAPPED_BIT)不进 m_MapCount,
+  // 计数为 0 时不能调 vmaUnmapMemory —— 那会减一个不存在的映射并断言。
+  if (page->vma_map_count <= 0) return Status::Ok_();
   vmaUnmapMemory(m.vma, page->vma_allocation);
+  --page->vma_map_count;
   page->host_ptr = nullptr;
   page->host_mapped = false;
   return Status::Ok_();
@@ -1474,15 +1498,22 @@ VulkanPagingAllocator::allocate_image_page(const ImagePageRequest& req) {
     ++m.stats.vma_alloc_count;  // M5:真实 vma* 调用才 +1
     if (r != VK_SUCCESS) return Status::OOM(fmt_err("vmaAllocateMemory(图像页)", r));
     p.vma_allocation = allocation;
-  // 显式映射:CUBE_MAPPED_BIT / CPU_TO_GPU 都不保证 pMappedData 非空(取决于
-  // VMA 的内存类型选择与主机可见堆布局),这里按需自己 map 一次。
-  // 若不映射,调用方(vulkan_cubemap)拿不到 CPU 侧地址,upload_face 就无法灌像素 ——
-  // 那是硬失败,不是"可以稍后再说"的事。
+  // 映射:分配时已带 VMA_ALLOCATION_CREATE_MAPPED_BIT,VMA 会把地址写进
+  // info.pMappedData。**优先用它**,不要无脑再 vmaMapMemory 一次 —— 那会让
+  // MapCount 变成 2,释放时必须还两次,是个纯粹自找的对称负担。
+  // 只在 pMappedData 为空时(某些主机可见堆不保证常驻)才自己 map。
   if (!p.host_ptr && m.vma_ready && m.vma != VK_NULL_HANDLE) {
-    void* vma_mapped = nullptr;
-    if (vmaMapMemory(m.vma, p.vma_allocation, &vma_mapped) == VK_SUCCESS) {
-      p.host_ptr = static_cast<std::uint8_t*>(vma_mapped);
-      p.host_mapped = vma_mapped != nullptr;
+    if (info.pMappedData != nullptr) {
+      p.host_ptr = static_cast<std::uint8_t*>(info.pMappedData);
+      p.host_mapped = true;
+      // 持久映射,不占 m_MapCount。
+    } else {
+      void* vma_mapped = nullptr;
+      if (vmaMapMemory(m.vma, p.vma_allocation, &vma_mapped) == VK_SUCCESS) {
+        p.host_ptr = static_cast<std::uint8_t*>(vma_mapped);
+        p.host_mapped = vma_mapped != nullptr;
+        if (vma_mapped != nullptr) p.vma_map_count = 1;
+      }
     }
   }
   }
@@ -1545,6 +1576,12 @@ device::Status VulkanPagingAllocator::release_image_page(u32 page_id) {
   }
   Impl::Page& p = m.pages[index];
   if (m.vma_ready && m.vma != VK_NULL_HANDLE && p.vma_allocation != VK_NULL_HANDLE) {
+    // 同 free_page_storage:按 vma_map_count 精确还清映射再 free。
+    // 少还一次 → ~VmaAllocation_T 断言;多还一次 → BlockAllocUnmap 断言。
+    while (p.vma_map_count > 0) {
+      vmaUnmapMemory(m.vma, p.vma_allocation);
+      --p.vma_map_count;
+    }
     vmaFreeMemory(m.vma, p.vma_allocation);
     ++m.stats.vma_free_count;
   } else if (!m.vma_ready) {
@@ -1555,6 +1592,7 @@ device::Status VulkanPagingAllocator::release_image_page(u32 page_id) {
   p.host_storage.shrink_to_fit();
   p.host_ptr = nullptr;
   p.host_mapped = false;
+  p.vma_map_count = 0;
   p.id = kNoPage;
   p.image_bound = false;
   p.buffer_bound = false;
@@ -1592,7 +1630,11 @@ void VulkanPagingAllocator::unmap_image_page(u32 page_id) {
   if (p == nullptr || !p->image_bound) return;
   if (p->host_ptr == nullptr) return;
   if (m.vma_ready && m.vma != VK_NULL_HANDLE && p->vma_allocation != VK_NULL_HANDLE) {
-    vmaUnmapMemory(m.vma, p->vma_allocation);
+    // 同 unmap_page:持久映射不进 m_MapCount,计数为 0 时不要调 vmaUnmapMemory。
+    if (p->vma_map_count > 0) {
+      vmaUnmapMemory(m.vma, p->vma_allocation);
+      --p->vma_map_count;
+    }
   }
   p->host_ptr = nullptr;
   p->host_mapped = false;
