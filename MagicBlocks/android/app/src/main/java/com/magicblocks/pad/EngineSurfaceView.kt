@@ -46,6 +46,18 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
     private var surfaceWidth = 0
     private var surfaceHeight = 0
 
+    // 必须把 this 注册给 surface 的 holder，否则 SurfaceHolder 永远不会回调
+    // surfaceCreated / surfaceChanged / surfaceDestroyed —— 引擎拿不到 surface，
+    // 渲染循环不启动，表现为"界面画出来但模型区永远不动、没有 MB_PERF"。
+    // 98cc9d9 重写相机手感时误删了这整块 init，导致 surface 路径断链。
+    init {
+        holder.addCallback(this)
+        // 让引擎的 swapchain image 直接浮在窗口最上层时不会被 Compose 遮住
+        holder.setFormat(android.graphics.PixelFormat.OPAQUE)
+        setZOrderOnTop(false)   // 保持在下面，Compose 浮在上面
+        isFocusable = true
+    }
+
     // ---------------------------------------------------------------- 视角状态
     //
     // 相机姿态是**一个单位四元数** q（相机系 → 世界系）。不存 yaw/pitch：
@@ -278,6 +290,25 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
                 frameMsMax = frameCostMaxNs / 1e6f,
                 renderFailRate = failRate,
                 msaa = session.msaaSamples(),
+            )
+            // ── t21 帧率权威判据（每秒一条）──
+            //
+            // 为什么必须是一条日志而不是看 HUD：HUD 是给人看的，截图会受「外部应用抢
+            // 前台」污染（2026-11-11 实测：截到白底画面导致误判「fps 不显示」）。
+            // logcat 是纯文本、可逐条计数、可自动校验前台归属，是唯一可靠读数。
+            //
+            // 字段全部来自本窗口的真实统计，不做任何推算：
+            //   window_ms  本窗口实际时长（≈1000，偏差说明节拍被打断）
+            //   frames     本窗口成功出帧数          → fps = frames / window_ms * 1000
+            //   fails      本窗口 render 失败次数    → 恒为 0 才是正常
+            //   ms_avg/max 平均/峰值单帧耗时（ms）
+            //   msaa       当前生效采样数
+            //   status     引擎自报状态（含 frames/size/surface/rot/model）
+            Log.i(
+                "MB_PERF",
+                "window_ms=${windowNs / 1_000_000} frames=$frameCount fails=$renderFailCount " +
+                    "fps=${"%.2f".format(fps)} ms_avg=${"%.2f".format(perf.frameMsAvg)} " +
+                    "ms_max=${"%.1f".format(perf.frameMsMax)} msaa=${perf.msaa} status=${session.status()}"
             )
             frameCount = 0
             renderFailCount = 0
