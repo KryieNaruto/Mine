@@ -80,13 +80,13 @@ Java_com_magicblocks_pad_MbRenderer_nativeSurfaceDestroyed(JNIEnv*, jclass, jlon
 }
 
 JNIEXPORT jboolean JNICALL
-Java_com_magicblocks_pad_MbRenderer_nativeRenderFrame(JNIEnv* env, jclass, jlong handle, jfloat yaw,
-                                                      jfloat pitch, jfloat scale, jfloat pan_x,
-                                                      jfloat pan_y) {
+Java_com_magicblocks_pad_MbRenderer_nativeRenderFrame(JNIEnv* env, jclass, jlong handle, jfloat qx,
+                                                      jfloat qy, jfloat qz, jfloat qw, jfloat scale,
+                                                      jfloat pan_x, jfloat pan_y) {
   auto* r = unpack(handle);
   if (!r) return JNI_FALSE;
   std::string err;
-  if (!r->render_frame(yaw, pitch, scale, pan_x, pan_y, &err)) {
+  if (!r->render_frame(qx, qy, qz, qw, scale, pan_x, pan_y, &err)) {
     log_native(env, "render_frame 失败: " + err);
     return JNI_FALSE;
   }

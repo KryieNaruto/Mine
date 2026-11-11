@@ -31,8 +31,10 @@ object MbRenderer {
     external fun nativeSurfaceDestroyed(handle: Long)
     external fun nativeRenderFrame(
         handle: Long,
-        yaw: Float,
-        pitch: Float,
+        qx: Float,
+        qy: Float,
+        qz: Float,
+        qw: Float,
         scale: Float,
         panX: Float,
         panY: Float
@@ -118,9 +120,9 @@ class EngineSession {
      * yaw/pitch 单位是弧度，scale 是双指缩放倍数，
      * panX/panY 是世界空间的平移偏移（Kotlin 侧已按可视宽度换算）。
      */
-    fun render(yaw: Float, pitch: Float, scale: Float, panX: Float, panY: Float): Boolean {
+    fun render(qx: Float, qy: Float, qz: Float, qw: Float, scale: Float, panX: Float, panY: Float): Boolean {
         if (handle == 0L || !surfaceAttached) return false
-        return MbRenderer.nativeRenderFrame(handle, yaw, pitch, scale, panX, panY)
+        return MbRenderer.nativeRenderFrame(handle, qx, qy, qz, qw, scale, panX, panY)
     }
 
     fun status(): String = if (handle == 0L) "no-handle" else MbRenderer.nativeStatus(handle)

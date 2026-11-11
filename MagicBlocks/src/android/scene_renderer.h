@@ -64,16 +64,18 @@ class SceneRenderer {
 
   // 渲染一帧并直接呈现到 Surface。全程无 CPU 回读。
   //
-  // 相机约定（见 record_into 里的说明，别再改成"转物体"）：
-  //   旋转实现的是**摄像机环绕**，物体在世界里始终不动、模型矩阵恒为单位阵。
-  //   yaw   : 相机绕世界 Y 轴的方位角（视觉上的**左右**转）  ← 屏幕左右滑
-  //   pitch : 相机绕世界 X 轴的俯仰角（视觉上的**上下**转，夹在 ±85°）← 屏幕上下滑
-  //   yaw=pitch=0 是正视图，eye = (0, 0, 2.6/scale)，看向原点。
-  // scale     : 缩放（双指捏合），本质是相机拉近拉远。
-  // pan_x/y   : 平移（双指拖动），单位是**世界空间**的偏移量 ——
-  //             由 Kotlin 侧按"屏幕像素 / 当前可视宽度"换算好再传进来，
-  //             这样平移速度与缩放级别无关（贴着手指走）。
-  bool render_frame(float yaw, float pitch, float scale, float pan_x, float pan_y,
+  // 相机约定（见 record_into 里的说明，别再改成"转物体"或欧拉角）：
+  //   **相机姿态是一个单位四元数 (qx,qy,qz,qw)**，不在这里做任何角度分解。
+  //   Kotlin 侧按"绕**相机自身轴**的小旋转"累积 q，因此：
+  //     左右拖 = 绕相机 Y 轴（画面左右转）
+  //     上下拖 = 绕相机 X 轴（画面上下转）
+  //   两个方向永远只作用于机体系，360° 任意角度都不会改变旋转轴、不会万向节锁、
+  //   也没有任何角度夹取。物体在世界里不动，动的永远是摄像机。
+  //   scale     : 缩放（双指捏合），本质是相机沿视线拉近拉远。
+  //   pan_x/y   : 平移（双指拖动），单位是**世界空间**的偏移量 ——
+  //               由 Kotlin 侧按"屏幕像素 / 当前可视宽度"换算好再传进来，
+  //               这样平移速度与缩放级别无关（贴着手指走）。
+  bool render_frame(float qx, float qy, float qz, float qw, float scale, float pan_x, float pan_y,
                     std::string* err);
 
   bool surface_ready() const { return swapchain_ != nullptr; }
@@ -115,8 +117,8 @@ class SceneRenderer {
   bool create_resources(std::string* err);
   void release_window();
   bool rebuild_pipeline_for_swapchain(std::string* err);
-  bool record_into(dev::IRenderTarget* target, float yaw, float pitch, float scale, float pan_x,
-                   float pan_y, std::string* err);
+  bool record_into(dev::IRenderTarget* target, float qx, float qy, float qz, float qw, float scale,
+                   float pan_x, float pan_y, std::string* err);
 
   std::unique_ptr<dev::IRenderDevice> device_;
   std::unique_ptr<dev::ISwapchain> swapchain_;

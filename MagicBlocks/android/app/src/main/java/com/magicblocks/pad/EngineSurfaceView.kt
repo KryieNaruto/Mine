@@ -9,10 +9,13 @@ import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import kotlin.math.abs
+import kotlin.math.cos
 import kotlin.math.exp
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.sin
+import kotlin.math.sqrt
 import kotlin.math.tan
 
 /**
@@ -27,8 +30,8 @@ import kotlin.math.tan
  *     像素**不经过** CPU，也不经过 Compose 重绘。
  *
  * 交互（方向按用户看到的物理屏幕算，见 [applyRotationDelta]）：
- *   单指左右拖 → 左右转（yaw，绕世界 Y 轴）
- *   单指上下拖 → 上下转（pitch，绕世界 X 轴）
+ *   单指左右拖 → 绕**相机自身 Y 轴**转（画面左右转）
+ *   单指上下拖 → 绕**相机自身 X 轴**转（画面上下转）
  *   松手      → 惯性：按松手瞬间的角速度继续转，速度指数衰减到 0
  *   双指捏合  → 缩放
  *   双指拖动  → 平移
@@ -42,8 +45,17 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
     private var surfaceHeight = 0
 
     // ---------------------------------------------------------------- 视角状态
-    private var yaw = 0f
-    private var pitch = 0f
+    //
+    // 相机姿态是**一个单位四元数** q（相机系 → 世界系）。不存 yaw/pitch：
+    // 欧拉角一旦分解，横竖两轴就会互相污染（转着转着旋转轴自己变了）。
+    // 拖动时右乘"绕相机自身轴的小旋转"：
+    //     q ← q * Δq,   Δq = Δq_pitch(局部 X) * Δq_yaw(局部 Y)
+    // 于是无论当前朝向如何，"左右拖只绕相机 Y、上下拖只绕相机 X"永远成立，
+    // 360° 任意角度、没有夹取、没有万向节锁。
+    private var qx = 0f
+    private var qy = 0f
+    private var qz = 0f
+    private var qw = 1f
     private var scale = 1f
     private var panX = 0f   // 世界空间平移
     private var panY = 0f
@@ -220,7 +232,7 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         // 也就是"这一帧让渲染线程占用了多久"。它不等于 GPU 执行时间（那是另一回事），
         // 但正是它决定渲染线程能不能跑满目标帧率。
         val t0 = System.nanoTime()
-        val ok = session.render(yaw, pitch, scale, panX, panY)
+        val ok = session.render(qx, qy, qz, qw, scale, panX, panY)
         val costNs = System.nanoTime() - t0
 
         val now = System.currentTimeMillis()
@@ -391,25 +403,76 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
     }
 
     /**
-     * 把一截**逻辑坐标**下的位移换算成视觉上的相机环绕量。
+     * 把一截**逻辑坐标**下的位移换算成"绕相机自身轴"的转角。
      *
      * displayRotation 是 Display.getRotation()：
      *   0/180（逻辑横屏，与物理排布一致）→ 直接用
      *   90/270（图片被转了 90°，事件仍按逻辑横屏上报）→ 交换 x/y
      *
      * 符号：两个方向都写成"元素往哪边推，画面就往哪边动"（跟手）。
-     *   vx > 0（往右推）→ yaw -= ：相机往左绕，物体看起来跟着手指往右转
-     *   vy > 0（往下推）→ pitch +=：相机抬高，从上方俯视，顶面露出、物体下移
-     * 物体本身在世界里不动，动的永远是摄像机（见 scene_renderer.cpp record_into）。
+     *   vx > 0（往右推）→ 绕相机 +Y 转 -vx*c：物体跟着手指往右转
+     *   vy > 0（往下推）→ 绕相机 +X 转 +vy*c：物体跟着手指往下走，顶面露出来
+     * 转的是摄像机（见 scene_renderer.cpp record_into），物体在世界里不动。
      */
     private fun applyRotationDelta(dx: Float, dy: Float) {
         val swapped = displayRotation == Surface.ROTATION_90 || displayRotation == Surface.ROTATION_270
-        val vx = if (swapped) dy else dx   // 视觉水平位移
-        val vy = if (swapped) dx else dy   // 视觉垂直位移
-        // ROT_PER_PX 是弧度/像素：拖过整个屏幕高度大约转 130°
-        yaw -= vx * ROT_PER_PX
-        pitch += vy * ROT_PER_PX
-        pitch = pitch.coerceIn(-PITCH_LIMIT, PITCH_LIMIT)
+        val vx = if (swapped) dy else dx   // 视觉水平位移（物理屏）
+        val vy = if (swapped) dx else dy   // 视觉垂直位移（物理屏）
+        // 位移 → **绕相机自身轴**的转角，全程没有阈值也没有夹取
+        rotateLocal(yawDelta = -vx * ROT_PER_PX, pitchDelta = vy * ROT_PER_PX)
+    }
+
+    /**
+     * 绕**相机自身轴**转一小步。这是"旋转轴永远不变"的关键。
+     *
+     * 数学（q 是相机系→世界系的单位四元数，四元数乘法左乘=绕世界轴、右乘=绕机体轴）：
+     *     Δq_pitch = (sin(b/2), 0, 0, cos(b/2))   局部 X
+     *     Δq_yaw   = (0, sin(a/2), 0, cos(a/2))   局部 Y
+     *     q ← q * Δq_pitch * Δq_yaw
+     * 先应用 yaw 再应用 pitch：右乘 Δpitch 之后 Δyaw 就发生在**已经转过 pitch 的**
+     * 坐标系里，所以横向永远是"绕当前画面的竖直轴"，不会因为俯仰过大而变成
+     * 绕世界 Y（那就是老实现的症状）。
+     *
+     * 为什么用乘积而不是"先算两个角再合成"：一次拖动只累积一次乘法，
+     * 反复相乘也不会出现欧拉角的万向节问题；四元数本来就能表示 360° 内任意朝向，
+     * 无需 pitch 夹取（模型的上下左右都能转到，看到底面也是合法视角）。
+     */
+    private fun rotateLocal(yawDelta: Float, pitchDelta: Float) {
+        var nx = 0f
+        var ny = 0f
+        var nz = 0f
+        var nw = 1f
+        // ---- 先 q * Δpitch ----
+        if (pitchDelta != 0f) {
+            val sh = sin(pitchDelta * 0.5f)
+            val ch = cos(pitchDelta * 0.5f)
+            // (qx,qy,qz,qw) * (sh,0,0,ch)
+            val ax = qw * sh + qx * ch
+            val ay = qy * ch + qz * sh
+            val az = qz * ch - qy * sh
+            val aw = qw * ch - qx * sh
+            nx = ax; ny = ay; nz = az; nw = aw
+        } else {
+            nx = qx; ny = qy; nz = qz; nw = qw
+        }
+        // ---- 再 (上式) * Δyaw ----
+        if (yawDelta != 0f) {
+            val sh = sin(yawDelta * 0.5f)
+            val ch = cos(yawDelta * 0.5f)
+            // (nx,ny,nz,nw) * (0,sh,0,ch)
+            val ax = nx * ch - nz * sh
+            val ay = ny * ch + nw * sh
+            val az = nz * ch + nx * sh
+            val aw = nw * ch - ny * sh
+            nx = ax; ny = ay; nz = az; nw = aw
+        }
+        // 归一化：几万次乘法后浮点会漂，不归一化相机会慢慢"缩水/变形"
+        val len = sqrt(nx * nx + ny * ny + nz * nz + nw * nw)
+        if (len < 1e-6f) return
+        qx = nx / len
+        qy = ny / len
+        qz = nz / len
+        qw = nw / len
     }
 
     /** 双指：距离变化 = 缩放，焦点移动 = 平移。 */
@@ -468,8 +531,11 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         // 重置滑动窗口：每次手势阶段切换（单指↔双指）都从当前位置重新锚定，
         // 避免把上一阶段的速度算进这一阶段。
         winStartMs = event.eventTime
-        winYaw0 = yaw
-        winPitch0 = pitch
+        // 四元数姿态没有"两条轴的角度"可以相减，所以窗口起点记成 0，
+        // 之后每次 rotateLocal 把这一段的转角**累加**到 winYaw0/winPitch0 上。
+        // 松手时 yawVel = winYaw0 / dt 就是这段的角速度。
+        winYaw0 = 0f
+        winPitch0 = 0f
         winPanX0 = panX
         winPanY0 = panY
     }
@@ -496,8 +562,8 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         val windowMs = min(spanMs, FLING_WINDOW_MS)
         val dt = windowMs / 1000f
 
-        yawVel = (yaw - winYaw0) / dt
-        pitchVel = (pitch - winPitch0) / dt
+        yawVel = winYaw0 / dt
+        pitchVel = winPitch0 / dt
         panXVel = (panX - winPanX0) / dt
         panYVel = (panY - winPanY0) / dt
 
@@ -507,6 +573,9 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         // 速度夹上限：防止极快的一甩把画面"甩飞"
         yawVel = yawVel.coerceIn(-MAX_YAW_VEL, MAX_YAW_VEL)
         pitchVel = pitchVel.coerceIn(-MAX_YAW_VEL, MAX_YAW_VEL)
+        // 新的一段从 0 重新累计，否则下一段会带上这一段的量
+        winYaw0 = 0f
+        winPitch0 = 0f
         startFling()
     }
 
@@ -521,16 +590,16 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         val now = event.eventTime
         if (winStartMs == 0L) {
             winStartMs = now
-            winYaw0 = yaw
-            winPitch0 = pitch
+            winYaw0 = 0f
+            winPitch0 = 0f
             winPanX0 = panX
             winPanY0 = panY
             return
         }
         if (now - winStartMs > FLING_WINDOW_MS.toLong()) {
             winStartMs = now
-            winYaw0 = yaw
-            winPitch0 = pitch
+            winYaw0 = 0f
+            winPitch0 = 0f
             winPanX0 = panX
             winPanY0 = panY
         }
@@ -575,9 +644,9 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         // 用 exp 而不是 (1-k*dt)：后者在掉帧(dt 大)时会变成负数 → 反向抖动。
         val decay = exp(-FLING_DAMPING * dt)
 
-        yaw += yawVel * dt
-        pitch += pitchVel * dt
-        pitch = pitch.coerceIn(-PITCH_LIMIT, PITCH_LIMIT)
+        // 惯性同样绕**相机自身轴**累积（右乘），所以甩出去之后横竖方向依旧
+        // 各自只作用于机体系，不会像欧拉角那样越甩轴越歪。
+        rotateLocal(yawDelta = yawVel * dt, pitchDelta = pitchVel * dt)
         panX -= panXVel * dt
         panY += panYVel * dt
 
@@ -585,9 +654,6 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         pitchVel *= decay
         panXVel *= decay
         panYVel *= decay
-
-        // 俯仰撞到上下限时，把速度也归零，否则会"贴着墙蹭"
-        if (abs(pitch) >= PITCH_LIMIT - 1e-4f) pitchVel = 0f
 
         renderOnce()
 
@@ -608,16 +674,20 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         renderOnce()
     }
 
-    /** 当前视觉状态，供 HUD 显示。 */
+    /** 当前视觉状态，供 HUD 显示。四元数姿态直接显示，不做欧拉角分解（分解会误导）。 */
     fun viewState(): String =
-        "yaw=${"%.2f".format(yaw)} pitch=${"%.2f".format(pitch)} " +
+        "q=(${"%.2f".format(qx)},${"%.2f".format(qy)},${"%.2f".format(qz)},${"%.2f".format(qw)}) " +
             "zoom=${"%.2f".format(scale)} pan=(${"%.2f".format(panX)},${"%.2f".format(panY)})"
 
-    /** 复位视角：回正 + 缩放回 1.0 + 平移归零，并立刻重画一帧。 */
+    /** 复位视角：姿态回单位四元数 + 缩放回 1.0 + 平移归零，并立刻重画一帧。 */
     fun resetView() {
         stopFling()
-        yaw = 0f
-        pitch = 0f
+        qx = 0f
+        qy = 0f
+        qz = 0f
+        qw = 1f
+        winYaw0 = 0f
+        winPitch0 = 0f
         scale = 1f
         panX = 0f
         panY = 0f
@@ -720,11 +790,13 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         const val CAM_DIST = 2.6f
         const val FOV_Y_RAD = (60.0 * Math.PI / 180.0).toFloat()
 
-        // 相机环绕灵敏度：0.006 rad/px ≈ 0.34°/px。
+        // 灵敏度：0.006 rad/px ≈ 0.34°/px。
         // 拖过 1440 逻辑像素（= 屏幕上 2160 物理像素的高度）约转 130°，
         // 拖过 900 像素约转 80° —— 一个模型转一圈在 2~3 次拖动的量级。
+        //
+        // **没有角度上限**：姿态是四元数，上下左右都能转满 360°，
+        // 也不需要 PITCH_LIMIT 那种夹取（夹取会造成"转到顶就贴墙"的错觉）。
         const val ROT_PER_PX = 0.006f
-        const val PITCH_LIMIT = 1.4835f   // ±85°：再往上 up 向量会退化
 
         // 缩放
         const val MIN_SCALE = 0.35f

@@ -338,8 +338,9 @@ void SceneRenderer::detach_surface() {
   release_window();
 }
 
-bool SceneRenderer::record_into(dev::IRenderTarget* target, float yaw, float pitch, float scale,
-                                float pan_x, float pan_y, std::string* err) {
+bool SceneRenderer::record_into(dev::IRenderTarget* target, float qx, float qy, float qz,
+                                float qw, float scale, float pan_x, float pan_y,
+                                std::string* err) {
   auto fail = [&](const std::string& m) {
     if (err) *err = m;
     last_error_ = m;
@@ -351,46 +352,46 @@ bool SceneRenderer::record_into(dev::IRenderTarget* target, float yaw, float pit
   res::ICommandList* cmd = cr.value().get();
 
   // ==========================================================================
-  // 相机环绕（orbit）：转的是**摄像机**，物体在世界里一动不动
+  // 相机：**四元数**姿态，永远绕**机体系三轴**转（arcball / turntable）
   // ==========================================================================
   //
-  // 之前这里是"模型矩阵 = rot_yaw * rot_pitch"，也就是转物体本身。两者在
-  // 单个静止物体上看着几乎一样，但在手感上是两回事：
-  //   * 转物体：先绕 Y 再绕 X，两次旋转不交换，两个轴会互相污染 ——
-  //     上下拖到底之后，左右拖看起来就不是干净的水平转了；
-  //   * 转相机：把视线方向做成 (yaw, pitch) 的球面参数，横竖两个方向
-  //     互相独立，拖动方向永远等于画面转动的方向，这才是"检视一个模型"。
+  // 历史教训，别改回去：
+  //   1. 最早的版本转的是**物体**（world = rot_yaw * rot_pitch）。两次旋转不
+  //      可交换，pitch 一大幅度 yaw 就不再是干净的水平转 —— 就是"旋转会改变
+  //      旋转轴"。
+  //   2. 第二版改成 (yaw, pitch) 球面参数相机。单看还行，但它仍然把方向写成
+  //      "世界 Y 多少度 + 抬升多少度"，本质是万向节：俯仰到顶时水平方向会退化成
+  //      绕世界 Y 而不是绕相机自己的 Y。
+  //   3. 现在是**累积四元数**：拖动时右乘"相对相机自身轴"的小旋转，
+  //          q ← q * Δq,  Δq = Δq_pitch(局部 X) * Δq_yaw(局部 Y)
+  //      相机轴 = q 的列向量，所以"上下拖 = 绕相机 X、左右拖 = 绕相机 Y"，
+  //      无论当前朝向如何都成立，360° 任意角度无死角、无夹取。
   //
-  // 球面参数（y 轴向上，相机在 z>0 一侧看向原点）：
-  //   eye = target + dist * (cos(pitch)sin(yaw), sin(pitch), cos(pitch)cos(yaw))
-  // yaw = 0、pitch = 0 时 eye = (0,0,dist)，就是正视图。
+  // 符号（拖动方向 → 画面方向，物体跟手）：
+  //   往右推 dx > 0 → 绕相机 +Y 转 -dx*c：物体跟着手指往右转，露出左侧面
+  //   往下推 dy > 0 → 绕相机 +X 转 +dy*c：物体跟着手指往下走，露出顶面
   //
-  // 拖动方向（屏幕像素 → 世界角）：
-  //   向下拖 → pitch 增大 → eye 抬高、从上方俯视   （"抓画面"方向：画面跟手）
-  //   向右拖 → yaw 增大   → eye 绕到物体右侧        （见下）
-  //
-  // 关于左右：eye 在 +x 侧时看到的是物体的**右侧面**，球面上的 yaw 正方向
-  // 对应"手也往右推"。这一条与纵轴相反（纵轴要让可见面"跟手"必须写成
-  // eye 抬高），不是笔误：竖直方向按"旋转方向跟手"，水平方向按"位置跟手"。
-  //
-  // 双指缩放改的是 dist；双指平移改的是 target（pan_x/pan_y 是世界空间偏移，
-  // Kotlin 侧已按当前可视宽度换算，所以不同缩放下"跟手"程度一致）。
-  //
-  // up 向量必须**逐帧**用 cam_up 算，不能写死 (0,1,0)：pitch 到 ±90° 时
-  // 视线与 (0,1,0) 平行，look_at 里的叉乘会退化成零向量，画面直接消失。
-  // 这里的 cam_up 是"每帧把世界 Y 投影到垂直于视线的平面"，俯视/仰视都稳。
+  // 相机位置由姿态反推：q 把世界系的 (0,0,1) 转到相机系的 +Z，
+  // 于是 eye = center + dist * q * (0,0,1)。q 恒为单位四元数 → 不会缩水。
   const float dist = 2.6f / (scale > 0.05f ? scale : 0.05f);
   const prim::Vec3 orbit_center{pan_x, pan_y, 0.f};
-  // to_eye：从环绕中心指向相机的**单位**向量。eye = orbit_center + dist * to_eye。
-  const float sp = std::sin(pitch), cp = std::cos(pitch);
-  const prim::Vec3 to_eye{cp * std::sin(yaw), sp, cp * std::cos(yaw)};
-  const prim::Vec3 eye{orbit_center.x + dist * to_eye.x, orbit_center.y + dist * to_eye.y,
-                       orbit_center.z + dist * to_eye.z};
-  // up = Y - (Y·to_eye) * to_eye：世界 Y 去掉沿视线的分量，与视线正交。
-  // pitch 夹在 ±85°，cp ≥ 0.087，所以这个向量绝不会退化成零。
-  const float k = to_eye.y;
-  const prim::Vec3 cam_up{-k * to_eye.x, 1.f - k * to_eye.y, -k * to_eye.z};
-  const prim::Mat4 view = prim::make_look_at(eye, orbit_center, cam_up);
+  // 归一化一次再求逆：连续相乘几千次后浮点会漂，不归一化会慢慢变形。
+  const float qn = std::sqrt(qx * qx + qy * qy + qz * qz + qw * qw);
+  const float iq = qn > 1e-6f ? 1.f / qn : 1.f;
+  const float ux = qx * iq, uy = qy * iq, uz = qz * iq, uw = qw * iq;
+  // q 的列向量就是**相机自身的轴**（单位四元数 → 旋转矩阵 R，列 0=右、1=上、2=后）：
+  //   back  = 2(xz - wy, yz + wx, 0.5 - x² - y²)
+  // 相机看向 -back，所以"环绕中心 → eye"的方向就是 back。
+  const prim::Vec3 back{2.f * (ux * uz - uw * uy), 2.f * (uy * uz + uw * ux),
+                        1.f - 2.f * (ux * ux + uy * uy)};
+  // up 取相机自身的上轴（列 1）。它天然与 back 正交，俯视/仰视都不会退化；
+  // 只有四个极点附近（看正上/正下方）叉乘才不稳，可实际拖动不可能一像素不差
+  // 地命中奇点，且 make_look_at 内部对退化情形已有兜底。
+  const prim::Vec3 up{2.f * (ux * uy + uw * uz), 1.f - 2.f * (ux * ux + uz * uz),
+                      2.f * (uy * uz - uw * ux)};
+  const prim::Vec3 eye{orbit_center.x - dist * back.x, orbit_center.y - dist * back.y,
+                       orbit_center.z - dist * back.z};
+  const prim::Mat4 view = prim::make_look_at(eye, orbit_center, up);
 
   // 投影宽高比必须用**屏幕上实际呈现**的尺寸，而不是 swapchain image 的尺寸。
   //
@@ -495,8 +496,8 @@ bool SceneRenderer::record_into(dev::IRenderTarget* target, float yaw, float pit
   return true;
 }
 
-bool SceneRenderer::render_frame(float yaw, float pitch, float scale, float pan_x, float pan_y,
-                                 std::string* err) {
+bool SceneRenderer::render_frame(float qx, float qy, float qz, float qw, float scale, float pan_x,
+                                 float pan_y, std::string* err) {
   std::lock_guard<std::mutex> lk(mutex_);
   auto fail = [&](const std::string& m) {
     if (err) *err = m;
@@ -520,7 +521,7 @@ bool SceneRenderer::render_frame(float yaw, float pitch, float scale, float pan_
   }
 
   // 2) 录进这张 image 并提交
-  if (!record_into(ar.target, yaw, pitch, scale, pan_x, pan_y, err)) return false;
+  if (!record_into(ar.target, qx, qy, qz, qw, scale, pan_x, pan_y, err)) return false;
 
   // 3) 呈现到 Surface（无回读）
   const auto ps = swapchain_->present_current();
