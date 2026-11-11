@@ -14,19 +14,24 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Text
@@ -81,6 +86,13 @@ class MainActivity : ComponentActivity() {
     // 所以初值只有 1x；msaaCurrent 存的是**实际生效**的采样数，不是请求值。
     private var msaaLevels by mutableStateOf(listOf(1))
     private var msaaCurrent by mutableStateOf(1)
+
+    // ---------------------------------------------------------------- 玩法
+    //
+    // 四个玩法目前**只有桩**：选中状态是真的（会高亮、会记日志），
+    // 但没有接任何引擎逻辑。桩的意义是把 UI 和导航结构先定下来，
+    // 真正实现时只需要在 onSelectPlayMode 里补分发，不用再动布局。
+    private var playMode by mutableStateOf(PlayMode.None)
 
     // ---------------------------------------------------------------- 预设模型列表
     //
@@ -195,7 +207,15 @@ class MainActivity : ComponentActivity() {
                         }
                         viewRevision++
                     },
-                    onRefreshModels = { loadModelList() }
+                    onRefreshModels = { loadModelList() },
+                    playMode = playMode,
+                    onSelectPlayMode = { mode ->
+                        // 玩法目前是桩：只切换选中态。真正实现时在这里把
+                        // mode.id 交给引擎（EngineSession 侧加对应入口）。
+                        Log.i(MbRenderer.TAG, "选择玩法 -> ${mode.id}（桩，未接引擎）")
+                        playMode = mode
+                        viewRevision++
+                    }
                 )
             }
         }
@@ -281,6 +301,20 @@ private val kButtonBg = Color(0xE2454A5C)
 private val kButtonActive = Color(0xE2246B8F)
 
 /**
+ * 四个玩法。目前**全是桩**：切换只改选中态，不驱动任何引擎逻辑。
+ *
+ * 之所以先落这个枚举而不是直接写死四个按钮：玩法 id 迟早要传给引擎，
+ * 现在定下来，后面接实现时 UI 侧一行都不用改。
+ */
+private enum class PlayMode(val label: String, val id: String) {
+    None("无玩法", "none"),
+    Sketch("涂鸦", "sketch"),
+    Stack("堆叠", "stack"),
+    Fsk("挤出", "fsk"),
+    Fvx("特效", "fvx"),
+}
+
+/**
  * Compose 覆盖层（UI 布局 v2）：
  *
  *   [左] 预设模型列表            [中] 3D 画面（不挡手势）            [右] 功能列表
@@ -305,10 +339,12 @@ private fun OverlayUi(
     selectedModel: ModelItem?,
     onToggleHudVisible: () -> Unit,
     onSelectModel: (ModelItem?) -> Unit,
-    onRefreshModels: () -> Unit
+    onRefreshModels: () -> Unit,
+    playMode: PlayMode,
+    onSelectPlayMode: (PlayMode) -> Unit
 ) {
     Row(
-        modifier = Modifier.fillMaxSize().padding(14.dp),
+        modifier = Modifier.fillMaxSize().padding(10.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.Top
     ) {
@@ -321,49 +357,50 @@ private fun OverlayUi(
             onRefresh = onRefreshModels
         )
 
-        Spacer(Modifier.width(16.dp))
+        Spacer(Modifier.width(12.dp))
 
         // ------------------------------------------------ 中：HUD（顶部，不挡拖拽）
         Column(
-            modifier = Modifier.weight(1f).padding(top = 4.dp),
+            modifier = Modifier.weight(1f).padding(top = 2.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             if (hudVisible) {
                 Column(
                     modifier = Modifier
                         .background(Color(0x990E1016), RoundedCornerShape(12.dp))
-                        .padding(horizontal = 14.dp, vertical = 8.dp)
+                        .padding(horizontal = 12.dp, vertical = 7.dp)
                 ) {
                     Text(
                         text = "MagicBlocks · " +
                             (selectedModel?.name ?: "内置立方体"),
                         color = kAccent,
-                        fontSize = 15.sp,
+                        fontSize = 13.sp,
                         fontWeight = FontWeight.Bold
                     )
-                    Spacer(Modifier.size(3.dp))
-                    Text(text = "左右滑 → 左右转 · 上下滑 → 上下转 · 双指缩放/平移", color = kTextBody, fontSize = 12.sp)
-                    Spacer(Modifier.size(6.dp))
+                    Spacer(Modifier.size(2.dp))
+                    Text(text = "左右滑转视角 · 双指缩放/平移", color = kTextBody, fontSize = 10.sp)
+                    Spacer(Modifier.size(5.dp))
                     PerfIndicator(perf)
-                    Spacer(Modifier.size(4.dp))
-                    Text(text = status, color = kTextDim, fontSize = 10.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                    Spacer(Modifier.size(3.dp))
+                    Text(text = status, color = kTextDim, fontSize = 9.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
                 }
             }
         }
 
-        Spacer(Modifier.width(16.dp))
+        Spacer(Modifier.width(12.dp))
 
         // ------------------------------------------------ 右：功能列表
         FunctionPanel(
             msaaLevels = msaaLevels,
             msaaCurrent = msaaCurrent,
             hudVisible = hudVisible,
+            playMode = playMode,
             onZoomIn = onZoomIn,
             onZoomOut = onZoomOut,
             onResetView = onResetView,
             onToggleHudVisible = onToggleHudVisible,
             onSelectMsaa = onSelectMsaa,
-            onToggleStatus = onToggleHud
+            onSelectPlayMode = onSelectPlayMode
         )
     }
 }
@@ -479,7 +516,11 @@ private fun ModelPanel(
             }
         }
         Spacer(Modifier.height(6.dp))
-        SmallButton("重新扫描", onClick = onRefresh, modifier = Modifier.fillMaxSize())
+        SmallButton(
+            text = "重新扫描",
+            onClick = onRefresh,
+            modifier = Modifier.fillMaxWidth()
+        )
     }
 }
 
@@ -495,8 +536,11 @@ private fun ModelRow(
 ) {
     Column(
         modifier = Modifier
-            .fillMaxSize()
-            .padding(vertical = 2.dp)
+            // 只撑宽、不撑高：行高必须由内容决定。
+            // 之前这里是 fillMaxSize()，在 LazyColumn / Column 里会被撑满父容器，
+            // 单行变成一大块空白（真机上量到 468dp 高）。
+            .fillMaxWidth()
+            .padding(vertical = 1.dp)
             .clip(RoundedCornerShape(8.dp))
             .background(if (selected) kSelectedBg else Color(0x221A1F2B))
             .border(
@@ -505,13 +549,13 @@ private fun ModelRow(
                 shape = RoundedCornerShape(8.dp)
             )
             .clickable(enabled = enabled) { onClick() }
-            .padding(horizontal = 10.dp, vertical = 7.dp)
+            .padding(horizontal = 8.dp, vertical = 5.dp)
             .alpha(if (enabled) 1f else 0.45f)
     ) {
         Text(
             text = (if (selected) "▶ " else "") + label,
             color = if (selected) accent else Color.White,
-            fontSize = 14.sp,
+            fontSize = 12.sp,
             fontWeight = FontWeight.SemiBold,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis
@@ -519,107 +563,173 @@ private fun ModelRow(
         Text(
             text = sub,
             color = kTextDim,
-            fontSize = 10.sp,
+            fontSize = 9.sp,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis
         )
     }
 }
 
-/** 右列：功能列表（缩放 / 复位 / HUD / MSAA 档位）。 */
+/** 右列：功能列表（视图操作 / 抗锯齿 / 玩法）。 */
 @Composable
 private fun FunctionPanel(
     msaaLevels: List<Int>,
     msaaCurrent: Int,
     hudVisible: Boolean,
+    playMode: PlayMode,
     onZoomIn: () -> Unit,
     onZoomOut: () -> Unit,
     onResetView: () -> Unit,
     onToggleHudVisible: () -> Unit,
     onSelectMsaa: (Int) -> Unit,
-    onToggleStatus: () -> Unit
+    onSelectPlayMode: (PlayMode) -> Unit
 ) {
-    PanelColumn(title = "功能") {
-        Column(modifier = Modifier.fillMaxHeight(0.86f)) {
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(
-                    onClick = onZoomOut,
-                    modifier = Modifier.weight(1f),
-                    colors = ButtonDefaults.buttonColors(containerColor = kButtonBg)
-                ) { Text("−", color = Color.White, fontSize = 18.sp) }
-                Button(
-                    onClick = onZoomIn,
-                    modifier = Modifier.weight(1f),
-                    colors = ButtonDefaults.buttonColors(containerColor = kButtonBg)
-                ) { Text("+", color = Color.White, fontSize = 18.sp) }
-            }
-            Spacer(Modifier.height(8.dp))
-            FunctionButton("复位视角", onClick = onResetView, active = false)
-            Spacer(Modifier.height(6.dp))
-            FunctionButton(
-                if (hudVisible) "隐藏信息" else "显示信息",
-                onClick = {
-                    onToggleHudVisible()
-                    onToggleStatus()
-                },
-                active = false
-            )
+    PanelColumn(title = "功能", takeRestHeight = true) {
+        // 一行两颗的小按钮：缩放。
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            SmallButton("−", onClick = onZoomOut, modifier = Modifier.weight(1f))
+            SmallButton("+", onClick = onZoomIn, modifier = Modifier.weight(1f))
+        }
+        Gap()
+        SmallButton(
+            text = "复位视角",
+            onClick = onResetView,
+            modifier = Modifier.fillMaxWidth()
+        )
+        Gap()
+        SmallButton(
+            text = if (hudVisible) "隐藏信息" else "显示信息",
+            onClick = onToggleHudVisible,
+            modifier = Modifier.fillMaxWidth()
+        )
 
-            Spacer(Modifier.height(12.dp))
-            Text("抗锯齿 MSAA", color = kAccent, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-            Spacer(Modifier.height(6.dp))
-            msaaLevels.forEach { lv ->
-                // 档位直接来自设备上报（vkGetPhysicalDeviceImageFormatProperties），
-                // 不会出现"点了 8x 却悄悄退回 4x"的假按钮。
-                FunctionButton(
-                    label = if (lv <= 1) "关闭 MSAA" else "${lv}x（实际 ${if (msaaCurrent > 1) "${msaaCurrent}x" else "关"}）",
-                    onClick = { onSelectMsaa(lv) },
-                    active = lv == msaaCurrent
-                )
-                Spacer(Modifier.height(6.dp))
+        // ---- 抗锯齿 ----
+        SectionLabel("抗锯齿 MSAA")
+        msaaLevels.forEach { lv ->
+            // 档位直接来自设备上报（vkGetPhysicalDeviceImageFormatProperties），
+            // 不会出现"点了 8x 却悄悄退回 4x"的假按钮。
+            SmallButton(
+                text = if (lv <= 1) "关闭" else "${lv}x",
+                onClick = { onSelectMsaa(lv) },
+                modifier = Modifier.fillMaxWidth(),
+                active = lv == msaaCurrent
+            )
+            Gap()
+        }
+        Text(
+            "当前 ${if (msaaCurrent > 1) "${msaaCurrent}x" else "关闭"}",
+            color = kTextDim,
+            fontSize = 9.sp,
+            modifier = Modifier.padding(bottom = 2.dp)
+        )
+
+        // ---- 玩法（桩）----
+        SectionLabel("玩法")
+        // 四个玩法按钮两行两列，比竖排四颗省一半高度。
+        val modes = listOf(PlayMode.Sketch, PlayMode.Stack, PlayMode.Fsk, PlayMode.Fvx)
+        modes.chunked(2).forEach { pair ->
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                pair.forEach { m ->
+                    SmallButton(
+                        text = m.label,
+                        onClick = { onSelectPlayMode(m) },
+                        modifier = Modifier.weight(1f),
+                        active = m == playMode
+                    )
+                }
+                // 奇数个时补一个空位，避免最后一颗按钮被拉伸成整行宽。
+                if (pair.size == 1) Spacer(Modifier.weight(1f))
             }
+            Gap()
         }
     }
 }
 
 @Composable
-private fun PanelColumn(title: String, content: @Composable () -> Unit) {
+private fun PanelColumn(
+    title: String,
+    takeRestHeight: Boolean = false,
+    content: @Composable ColumnScope.() -> Unit
+) {
     Column(
         modifier = Modifier
-            .width(232.dp)
+            .width(196.dp)
             .fillMaxHeight()
             .background(kPanelBg, RoundedCornerShape(14.dp))
             .border(1.dp, kPanelBorder, RoundedCornerShape(14.dp))
-            .padding(12.dp)
+            .padding(10.dp)
     ) {
-        Text(title, color = kAccent, fontSize = 15.sp, fontWeight = FontWeight.Bold)
-        Spacer(Modifier.height(8.dp))
-        content()
+        Text(title, color = kAccent, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(6.dp))
+        if (takeRestHeight) {
+            // 内容区撑满剩余高度并允许纵向滚动：窄屏 / 玩法变多时
+            // 不会再把后面的按钮挤出屏幕（之前就是这个问题）。
+            Column(
+                modifier = Modifier.fillMaxWidth().weight(1f).verticalScroll(rememberScrollState()),
+                content = content
+            )
+        } else {
+            Column(modifier = Modifier.fillMaxWidth(), content = content)
+        }
     }
 }
 
+/** 小节间距。所有纵向间隔都走这里，改一处就整体收紧/放松。 */
 @Composable
-private fun FunctionButton(label: String, onClick: () -> Unit, active: Boolean) {
-    Button(
-        onClick = onClick,
-        modifier = Modifier.fillMaxSize(),
-        contentPadding = PaddingValues(vertical = 6.dp),
-        colors = ButtonDefaults.buttonColors(
-            containerColor = if (active) kButtonActive else kButtonBg
+private fun Gap() = Spacer(Modifier.height(5.dp))
+
+/** 小节标题（抗锯齿 / 玩法）。 */
+@Composable
+private fun SectionLabel(text: String) {
+    Spacer(Modifier.height(10.dp))
+    Text(text, color = kAccent, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+    Spacer(Modifier.height(5.dp))
+}
+
+/**
+ * 统一的小号按钮。
+ *
+ * 为什么不用 Material3 的默认 Button：它自带 minHeight = 40.dp 和较大的默认内边距，
+ * 排成一列时每颗都像一块砖（真机上量到 48dp/颗）。这里显式压到 30dp、去掉默认
+ * 内边距、只用 10dp 水平内边距，一行能放下两颗还不挤。
+ *
+ * 不用 Button 而自己画 Row，是因为 Material3 的 ButtonDefaults.MinHeight 无法单独
+ * 覆盖（必须同时给 Modifier.height），而 Modifier.height 会与 contentPadding 打架，
+ * 出现文字被裁的情况。自己控制颜色和点击更直接。
+ */
+@Composable
+private fun SmallButton(
+    text: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    active: Boolean = false
+) {
+    Box(
+        modifier = modifier
+            .height(30.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .background(if (active) kButtonActive else kButtonBg)
+            .border(
+                width = 1.dp,
+                color = if (active) kAccent else Color(0x22FFFFFF),
+                shape = RoundedCornerShape(8.dp)
+            )
+            .clickable { onClick() }
+            .padding(horizontal = 8.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = text,
+            color = Color.White,
+            fontSize = 12.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
         )
-    ) {
-        Text(label, color = Color.White, fontSize = 13.sp, maxLines = 1)
-    }
-}
-
-@Composable
-private fun SmallButton(label: String, onClick: () -> Unit, modifier: Modifier = Modifier) {
-    Button(
-        onClick = onClick,
-        modifier = modifier.height(34.dp),
-        contentPadding = PaddingValues(vertical = 2.dp),
-        colors = ButtonDefaults.buttonColors(containerColor = kButtonBg)
-    ) {
-        Text(label, color = Color.White, fontSize = 12.sp)
     }
 }
