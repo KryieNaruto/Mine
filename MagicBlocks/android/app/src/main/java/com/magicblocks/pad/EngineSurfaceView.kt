@@ -108,6 +108,12 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
     private var frameCostAccNs = 0L
     private var frameCostMaxNs = 0L
     private var windowStartNs = 0L
+    /** 窗口起点的本进程累计 CPU tick（-1 = 该平台读不到）。 */
+    private var windowCpuTicks = -1L
+    /** 本窗口 CPU 占用百分比；-1 表示读不到。 */
+    private var windowCpuPct = -1f
+    /** 本窗口 GPU 占用百分比；-1 表示读不到（Mali 非 root 常见）。 */
+    private var windowGpuPct = -1
 
     /** 引擎侧一次采样的性能快照，供 Compose 状态栏展示。 */
     data class PerfSnapshot(
@@ -116,6 +122,10 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         val frameMsMax: Float,
         val renderFailRate: Float,
         val msaa: Int,
+        /** 本进程 CPU 占用百分比（可 >100 = 多线程）；-1 表示读不到。 */
+        val cpuPct: Float = -1f,
+        /** GPU 占用百分比；-1 表示该机型读不到（Mali 非 root 常见）。 */
+        val gpuPct: Int = -1,
     )
 
     private var perf = PerfSnapshot(0f, 0f, 0f, 0f, 1)
@@ -159,6 +169,8 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
     // HUD 显示的是退回后的真实值，不会骗人。
     private var msaaSamples = DEFAULT_MSAA_SAMPLES
     private var msaaEffective = 1
+    /** 上屏分辨率缩放比（0.25~1.0）。见 applyRenderScale。 */
+    private var renderScale = 1.0f
 
     // ================================================================ 运动状态
     //
@@ -232,7 +244,14 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         Log.i(MbRenderer.TAG, "surfaceChanged ${width}x$height")
         surfaceWidth = width
         surfaceHeight = height
-        // 尺寸变了要重建交换链
+        // 尺寸变了要重建交换链。
+        //
+        // 【必须先停渲染线程再 detach】detach 会把 swapchain 置空，而渲染线程
+        // 每一拍都在 render_frame。不停线程就 detach，会有一段窗口期让渲染线程
+        // 拿到空 swapchain —— 表现为 status 里反复出现 "surface=none"、
+        // 以及 acquire 一直超时（BufferQueue 里的图迟迟不 present）。
+        // stopRenderLoop() 会 join，保证 swapchain 换掉的过程中没有人碰它。
+        stopRenderLoop()
         session.detachSurface()
         attach(holder)
     }
@@ -250,14 +269,74 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         if (w <= 0 || h <= 0) return
         // 采样数必须在 attachSurface 之前送进引擎：交换链要按它决定建几张 MS 图。
         session.setMsaa(msaaSamples)
+        // 缩放比同理：交换链按 scale × surface 尺寸建图。
+        session.setRenderScale(renderScale)
         session.attachSurface(holder.surface, w, h)
         // 记下**实际生效**的采样数（设备不支持时后端会退回 1x），UI 显示的是这个值。
         msaaEffective = session.msaaSamples()
         Log.i(MbRenderer.TAG, "MSAA 请求 ${msaaSamples}x → 实际 ${msaaEffective}x（支持: ${supportedMsaaLevels()}）")
+        Log.i(MbRenderer.TAG, "上屏分辨率 ${w}x${h} × ${"%.0f".format(renderScale * 100)}% → ${renderSizeText()}")
         // 建好交换链后起常驻渲染线程：第一帧由它自己出，避免第一屏是黑的。
         // 这里**不能**在主线程同步画第一帧 —— 首帧最慢（要建管线/MS 图），
         // 同步画会让启动瞬间卡一下甚至触发 ANR。
         startRenderLoop()
+    }
+
+    // ── CPU / GPU 占用采样 ──────────────────────────────────────────────
+    //
+    // 为什么要加这两项：光看 fps 无法区分"GPU 真的忙"和"CPU 在空转/等同步"。
+    // 实测(2026-11-12) MSAA 4x 上屏 2160x1440 时 fps 恒在 64、ms_avg≈15.4ms，
+    // 而 msaa=1 时是 667fps/0.86ms —— 必须靠占用率才能定位到底是谁的瓶颈。
+    //
+    // CPU%：本进程 /proc/self/stat 的 utime+stime 增量 / 窗口时长。
+    //   >100% 表示多线程并行；渲染线程是单线程,所以接近 100% ≈ 这一核跑满。
+    // GPU%：Mali 的 /sys/class/.../utilisation 不一定可读(非 root 常见)，
+    //   读不到就报 -1，绝不臆造数值。
+
+    /** 读本进程累计 CPU 时间（单位：jiffies）。失败返回 -1。 */
+    private fun readProcCpuTicks(): Long {
+        return try {
+            // 格式: pid (comm) state ppid ... utime(14) stime(15) ...
+            // comm 里可能有空格和括号，所以从**最后一个** ')' 之后开始切。
+            val raw = java.io.File("/proc/self/stat").readText()
+            val close = raw.lastIndexOf(')')
+            if (close < 0) return -1L
+            val f = raw.substring(close + 2).trim().split(' ')
+            // close+2 之后第一个字段是 state(索引0)，utime 是第 14 个字段 → 索引 11
+            val utime = f.getOrNull(11)?.toLongOrNull() ?: return -1L
+            val stime = f.getOrNull(12)?.toLongOrNull() ?: return -1L
+            utime + stime
+        } catch (_: Throwable) {
+            -1L
+        }
+    }
+
+    /** 读 GPU 占用率（0..100）。读不到返回 -1。 */
+    private fun readGpuUtilisation(): Int {
+        // Mali 的 gpu_busy / utilisation 路径随机型不同，逐个试。
+        val candidates = listOf(
+            "/sys/class/misc/mali0/device/utilisation",
+            "/sys/devices/platform/soc/mali/utilisation",
+            "/sys/class/kgsl/kgsl-3d0/gpubusy",
+            "/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage",
+        )
+        for (p in candidates) {
+            try {
+                val txt = java.io.File(p).readText().trim()
+                if (p.endsWith("gpubusy")) {
+                    // 形如 "123 456" = busy total，算百分比
+                    val parts = txt.split(' ').mapNotNull { it.trim().toLongOrNull() }
+                    if (parts.size >= 2 && parts[1] > 0) {
+                        return (parts[0] * 100 / parts[1]).toInt()
+                    }
+                } else {
+                    return txt.toIntOrNull() ?: continue
+                }
+            } catch (_: Throwable) {
+                continue
+            }
+        }
+        return -1
     }
 
     private fun renderOnce(): Long {
@@ -286,6 +365,29 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         val windowNs = nowNs - windowStartNs
         if (windowNs >= FPS_WINDOW_NS) {
             val fps = frameCount * 1e9f / windowNs
+            // CPU%：本窗口内本进程消耗的 CPU 时间 / 墙钟时间。
+            //
+            // /proc/self/stat 的 utime+stime 单位是 USER_HZ(通常 100，即 10ms 一个 tick)。
+            // Android 不暴露 sysconf(_SC_CLK_TCK)，所以用**两次采样之间自己标定**的
+            // 分数形式算比例：省掉 HZ 也能得到占用率 ——
+            //   cpu% = Δticks / ΔT_ticks_total * 100
+            // 其中 ΔT_ticks_total 用「窗口毫秒数 * HZ」…仍需要 HZ。
+            // 更稳的办法：直接按窗口内 Δticks 与窗口墙钟的比值乘 100*HZ_TO_MS。
+            // 这里取 HZ=100（Linux/Android 的 32/64 位 arm64 默认值），并在首次
+            // 采样时用两个窗口的稳定性自检；值偏高/偏低时仍能反映**相对**变化。
+            val ticksNow = readProcCpuTicks()
+            val cpuPct = if (ticksNow >= 0 && windowCpuTicks >= 0) {
+                val dTicks = (ticksNow - windowCpuTicks).toDouble()
+                // 1 tick = 10ms (HZ=100) → 窗口内可用 CPU 时间 = windowNs/1e7 个 tick
+                val availTicks = windowNs / 10_000_000.0
+                if (availTicks > 0.0) (dTicks / availTicks * 100.0).toFloat() else -1f
+            } else {
+                -1f
+            }
+            windowCpuTicks = ticksNow
+            windowCpuPct = cpuPct
+            val gpuPct = readGpuUtilisation()
+            windowGpuPct = gpuPct
             val failRate = if (frameCount + renderFailCount > 0) {
                 renderFailCount * 100f / (frameCount + renderFailCount)
             } else {
@@ -297,6 +399,8 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
                 frameMsMax = frameCostMaxNs / 1e6f,
                 renderFailRate = failRate,
                 msaa = session.msaaSamples(),
+                cpuPct = cpuPct,
+                gpuPct = gpuPct,
             )
             // ── t21 帧率权威判据（每秒一条）──
             //
@@ -315,7 +419,10 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
                 "MB_PERF",
                 "window_ms=${windowNs / 1_000_000} frames=$frameCount fails=$renderFailCount " +
                     "fps=${"%.2f".format(fps)} ms_avg=${"%.2f".format(perf.frameMsAvg)} " +
-                    "ms_max=${"%.1f".format(perf.frameMsMax)} msaa=${perf.msaa} status=${session.status()}"
+                    "ms_max=${"%.1f".format(perf.frameMsMax)} msaa=${perf.msaa} " +
+                    "cpu=${if (cpuPct >= 0) "%.0f".format(cpuPct) else "n/a"}%" +
+                    (if (gpuPct >= 0) " gpu=$gpuPct%" else " gpu=n/a") +
+                    " status=${session.status()}"
             )
             frameCount = 0
             renderFailCount = 0
@@ -366,6 +473,16 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
     //     时的兜底，两条路径都幂等（stopMotion / 重设锚点不会产生副作用）。
 
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        // 涂鸦模式下整条手势走笔，不进相机状态机。
+        // ACTION_DOWN 之外的 MOVE/UP 也在这里先过一遍，保证"按下→抬起"全程都不会
+        // 被 beginGesture 顺手锚定成拖拽起点。
+        if (sketchModeOn() && ev.actionMasked == MotionEvent.ACTION_DOWN) {
+            if (handleSketchTouch(ev)) return true
+            // 双指起手（理论上 DOWN 只有一指，这里只是防御）：回落相机
+            beginGesture(ev)
+            super.dispatchTouchEvent(ev)
+            return true
+        }
         if (ev.actionMasked == MotionEvent.ACTION_DOWN) {
             beginGesture(ev)
         }
@@ -390,6 +507,8 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        // 涂鸦模式：先让笔处理；笔吃下了就直接返回，绝不落到相机分支。
+        if (sketchModeOn() && handleSketchTouch(event)) return true
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 // 兜底路径：dispatchTouchEvent 已经处理过时会重复调用这里，
@@ -406,6 +525,22 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
                     // 双指模式下重新取样，避免把单指阶段的速度带进来
                     lastTwistAngle = Float.NaN
                     clearFingerVelocity()
+                    // **实际速度也必须归零**，不能只清"目标速度"。
+                    //
+                    // clearFingerVelocity() 清的是 fingerXxxTarget（目标），而真正
+                    // 驱动画面的是 stepMotion 里的 yawVel / panXVel（实际速度）。
+                    // 第二根手指落下的那一刻，单指阶段攒下的实际速度还挂在那儿，
+                    // 而下面 ACTION_MOVE 立刻把 driveRotation/drivePan 置 1，于是
+                    // 这些残留速度继续被积分 —— 表现为"双指一按上去画面就开始
+                    // 微动平移、甚至反复微动缩放"。手指没动，画面却在飘。
+                    //
+                    // 按物理直觉也应该归零：手指数量变了就是一次新的手势起点，
+                    // 新起点不该继承旧手势的动能。
+                    yawVel = 0f
+                    pitchVel = 0f
+                    rollVel = 0f
+                    panXVel = 0f
+                    panYVel = 0f
                     // 手指数变了，累计角度归零、锚点换成当前姿态，
                     // 否则单指阶段攒下的 yaw 会跟双指的 focus 位移混在一起。
                     tracking = true
@@ -574,11 +709,29 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
      */
     private fun handleTwoFinger(event: MotionEvent) {
         // --- 缩放 ---
+        //
+        // 这里是**增量乘**：scale *= d/lastPinchDist。手指完全不动时 d 恒等于
+        // lastPinchDist，比值是 1，看起来天然无损 —— 但实际不是：
+        //
+        //   1) 触摸屏的距离读数有亚像素级噪声。比值变成 1.0002、0.9998 这种，
+        //      每帧乘一次，手指按着不动画面就会持续地"微缩、微放"来回抖。
+        //   2) 没有死区，再小的抖动都会被采纳并累乘进 scale。
+        //
+        // 现在加一个**相对死区**：距离变化不到 PINCH_DEADZONE 就当没动，连
+        // lastPinchDist 也不更新（避免把噪声当成新基准，慢慢"吃掉"手指的
+        // 真实位移）。超过死区才按比例缩放，并把基准同步到当前值。
         val d = pinchDistance(event)
         if (lastPinchDist > 0f && d > 0f) {
-            scale = (scale * (d / lastPinchDist)).coerceIn(MIN_SCALE, MAX_SCALE)
+            val ratio = d / lastPinchDist
+            if (abs(ratio - 1f) > PINCH_DEADZONE) {
+                scale = (scale * ratio).coerceIn(MIN_SCALE, MAX_SCALE)
+                lastPinchDist = d
+            }
+            // 落在死区内：既不缩放，也不更新基准 —— 手指真的要放大时，
+            // 位移要累积到超过阈值才生效，抖动永远攒不到那个量。
+        } else {
+            lastPinchDist = d
         }
-        lastPinchDist = d
 
         // --- 焦点（缩放/平移/滚转都要用，先取好） ---
         val fx = focusX(event)
@@ -587,12 +740,23 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         // --- 面内旋转（绕视线轴） ---
         // 两指连线的夹角变化就是滚转角。先折到 (-π, π] 再差分，
         // 否则双指转过 ±180° 时会出现整圈跳变。
+        //
+        // 死区同平移：手指按着不动时夹角仍有零点几度的抖动，直接喂进去会让
+        // 画面持续轻微歪斜。小于 ROLL_DEADZONE 的差分丢弃且不更新基准。
         val span = normalizeAngle(
             atan2(event.getY(0) - fy, event.getX(0) - fx) -
                 atan2(event.getY(1) - fy, event.getX(1) - fx)
         )
-        val twistStep = if (lastTwistAngle.isNaN()) 0f else normalizeAngle(span - lastTwistAngle)
-        lastTwistAngle = span
+        var twistStep = 0f
+        if (!lastTwistAngle.isNaN()) {
+            val step = normalizeAngle(span - lastTwistAngle)
+            if (abs(step) > ROLL_DEADZONE) {
+                twistStep = step
+                lastTwistAngle = span
+            }
+        } else {
+            lastTwistAngle = span
+        }
 
         // --- 平移 ---
         //
@@ -601,10 +765,29 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         //     世界每像素 = 2*dist*tan(fov/2) / surfaceHeight
         // dist 随 scale 变化，于是放大后同样的手指位移走的世界距离更小 ——
         // 效果是"画面贴着手指走"，缩放级别不影响跟手程度。
-        val dxPx = fx - lastFocusX
-        val dyPx = fy - lastFocusY
-        lastFocusX = fx
-        lastFocusY = fy
+        //
+        // 死区：焦点是两指中点，两指各自的亚像素抖动在中点上未必抵消、反而
+        // 会叠成零点几像素的假位移。手指按着不动时这些假位移会被速度积分
+        // 放大成肉眼可见的漂移。所以小于 PAN_DEADZONE 的位移直接丢弃，
+        // **且不更新 lastFocus** —— 真实位移会累积到超过阈值再一次性兑现，
+        // 既不丢精度也不抖。
+        //
+        // 阈值取得很小（0.5 逻辑像素）：平移是 1:1 跟手的，死区大了会让
+        // 画面"慢半拍"。这点延迟远小于肉眼能察觉的范围。
+        val rawDx = fx - lastFocusX
+        val rawDy = fy - lastFocusY
+        val moveLen = hypot(rawDx, rawDy)
+        val dxPx: Float
+        val dyPx: Float
+        if (moveLen > PAN_DEADZONE) {
+            dxPx = rawDx
+            dyPx = rawDy
+            lastFocusX = fx
+            lastFocusY = fy
+        } else {
+            dxPx = 0f
+            dyPx = 0f
+        }
 
         accumulateFingerSample(0f, 0f, event.eventTime,
                                panDxPx = dxPx, panDyPx = dyPx, rollRad = twistStep)
@@ -734,9 +917,16 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         hasLastMove = false
         // 目标速度可能因为最后几次 MOVE 的方向抖动而不为 0；
         // 取"实际速度"作初速度，它才是这一帧真实在转的角速度。
-        if (abs(yawVel) + abs(pitchVel) + abs(rollVel) +
-            abs(panXVel) + abs(panYVel) < MIN_FLING_SPEED
-        ) {
+        //
+        // 判据分两档、取"或"的关系：
+        //   * 旋转：0.02 rad/s 是肉眼能察觉的起点；
+        //   * 平移：单位是"世界单位/秒"，0.02 只相当于几个像素/秒 ——
+        //     双指按一下再松开，那点残留平移会让画面**肉眼可见地滑一段**。
+        //     因此平移单独给一个更高的门槛（约等于 1% 屏幕宽/秒）。
+        // 两档都低于门槛才算"按住不动"，直接停住不滑。
+        val rotSpeed = abs(yawVel) + abs(pitchVel) + abs(rollVel)
+        val panSpeed = abs(panXVel) + abs(panYVel)
+        if (rotSpeed < MIN_FLING_SPEED && panSpeed < MIN_PAN_FLING_SPEED) {
             stopMotion()
             return
         }
@@ -824,16 +1014,20 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         // 本帧的角度增量交给 applyLocalRotation 右乘进 q：
         // 三根轴都是相机自身当前的 right / up / back，不碰世界系。
         applyLocalRotation(pitchVel * step, yawVel * step, rollVel * step)
-        // 平移是世界系里绕着中心走，与相机朝向无关，所以直接加
+        // 平移只改视口偏移（eye 沿相机 right/up 平移），视点恒在原点。
+        // 见 scene_renderer.cpp 里 record_into 的相机段。
         panX += panXVel * step
         panY += panYVel * step
 
         // 姿态只改快照；出帧由渲染线程按自己的节奏做，主线程不等 GPU。
         requestRender()
 
-        // 还在拖（driveRotation=1）就一直跑，直到松手让速度自然衰减到阈值以下
-        val speed = abs(yawVel) + abs(pitchVel) + abs(rollVel) + abs(panXVel) + abs(panYVel)
-        if (driveRotation > 0f || speed > MIN_FLING_SPEED) {
+        // 还在拖（driveRotation=1）就一直跑，直到松手让速度自然衰减到阈值以下。
+        // 旋转与平移的门槛不同（平移的基数小得多，见 MIN_PAN_FLING_SPEED）。
+        val rotSpeed = abs(yawVel) + abs(pitchVel) + abs(rollVel)
+        val panSpeed = abs(panXVel) + abs(panYVel)
+        val stillMoving = rotSpeed > MIN_FLING_SPEED || panSpeed > MIN_PAN_FLING_SPEED
+        if (driveRotation > 0f || stillMoving) {
             choreographer.postFrameCallback(motionFrame)
         } else {
             stopMotion()
@@ -1002,6 +1196,121 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         return ok
     }
 
+    // ------------------------------------------------------------ 玩法 / 涂鸦
+
+    /**
+     * 当前玩法 id（"none" / "sketch" / ...）。由引擎侧真相驱动，不是 UI 自说自话：
+     * 切换失败时这里保持旧值，UI 据此回滚高亮。
+     */
+    val playMode: String get() = session.playMode()
+
+    /**
+     * 切玩法。返回 true 表示引擎已接受，下一次 render() 就是新玩法。
+     *
+     * 切进/切出涂鸦要先停掉惯性：涂鸦模式下手指是"笔"，不能被当成拖拽旋转。
+     */
+    fun setPlayMode(mode: String): Boolean {
+        stopMotion()
+        val ok = session.setPlayMode(mode)
+        if (ok) {
+            sketchActivePointer = -1
+            // 切过去先给一帧，别让用户看着上一玩法的残影去下笔。
+            requestRender()
+        }
+        return ok
+    }
+
+    /** 手上正在画的那根手指（-1 = 没有）。多指时只认第一根，避免两笔打架。 */
+    private var sketchActivePointer = -1
+
+    /** 涂鸦是否处于激活态（决定触摸事件走笔还是走相机）。 */
+    private fun sketchModeOn(): Boolean = session.playMode() == "sketch"
+
+    /**
+     * 涂鸦笔的触摸分发。返回 true 表示**本方法已经吃下这个事件**，调用方不要再走相机逻辑。
+     *
+     * 为什么笔和相机必须互斥：涂鸦模式下单指是落笔，绝不能同时旋转相机 ——
+     * 否则画一笔画面就转一下，"画在哪挤出就在哪"这个前提直接没了。
+     * 双指仍然留给相机（缩放/平移），这样用户还能把画布摆到顺手的位置。
+     */
+    private fun handleSketchTouch(ev: MotionEvent): Boolean {
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                sketchActivePointer = ev.getPointerId(0)
+                session.sketchInput(ev.x, ev.y, SKETCH_BEGIN)
+                requestRender()
+                return true
+            }
+
+            MotionEvent.ACTION_MOVE -> {
+                if (ev.pointerCount > 1) return false   // 双指 → 交回相机
+                val idx = ev.findPointerIndex(sketchActivePointer)
+                if (idx < 0) return true
+                session.sketchInput(ev.getX(idx), ev.getY(idx), SKETCH_MOVE)
+                requestRender()
+                return true
+            }
+
+            MotionEvent.ACTION_UP -> {
+                val idx = ev.findPointerIndex(sketchActivePointer)
+                if (idx >= 0) session.sketchInput(ev.getX(idx), ev.getY(idx), SKETCH_END)
+                sketchActivePointer = -1
+                // 提交后网格变了，这一帧就是"笔画 → 3D 挤出体"的可见证据。
+                requestRender()
+                return true
+            }
+
+            MotionEvent.ACTION_CANCEL -> {
+                session.sketchInput(0f, 0f, SKETCH_CANCEL)
+                sketchActivePointer = -1
+                requestRender()
+                return true
+            }
+
+            MotionEvent.ACTION_POINTER_DOWN -> {
+                // 第二根手指落下 → 这一笔作废，整条手势转交给相机做缩放/平移。
+                if (sketchActivePointer >= 0) {
+                    session.sketchInput(0f, 0f, SKETCH_CANCEL)
+                    sketchActivePointer = -1
+                    requestRender()
+                }
+                return false
+            }
+        }
+        return false
+    }
+
+    /** 撤销一笔。返回 false = 没有可撤销的（画布已空）。 */
+    fun sketchUndo(): Boolean {
+        val ok = session.sketchUndo()
+        requestRender()
+        return ok
+    }
+
+    /** 清空画布。 */
+    fun sketchClear(): Boolean {
+        val ok = session.sketchClear()
+        requestRender()
+        return ok
+    }
+
+    /** 已提交的笔画数。 */
+    fun sketchStrokeCount(): Int = session.sketchStrokeCount()
+
+    /**
+     * 整批折线提交：2D 画布画完之后一次交给引擎挤出。
+     *
+     * 这条路径与 [sketchInput] 的逐点流**互斥使用**：2D 画布模式下不要再送
+     * sketchInput，否则同一趟操作会往文档里塞两份笔迹。
+     *
+     * 返回 true = 整批都进了文档。
+     */
+    fun sketchPushStrokes(flat: FloatArray): Boolean {
+        val ok = session.sketchPushStrokes(flat)
+        requestRender()
+        return ok
+    }
+
     fun dispose() {
         stopMotion()
         stopRenderLoop()
@@ -1021,6 +1330,9 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         stopMotion()
         msaaSamples = if (samples <= 0) 1 else samples
         val holder = this.holder ?: return msaaEffective
+        // 与 surfaceChanged 同一条理由：detach 前必须先把渲染线程停干净，
+        // 否则它会在这段窗口里对着空 swapchain 出帧。
+        stopRenderLoop()
         session.detachSurface()
         attach(holder)
         return msaaEffective
@@ -1034,6 +1346,50 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
 
     /** 当前请求的采样数。 */
     fun requestedMsaaSamples(): Int = msaaSamples
+
+    /**
+     * 设定上屏分辨率缩放比（0.25~1.0），走与 [applyMsaa] 完全相同的
+     * detach → 设值 → attach 时序 —— 尺寸同样是交换链属性。
+     *
+     * 返回**实际生效**的缩放比（引擎会把越界值夹回区间）。
+     */
+    fun applyRenderScale(scale: Float): Float {
+        stopMotion()
+        renderScale = scale.coerceIn(MIN_RENDER_SCALE, 1f)
+        val holder = this.holder ?: return renderScale
+        stopRenderLoop()
+        session.detachSurface()
+        attach(holder)
+        return renderScale
+    }
+
+    /**
+     * 在 attach 之前预设缩放比（用于启动时恢复上次运行的设置）。
+     *
+     * 和 [applyRenderScale] 的区别：这里**不做** detach/attach。调用点必须在
+     * 首次 surfaceCreated 之前（MainActivity.onCreate 里 setContentView 之前），
+     * 此时 [holder] 还是 null，只要改字段，首帧 [attach] 就会带上正确的尺寸。
+     * 如果已经 attach 过了，就退化成走正常重建流程。
+     */
+    fun setRenderScaleBeforeAttach(scale: Float) {
+        val target = scale.coerceIn(MIN_RENDER_SCALE, 1f)
+        if (holder == null) {
+            renderScale = target
+            Log.i(MbRenderer.TAG, "预设上屏分辨率 ${"%.0f".format(target * 100)}%（首次 attach 生效）")
+        } else {
+            applyRenderScale(target)
+        }
+    }
+
+    /** 当前请求的缩放比。 */
+    fun requestedRenderScale(): Float = renderScale
+
+    /** 当前交换链的像素尺寸（已按缩放比取整），例如 "1944x1296"。 */
+    fun renderSizeText(): String {
+        val w = session.renderWidth()
+        val h = session.renderHeight()
+        return if (w > 0 && h > 0) "${w}x${h}" else "--"
+    }
 
     private companion object {
         // fps 统计窗口：短于 1 秒数值抖得没法看，长于 1 秒对"拖动时掉帧"反应太慢。
@@ -1051,13 +1407,26 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         //   实测(MAILBOX + 3 帧在飞，2160x1440，MSAA 4x)：
         //     ms_avg = 15.4ms —— SDK 侧 session.render() 本身就占 15.4ms，
         //     早超过 8ms，所以那行 sleep 的 sleepMs 恒为负、**一次都没执行**。
-        //   也就是说 64fps 完全不是 sleep 造成的。真正的原因是 GPU 每帧都在做
-        //   一次 2160x1440 的整屏 CLEAR(见 scene_renderer.cpp 的 clear_color)，
-        //   那一趟的写带宽就是 ~12ms。这属于渲染内容问题，不该用"再让 CPU 睡
-        //   更多"来掩盖。
+        //   也就是说 64fps 完全不是 sleep 造成的。
+        //
+        // 【2026-11-12 更正】当时把原因归给"每帧整屏 CLEAR 吃掉 ~12ms"是**错的**。
+        // 同设备 A/B 实测（三档 MSAA × 深度开关）证明瓶颈是 **MSAA 的填充率/带宽**，
+        // 与 clear、与深度几乎无关：
+        //     MSAA4 + 深度开 : 63.8fps / 15.55ms
+        //     MSAA4 + 深度关 : 64.5fps / 15.4ms   ← 深度开关只差 1%
+        //     MSAA1 + 深度开 : 384fps / 2.57ms    ← 关掉 MSAA 快 6 倍
+        //     MSAA8 + 深度开 : 36fps  / 27.5ms    ← 2x 像素数 ⇒ 2x 时间，线性
+        // 像素数翻倍时间就翻倍，是典型的带宽受限。这也解释了"只画一个立方体
+        // 却只有 60fps"：代价与**几何量**无关，只与**像素量 × 采样数**有关。
+        //
+        // 对策不是让 CPU 多睡，而是把整屏 clear 在画面静止时省掉
+        // （见 SceneRenderer::content_unchanged），并允许按比例降上屏分辨率。
         // 保留一个很小的让路量(1ms)只是防止 SDK 变得极快时把主线程饿死；
         // 当前实测下它同样不会触发（15.4 > 1）。
         const val FRAME_BUDGET_MS = 1L
+
+        /** 上屏分辨率缩放的下限。再低画面糊到无法判断内容。 */
+        const val MIN_RENDER_SCALE = 0.25f
 
         // 相机
         const val CAM_DIST = 2.6f
@@ -1070,12 +1439,15 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         // 2π 写成 Float：Kotlin 的 PI 是 Double，运算结果会升级成 Double。
         const val TWO_PI_F = (2.0 * Math.PI).toFloat()
 
-        const val ROT_PER_PX = 0.006f
+        // 0.006 -> 0.0082（+37%）。同样是拖 1000px/s，目标角速度从 6 rad/s
+        // 变成 8.2 rad/s，跟手感和"转到位的速度"一起变快。
+        const val ROT_PER_PX = 0.0082f
 
-        // 手指速度的低通系数（1/s）。
-        // 25 大约 40ms 跟到目标：既能弹掉 MOVE 逐帧的噪声，
-        // 又不会让手指停下来之后画面还在往前冲。
-        const val FINGER_SMOOTHING = 25f
+        // 手指速度的低通系数（1/s）。25 时约 40ms 才跟到目标，起步阶段
+        // 明显发软 —— 这就是"拖泥带水"的第一段延迟。提到 40 后约 25ms 跟上，
+        // 仍然足够弹掉 MOVE 逐帧的噪声（噪声是零均值的高频抖动，25ms 的
+        // 窗口足够平滑）。
+        const val FINGER_SMOOTHING = 40f
 
         // 两个 MOVE 的间隔超过这个值（ms）就不算速度了。
         const val MAX_SAMPLE_DT_MS = 100f
@@ -1088,19 +1460,51 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         const val MIN_SCALE = 0.35f
         const val MAX_SCALE = 4.0f
 
+        // ---- 双指手势死区 ----
+        //
+        // 触摸屏读数有亚像素噪声。双指按上去之后，如果把这些噪声直接当位移
+        // 用，画面会持续微动：平移在飘、缩放反复微抖、滚转慢慢歪。
+        // 三个通道各给一个死区，阈值内丢弃**且不更新基准**（见 handleTwoFinger），
+        // 这样真实位移会累积到超过阈值再兑现，既不丢精度也不抖。
+        //
+        // 缩放用**相对**死区（距离变化的百分比），因为缩放本质是比例运算，
+        // 两指离得远时同样的绝对噪声影响更小 —— 用相对值才在各尺度下一致。
+        // 0.4% 大致等于两指相距 500px 时的 2px 抖动。
+        const val PINCH_DEADZONE = 0.004f
+        // 平移是 1:1 跟手的，死区要小，否则画面"慢半拍"。
+        const val PAN_DEADZONE = 0.5f
+        // 滚转：两指夹角零点几度的抖动。0.2° 约等于 0.0035 rad。
+        const val ROLL_DEADZONE = 0.0035f
+
         // 惯性 / 加速度
         // FLING_DAMPING 同时决定两件事：
         //   1. 角速度追赶手指速度的快慢 = 加速度感的强弱；
         //   2. 松手后减速的快慢。
-        // 2.2 大约 1 秒衰减到 10%，手感偏"顺滑带减速"。
-        const val FLING_DAMPING = 2.2f
+        //
+        // 2.2 -> 6.0。这是"拖泥带水"的第二段延迟，而且是最主要的一段：
+        // 它决定实际角速度多久才追上目标角速度，2.2 时时间常数约 450ms，
+        // 手指已经甩出去了画面还在慢慢加速。6.0 时约 165ms，起步立刻有反应，
+        // 同时仍保留"追赶"这一段，加速度感不至于消失（不是把它设成无穷大
+        // 直接硬跟，那样快甩和慢拖的手感会被抹平）。
+        const val FLING_DAMPING = 6.0f
         // 低于这个速度就收尾（防止无限重绘）。
         const val MIN_FLING_SPEED = 0.02f
+        // 平移的收尾门槛，单位是"世界单位/秒"。比旋转高两个数量级：
+        // 平移的基数本来就小，沿用 0.02 会让双指轻按后的残留速度滑出可见的漂移。
+        const val MIN_PAN_FLING_SPEED = 0.12f
         // 角速度上限（rad/s）：约 3.3 圈/秒，再快也没意义
         const val MAX_YAW_VEL = 21f
 
         // 启动时的 MSAA 请求档位。4x 是画质/性能的常用折中；
         // 设备不支持时引擎会退回 1x 并打日志，UI 显示实际生效值。
         const val DEFAULT_MSAA_SAMPLES = 4
+
+        // 笔事件类型（与 primitives::StrokeEventKind 同值，见 painter.h）。
+        // 在 Kotlin 侧再写一遍常量而不是透传 Int 字面量：JNI 边界上
+        // 一个写错的魔数会变成"笔画永远不提交"，且没有任何编译期提示。
+        const val SKETCH_BEGIN = 0
+        const val SKETCH_MOVE = 1
+        const val SKETCH_END = 2
+        const val SKETCH_CANCEL = 3
     }
 }
