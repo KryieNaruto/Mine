@@ -18,6 +18,10 @@
 
 #include "magicblocks_shaders.h"
 
+// 模型网格的顶点定义（48 字节/顶点）。模型管线必须按它的真实布局去读，
+// 不能沿用内置立方体那份 36 字节布局 —— 详见 model_pipeline_desc()。
+#include "magicblocks/primitives/mesh.h"
+
 namespace magicblocks::android {
 
 namespace {
@@ -138,6 +142,53 @@ res::PipelineDesc cube_pipeline_desc(res::u32 samples) {
   // create_pipeline_for_shape 会直接拒绝(形状 samples=4 与 desc samples=1 不一致)。
   // 以前这里漏了赋值 → 恒为 1 → 开 ×4 必然建管线失败。
   desc.samples = samples;
+  return desc;
+}
+
+// 模型专用管线：顶点布局必须与 primitives::mesh_vertex_layout() 逐字节一致。
+//
+// 这里曾经直接复用 cube_pipeline_desc()，而内置立方体的 Vertex 是 36 字节
+// （pos3 + nrm3 + col3 全 float），模型网格的 Vertex 是 **48 字节**
+// （pos3 + pad / nrm3 + pad / color ubyte4norm + uv2 + pad，见 mesh.h）。
+// 用 36 字节的 stride 去读 48 字节的数据，第二个顶点就起在错位的字节上，
+// 于是兔子的每个三角形都散成互不相连的碎片 —— 就是"三角形爆炸乱飞"。
+//
+// 颜色属性也被换了格式：模型是 RGBA8 归一化（location 2），不是 vec3。
+// 模型没有颜色语义（loader 填白），着色器按法线明暗成灰白即可，但**格式和
+// 偏移必须说对**，否则同样会读到邻居顶点的字节。
+res::PipelineDesc model_pipeline_desc(res::u32 samples) {
+  res::PipelineDesc desc = cube_pipeline_desc(samples);
+
+  desc.vertexLayout.bindings.clear();
+  desc.vertexLayout.attributes.clear();
+
+  res::VertexInputBinding binding{};
+  binding.binding = 0;
+  binding.stride = static_cast<res::u32>(sizeof(primitives::Vertex));
+  binding.instanced = false;
+
+  res::VertexAttribute pos{};
+  pos.location = 0;
+  pos.binding = 0;
+  pos.format = res::VertexFormat::Float3;
+  pos.offset = static_cast<res::u32>(offsetof(primitives::Vertex, position));
+
+  res::VertexAttribute nrm{};
+  nrm.location = 1;
+  nrm.binding = 0;
+  nrm.format = res::VertexFormat::Float3;
+  nrm.offset = static_cast<res::u32>(offsetof(primitives::Vertex, normal));
+
+  res::VertexAttribute col{};
+  col.location = 2;
+  col.binding = 0;
+  col.format = res::VertexFormat::UByte4Norm;
+  col.offset = static_cast<res::u32>(offsetof(primitives::Vertex, color));
+
+  desc.vertexLayout.bindings.push_back(binding);
+  desc.vertexLayout.attributes.push_back(pos);
+  desc.vertexLayout.attributes.push_back(nrm);
+  desc.vertexLayout.attributes.push_back(col);
   return desc;
 }
 }  // namespace
@@ -318,6 +369,13 @@ bool SceneRenderer::rebuild_pipeline_for_swapchain(std::string* err) {
   if (!pr.ok()) return fail("按交换链形状建管线失败: " + pr.message());
   pipeline_ = pr.take();
   pipeline_hash_ = pipeline_->hash();
+
+  // 模型管线同形状、同采样数，只换顶点输入布局。它必须跟立方体管线一起
+  // 重建 —— 采样数一变，旧的模型管线就与 render pass 不兼容了。
+  auto mp = vkdev->create_pipeline_for_shape(model_pipeline_desc(effective_msaa_samples_), shape);
+  if (!mp.ok()) return fail("按交换链形状建模型管线失败: " + mp.message());
+  model_pipeline_ = mp.take();
+  model_pipeline_hash_ = model_pipeline_->hash();
   return true;
 }
 
@@ -462,25 +520,34 @@ bool SceneRenderer::record_into(dev::IRenderTarget* target, float qx, float qy, 
   sc.height = static_cast<dev::u32>(height_);
   if (auto s = cmd->set_scissor(sc); !s.ok()) return fail("set_scissor: " + s.message);
 
-  // 画哪一层：选了预设模型就画模型，否则画内置立方体。两者的顶点布局一致
-  // （位置/法线/颜色各 3 个 float），所以共用同一条管线 —— 模型没有顶点色时
-  // cube.frag 会退化成按法线算的灰白，不会黑成一片（见 shaders/cube.vert 注释）。
+  // 画哪一层：选了预设模型就画模型，否则画内置立方体。
   //
-  // 注意 OBJ 没有顶点色：loader 填的是白色，片元着色器最终按法线明暗成灰白
-  // —— 能看清形状，只是不上色。给模型单独做一条配色管线是后话，这里不假装做了。
+  // 两者**顶点布局不同**，所以管线也必须不同：
+  //   内置立方体 : 36B/顶点 = pos3 + nrm3 + col3（全 float）
+  //   模型网格   : 48B/顶点 = pos3+pad / nrm3+pad / RGBA8 + uv2 + pad
+  // 以前这里写着"两者布局一致，共用同一条管线"—— 那句是错的，也是兔子
+  // 三角形爆炸乱飞的直接原因：用 36B 的步长读 48B 的数据，从第二个顶点起
+  // 每个字段都错位，三角形互不相连。
+  //
+  // 着色器同一个：模型顶点色是白色，片元按法线明暗成灰白，形状清晰可辨。
+  bool drawing_model = false;
   const res::IBuffer* vb = vertex_buffer_.get();
   const res::IBuffer* ib = index_buffer_.get();
   std::uint32_t draw_indices = index_count_;
   if (model_ != nullptr) {
     const prim::IMesh* mesh = model_->mesh();
-    if (mesh != nullptr && mesh->vertex_buffer() != nullptr && mesh->index_buffer() != nullptr) {
+    if (mesh != nullptr && mesh->vertex_buffer() != nullptr && mesh->index_buffer() != nullptr &&
+        model_pipeline_ != nullptr) {
       vb = mesh->vertex_buffer();
       ib = mesh->index_buffer();
       draw_indices = mesh->index_count();
+      drawing_model = true;
     }
   }
 
-  if (auto s = cmd->bind_pipeline(pipeline_.get(), pipeline_hash_); !s.ok()) {
+  res::IPipeline* pipe = drawing_model ? model_pipeline_.get() : pipeline_.get();
+  const std::uint64_t pipe_hash = drawing_model ? model_pipeline_hash_ : pipeline_hash_;
+  if (auto s = cmd->bind_pipeline(pipe, pipe_hash); !s.ok()) {
     return fail("bind_pipeline: " + s.message);
   }
 

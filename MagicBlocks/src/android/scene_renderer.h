@@ -128,6 +128,11 @@ class SceneRenderer {
   std::unique_ptr<res::IBuffer> index_buffer_;
   std::unique_ptr<res::IPipeline> pipeline_;
   std::uint64_t pipeline_hash_ = 0;
+  // 模型管线：顶点布局是 48 字节的 primitives::Vertex，与内置立方体的
+  // 36 字节布局不同，所以**不能共用** —— 共用的后果是按错步长读顶点，
+  // 三角形散成碎片（兔子"爆炸乱飞"）。null 表示还没建。
+  std::unique_ptr<res::IPipeline> model_pipeline_;
+  std::uint64_t model_pipeline_hash_ = 0;
   std::uint32_t index_count_ = 0;
 
   // 当前选中的预设模型（null = 画内置立方体）。所有权归这里：加载成功才替换，
