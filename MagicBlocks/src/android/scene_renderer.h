@@ -47,6 +47,22 @@ struct Vertex {
   float r, g, b;
 };
 
+// ---------------------------------------------------------------- 管线描述
+//
+// 这两条管线描述**对外开放**（不是 scene_renderer.cpp 里的匿名 namespace），
+// 原因是它们编码了一份"看不见的契约"，而违反它的症状极难从画面上倒推：
+//
+//   内置立方体的顶点是 36 字节（pos3 + nrm3 + col3，全 float）；
+//   预设 OBJ 模型的顶点是 48 字节（pos3+pad / nrm3+pad / RGBA8 + uv2 + pad，
+//   见 primitives/mesh.h）。两条管线一旦合并成一条 36 字节步长的，
+//   GPU 从第二个顶点起每个字段都读在错位的字节上 —— 每个三角形三个角各自
+//   飞走，就是用户说的"三角面片全炸"，而且**不报任何错**。
+//
+// 所以布局必须能被测试逐字段断言（tests/magicblocks_android_scene_renderer_test.cpp）。
+// samples 必须与交换链真实生效的采样数一致，两个函数都原样透传。
+res::PipelineDesc cube_pipeline_desc(res::u32 samples);
+res::PipelineDesc model_pipeline_desc(res::u32 samples);
+
 class SceneRenderer {
  public:
   SceneRenderer() = default;

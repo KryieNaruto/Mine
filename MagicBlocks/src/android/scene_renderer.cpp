@@ -92,6 +92,12 @@ std::vector<std::uint32_t> build_indices() {
   return idx;
 }
 
+// 两条管线描述**故意不放进**上面的匿名 namespace：它们的布局契约必须能被测试
+// 断言（声明在 scene_renderer.h，测试在
+// tests/magicblocks_android_scene_renderer_test.cpp）。"36 字节步长去读 48 字节
+// 数据"这类错误编译期完全看不出来，跑起来也不报错，只能靠断言钉住。
+}  // namespace
+
 res::PipelineDesc cube_pipeline_desc(res::u32 samples) {
   res::PipelineDesc desc;
 
@@ -135,6 +141,19 @@ res::PipelineDesc cube_pipeline_desc(res::u32 samples) {
 
   desc.stages.push_back(vs);
   desc.stages.push_back(fs);
+  // 【深度状态必须与 render pass 的附件一致】
+  //
+  // 交换链图像不带深度附件（VkSwapchainCreateInfoKHR 不允许声明），本工程的
+  // VulkanSwapchain 目前也没有另外建深度图，所以 attach_surface 传的
+  // shape.has_depth = false、pass 里根本没有深度附件。
+  // 此时管线若声明 depthTest/depthWrite = true，管线与 pass 就**逐项不兼容**，
+  // vkCmdDraw 会被静默丢弃 —— 屏幕只剩清屏色，且不报任何错。
+  //
+  // 所以这里关掉，与 shape.has_depth = false 同口径。真要把深度打开，必须
+  // 三处一起改：先在 VulkanSwapchain 建每张图配一张的深度图（并暴露
+  // has_depth 探针），再把这里打开、把 rebuild_pipeline_for_swapchain 里的
+  // shape.has_depth/depth_format 一起填。只改其中一处的症状分别是
+  // "静默不画"和"face 互相穿透"——都比现在难看得多。
   desc.depth.depthTest = false;
   desc.depth.depthWrite = false;
   desc.push_constant_bytes = static_cast<res::u32>(sizeof(PushConstants));
@@ -191,7 +210,6 @@ res::PipelineDesc model_pipeline_desc(res::u32 samples) {
   desc.vertexLayout.attributes.push_back(col);
   return desc;
 }
-}  // namespace
 
 SceneRenderer::~SceneRenderer() {
   detach_surface();
@@ -353,7 +371,17 @@ bool SceneRenderer::rebuild_pipeline_for_swapchain(std::string* err) {
   const device::Format fmt = swapchain_->format();
   backend::AttachmentShape shape{};
   shape.color_format = fmt;
+  // 【深度开关必须与管线、与目标三者同口径】
+  //
+  // 交换链图像本身没有深度附件（VkSwapchainCreateInfoKHR 不允许声明），
+  // 本工程的 VulkanSwapchain 目前也没有像 MS 色图那样另外建一份深度图，
+  // 所以这里恒为 false —— 管线那边（cube_pipeline_desc）同样关掉深度。
+  // 三者只要有一处不一致，管线与 pass 就不兼容，vkCmdDraw 被静默丢弃。
+  //
+  // 要打开深度，先给 VulkanSwapchain 加"每张交换链图一张深度图"，再在这里
+  // 填 has_depth/depth_format，最后打开管线的 depthTest/depthWrite。
   shape.has_depth = false;
+  shape.depth_format = device::Format::D16_UNORM;
   // 必须用 **实际生效** 的采样数，且与交换链建 MS 图时的值一致。
   // 这里曾经硬编码 1，导致 MS 图建好却没任何管线/附件用它 —— 开了 ×4 等于没开。
   shape.samples = effective_msaa_samples_;

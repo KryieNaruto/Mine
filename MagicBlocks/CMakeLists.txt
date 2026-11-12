@@ -462,12 +462,14 @@ endif()  # NOT ANDROID（桌面可执行程序）
 # --- Android：JNI 层 .so（给 pad 上的 Compose/SurfaceView 用）---
 if(ANDROID)
   add_library(magicblocks_jni SHARED
-    src/android/scene_renderer.cpp
+    # scene_renderer.cpp 由 magicblocks_android_scene 提供（见下方“Android 壳层
+    # 平台无关部分”）：JNI .so 与宿主测试链接的是**同一份实现**，不会出现
+    # “测试测的是另一份代码”。
     src/android/jni_bridge.cpp)
   target_include_directories(magicblocks_jni PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_BINARY_DIR})
-  target_link_libraries(magicblocks_jni PRIVATE magicblocks android log)
+  target_link_libraries(magicblocks_jni PRIVATE magicblocks magicblocks_android_scene android log)
   # MB_ANDROID_USE_NDK 必须给到 JNI target：jni_bridge.cpp 里
   # nativeWindowFromSurface 用 #if defined(MB_ANDROID_USE_NDK) 才调用真的
   # ANativeWindow_fromSurface；上层的同名编译定义只作用于 magicblocks target，
@@ -476,6 +478,36 @@ if(ANDROID)
     VK_USE_PLATFORM_ANDROID_KHR
     MB_ANDROID_USE_NDK)
   set_target_properties(magicblocks_jni PROPERTIES OUTPUT_NAME "magicblocks")
+endif()
+
+# --- Android 壳层里“平台无关”的那部分（宿主机也编）---
+#
+# src/android/scene_renderer.cpp 里住着两种东西：
+#   1. 纯值语义的管线描述（cube_pipeline_desc / model_pipeline_desc）——宿主机可测；
+#   2. SceneRenderer 本体——依赖 Vulkan 设备、交换链、ANativeWindow，只能在 pad 上跑。
+#
+# 第 1 部分是“36 字节步长读 48 字节顶点 → 三角面片全炸”这条回归的唯一守门人，
+# 而它编译期看不出来、运行期也不报错。所以把它单独编成一个目标，让 gtest 能断言：
+# JNI .so 与 magicblocks_test 链接同一份源文件，测的就是上真机的那份代码。
+add_library(magicblocks_android_scene
+  src/android/scene_renderer.cpp)
+target_include_directories(magicblocks_android_scene PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_include_directories(magicblocks_android_scene PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_BINARY_DIR})
+target_link_libraries(magicblocks_android_scene PUBLIC magicblocks)
+if(ANDROID)
+  target_compile_definitions(magicblocks_android_scene PRIVATE
+    VK_USE_PLATFORM_ANDROID_KHR
+    MB_ANDROID_USE_NDK)
+else()
+  # 宿主机上没有 <android/log.h>。src/android/host/ 提供**仅用于测试编译**的替身；
+  # 真实 NDK 路径（ANativeWindow + MB_ANDROID_USE_NDK）仍然只在 Android 构建里启用。
+  target_include_directories(magicblocks_android_scene PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/android/host)
+  target_compile_definitions(magicblocks_android_scene PRIVATE
+    MB_ANDROID_HOST_STUB=1)
 endif()
 
 if(MB_BUILD_TESTS)
@@ -524,8 +556,12 @@ add_executable(magicblocks_test
   # backend 内的 MSAA 能力自证测试:它必须直接调 vkGetPhysicalDeviceImageFormatProperties
   # 才能验到"caps 报的采样等级是不是真的能用"(8x 静默降级的守门人),
   # 而 Vk* 类型只允许出现在 src/backend/**(G3),所以它住在 src 下。
-  src/backend/vulkan/msaa_render_pass_test.cpp)
-target_link_libraries(magicblocks_test PRIVATE magicblocks GTest::gtest GTest::gtest_main)
+  src/backend/vulkan/msaa_render_pass_test.cpp
+  # 2026-11-12：Android 场景渲染器的两条顶点布局契约。
+  # “36 字节步长读 48 字节模型数据 → 三角面片全炸”编译期看不出来、运行期
+  # 也不报错，只能靠断言钉住（详见测试文件头注释）。
+  tests/magicblocks_android_scene_renderer_test.cpp)
+target_link_libraries(magicblocks_test PRIVATE magicblocks magicblocks_android_scene GTest::gtest GTest::gtest_main)
 target_include_directories(magicblocks_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_BINARY_DIR})
 if(WIN32)
   target_compile_definitions(magicblocks_test PRIVATE VK_USE_PLATFORM_WIN32_KHR)

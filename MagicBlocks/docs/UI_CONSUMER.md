@@ -311,3 +311,32 @@ C++ 侧(`scene_renderer.cpp`)从四元数取三根轴:`col0=right、col1=up、co
 
 效果:SDK 重构期间再慢,也只有画面掉帧(SurfaceView 那层的
 `queueBuffer fps` 下降),UI 不再跟着卡。
+
+### 10.6 两条顶点布局 → 两条管线(重要)
+
+场景里可能画两种物体,它们的顶点布局**不同**,所以管线也必须不同:
+
+| 画什么 | 顶点结构 | 每顶点字节 | 颜色属性 |
+|---|---|---|---|
+| 内置立方体 | `android::Vertex`(`scene_renderer.h`) | 36 | `location 2` = `Float3` |
+| 预设 OBJ 模型 | `primitives::Vertex`(`primitives/mesh.h`) | 48 | `location 2` = `UByte4Norm` + `uv` |
+
+曾经的写法是 `record_into` 里"两者布局一致,共用同一条管线",直接复用
+`cube_pipeline_desc()`。GPU 于是按 36 字节的步长去读 48 字节的数据:第一个顶点
+碰巧还对,从第二个起每个字段都落在错位的字节上 —— 兔子的每个三角形三个角各自
+飞到毫不相干的位置,就是用户说的**"三角面片全炸"**。
+
+现在的约定(`scene_renderer.cpp`):
+
+* `cube_pipeline_desc(samples)` —— 内置立方体的 36 字节布局;
+* `model_pipeline_desc(samples)` —— 先复制立方体那份,再**整组换掉**
+  `vertexLayout`(stride 48 + `offsetof`),着色器仍是同一个 `cube.vert/cube.frag`;
+* 两条管线在 `rebuild_pipeline_for_swapchain()` 里**一起**重建。采样数一变,
+  旧管线就与 render pass 不兼容(vkCmdDraw 被静默丢弃,屏幕只剩清屏色),
+  所以模型管线不能只在 1x 时建一次;
+* `record_into()` 按当前画的是模型还是立方体选管线;画模型但模型管线尚未就绪时
+  **退回立方体管线**,宁可画错一帧也不 bind 一条与 pass 不兼容的管线。
+
+回归证据:`magicblocks_test` 里 `SceneRendererModelPipeline` 用例组把
+"模型管线的 stride/属性格式必须等于 `mesh_vertex_layout()` 且**不等于**立方体那份"
+钉在 CI 上;真机上 5 个预设逐个点选、互相切换、再切回内置立方体,全部正确。
