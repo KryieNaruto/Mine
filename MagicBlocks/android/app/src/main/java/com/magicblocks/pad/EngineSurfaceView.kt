@@ -60,12 +60,19 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
 
     // ---------------------------------------------------------------- 视角状态
     //
-    // 相机姿态是**一个单位四元数** q（相机系 → 世界系）。不存 yaw/pitch：
-    // 欧拉角一旦分解，横竖两轴就会互相污染（转着转着旋转轴自己变了）。
-    // 拖动时右乘"绕相机自身轴的小旋转"：
-    //     q ← q * Δq,   Δq = Δq_pitch(局部 X) * Δq_yaw(局部 Y)
-    // 于是无论当前朝向如何，"左右拖只绕相机 Y、上下拖只绕相机 X"永远成立，
-    // 360° 任意角度、没有夹取、没有万向节锁。
+    // 相机姿态是**一个单位四元数** q（机体系 → 世界系）。
+    //
+    // 每帧拖动只做一件事：**右乘两个增量**
+    //
+    //     q ← normalize( q * Rx(Δpitch) * Ry(Δyaw) )
+    //
+    // 四元数乘法里右乘 = 绕**机体轴**，而机体轴的定义就是相机此刻
+    // 的 right / up。所以左右拖永远绕当前相机的 up、上下拖永远绕当前
+    // 相机的 right，不需要任何“取轴”操作（取轴就会把读者/
+    // 自己引到“每帧重新选轴”的歧路上）。
+    //
+    // 四元数没有欧拉角那种万向节奇点，所以 360° 无死角、
+    // **不需要也不允许任何角度夹取**。
     private var qx = 0f
     private var qy = 0f
     private var qz = 0f
@@ -138,7 +145,7 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
     fun setDisplayRotation(rotation: Int) {
         if (rotation == displayRotation) return
         displayRotation = rotation
-        Log.i(MbRenderer.TAG, "屏幕朝向 rotation=$rotation（旋转轴映射已随之切换）")
+        Log.i(MbRenderer.TAG, "屏幕朝向 rotation=$rotation")
         rotationListener?.invoke(rotation)
     }
 
@@ -399,6 +406,8 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
                     // 双指模式下重新取样，避免把单指阶段的速度带进来
                     lastTwistAngle = Float.NaN
                     clearFingerVelocity()
+                    // 手指数变了，累计角度归零、锚点换成当前姿态，
+                    // 否则单指阶段攒下的 yaw 会跟双指的 focus 位移混在一起。
                     tracking = true
                 }
             }
@@ -426,6 +435,16 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
                 } else {
                     handleOneFinger(event)
                 }
+                // 拖动开关：手指按着的这段时间里，手指速度**就是**目标角速度。
+                //
+                // 这两个变量以前只被赋 0（在 beginGesture / stopMotion /
+                // releaseToFling 里），**从来没有被置过 1**。而 stepMotion 里
+                //     tgtYaw = fingerYawTarget * driveRotation
+                // 于是目标速度恒等于 0，三个旋转轴全是零速 —— 单指拖动完全转不动。
+                // 缩放不走这条通道（zoomBy 直接改 scale），所以表现成"只能缩放、
+                // 无法旋转"。必须在这里打开，松手时由 releaseToFling 关掉。
+                driveRotation = 1f
+                drivePan = 1f
                 // 手指一动，推进器就得跑着 —— 真正的角度积分在 stepMotion 里按帧做。
                 startMotion()
                 // 主线程只更新快照，真正出帧在渲染线程（见 renderLoopBody）。
@@ -476,6 +495,8 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         // 单指阶段不产生平移，但焦点要跟着走，否则从双指切回来时会跳
         lastFocusX = event.x
         lastFocusY = event.y
+        // 只把位移喂成"手指速度"，真正的转动由 stepMotion 按真实帧间隔积分。
+        // 这样拖动和惯性走同一条路径，加速度感（FLING_DAMPING 的追赶）来自这里。
         accumulateFingerSample(vx, vy, event.eventTime,
                                panDxPx = 0f, panDyPx = 0f, rollRad = 0f)
     }
@@ -483,48 +504,60 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
     /**
      * 把一截**逻辑坐标**下的位移换算成视觉（物理屏）位移。
      *
-     * displayRotation 是 Display.getRotation()：
-     *   0/180（逻辑横屏，与物理排布一致）→ 直接用
-     *   90/270（图片被转了 90°，事件仍按逻辑横屏上报）→ 交换 x/y
+     * 这里是**恒等**，不做任何 x/y 交换：交换链声明的是 `preTransform = IDENTITY`
+     * （见 vulkan_swapchain.cpp），窗口本身就是横屏 2160x1440，MotionEvent 的
+     * x/y 已经是屏幕方向。曾经因为 buffer 是竖的而交换 x/y，那会把水平右滑
+     * 当成垂直下滑，立方体不左右转而歪出顶面。
+     *
+     * displayRotation 仍保留供日志使用，但不参与手势方向换算。
      */
-    private fun toVisualDelta(dx: Float, dy: Float): Pair<Float, Float> {
-        val swapped = displayRotation == Surface.ROTATION_90 || displayRotation == Surface.ROTATION_270
-        return if (swapped) Pair(dy, dx) else Pair(dx, dy)
-    }
+    private fun toVisualDelta(dx: Float, dy: Float): Pair<Float, Float> = Pair(dx, dy)
 
-    /**
-     * 绕**相机自身的一根轴**转一小步。这是"旋转轴永远不变"的全部数学。
-     *
-     * q 是"相机系 → 世界系"的单位四元数。四元数乘法里**右乘** = 绕机体轴、
-     * 左乘 = 绕世界轴。所以只要永远右乘单轴小旋转，轴就不可能跑到世界系去：
-     *
-     *     axis 0 (right, 局部 X): Δq = (sin(b/2), 0,         0,         cos(b/2))
-     *     axis 1 (up,    局部 Y): Δq = (0,         sin(b/2), 0,         cos(b/2))
-     *     axis 2 (back,  局部 Z): Δq = (0,         0,        sin(b/2),  cos(b/2))
-     *     q ← normalize(q * Δq)
-     *
-     * 关键：**一次只绕一根轴**。上一版把 pitch 和 yaw 两次右乘写死在同一个
-     * 函数里（q ← q*Δpitch*Δyaw），后一次乘法的轴会跟着前一次的结果走，
-     * 横竖方向一连动就互相"串轴" —— 那正是"旋转会影响旋转轴"。
-     * 现在每一帧各轴**分别**右乘，轴各转各的。
-     *
-     * 另外没有任何 pitch 夹取：四元数能表示 360° 内任意朝向（滚转由双指给），
-     * 上下翻到底看到底面也是合法视角。
-     */
-    private fun rotateAboutLocalAxis(axis: Int, angle: Float) {
-        if (angle == 0f) return
-        val sh = sin(angle * 0.5f)
-        val ch = cos(angle * 0.5f)
-        val ax = if (axis == 0) sh else 0f
-        val ay = if (axis == 1) sh else 0f
-        val az = if (axis == 2) sh else 0f
-        val aw = ch
-        // q * Δq。Δq 只有一根轴非零，展开后每步只有两项相加。
-        val nx = qw * ax + qx * aw + qy * az - qz * ay
-        val ny = qw * ay - qx * az + qy * aw + qz * ax
-        val nz = qw * az + qx * ay - qy * ax + qz * aw
-        val nw = qw * aw - qx * ax - qy * ay - qz * az
-        // 归一化：几万次乘法后浮点会漂，不归一化相机会慢慢"缩水/变形"
+    // ================================================================ 拖动旋转
+    //
+    // 归约到一句：每帧在当前四元数上右乘两个增量。
+    //
+    //   q ← normalize( q * Rx(Δpitch) * Ry(Δyaw) * Rz(Δroll) )
+    //
+    // 右乘 = 绕机体轴，于是：
+    //   • 左右拖（Ry）绕**当前相机自己的 up** —— 不是世界 Y。
+    //     俯仰过之后再左右拖，轴会跟着相机一起倾斜，这就是“转方向跟手”。
+    //   • 上下拖（Rx）绕**当前相机自己的 right**。
+    //   • 双指拧（Rz）绕**当前相机自己的 back**。
+    //
+    // 三个增量都是当帧小角（由速度积分得来，step ≤ 50ms），所以乘序差异
+    // 只是二阶小量，不会造成可见的串轴。
+    // **没有任何角度夹取**：俯仰能转满 360°，四元数没有万向节奇点。
+    private fun applyLocalRotation(deltaPitch: Float, deltaYaw: Float, deltaRoll: Float) {
+        if (deltaPitch == 0f && deltaYaw == 0f && deltaRoll == 0f) return
+
+        // q = q * Rx(pitch) * Ry(yaw) * Rz(roll)
+        // 三个单轴增量依次右乘；合并成一个增量再右乘一次，
+        // 节省三次归一化。
+        val hp = deltaPitch * 0.5f
+        val hy = deltaYaw * 0.5f
+        val hr = deltaRoll * 0.5f
+        val sp = sin(hp); val cp = cos(hp)
+        val sy = sin(hy); val cy = cos(hy)
+        val sr = sin(hr); val cr = cos(hr)
+
+        // Rx * Ry
+        val ax = sp * cy
+        val ay = cp * sy
+        val az = -sp * sy
+        val aw = cp * cy
+        // (Rx*Ry) * Rz
+        val dx = ax * cr - ay * sr
+        val dy = ax * sr + ay * cr
+        val dz = az * cr - aw * sr
+        val dw = az * sr + aw * cr
+
+        // q * d
+        val nx = qw * dx + qx * dw + qy * dz - qz * dy
+        val ny = qw * dy - qx * dz + qy * dw + qz * dx
+        val nz = qw * dz + qx * dy - qy * dx + qz * dw
+        val nw = qw * dw - qx * dx - qy * dy - qz * dz
+
         val len = sqrt(nx * nx + ny * ny + nz * nz + nw * nw)
         if (len < 1e-6f) return
         qx = nx / len
@@ -642,9 +675,14 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         val dtMs = if (hasLastMove) (now - lastMoveTime).toFloat() else 0f
         if (hasLastMove && dtMs > 0f && dtMs < MAX_SAMPLE_DT_MS) {
             val dt = dtMs / 1000f
-            // 帧间噪声很大（一次 MOVE 只有 1~2 像素），先做一次归一化再低通
+            // 参考实现是 targetEuler.x += (-dy) * ratio、targetEuler.y += (dx) * ratio，
+            // 但那份代码是"cameraRoot * Euler(x,y,z)"、绕世界 Y 的欧拉框架；
+            // 这里是**绕相机自身 up 右乘**，yaw 的正方向与欧拉 Y 相反，所以
+            // 水平取负号（上下方向本来就一致，不动）。
+            //   手指向左 dx<0 → yawT>0 → 绕相机 up 正转
+            //   手指向上 dy<0 → pitchT>0 → 绕相机 right 正转
             val yawT = -vxPx / dt * ROT_PER_PX
-            val pitchT = vyPx / dt * ROT_PER_PX
+            val pitchT = -vyPx / dt * ROT_PER_PX
             val rollT = rollRad / dt
             val panXT = -panDxPx / dt * worldUnitsPerPixel()
             val panYT = panDyPx / dt * worldUnitsPerPixel()
@@ -741,8 +779,8 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
      * 每一帧做三件事：
      *   1. 速度向目标速度收敛（拖动时目标来自手指，惯性时目标为 0）——
      *      这一步就是加速度感本身；收敛得快慢由 FLING_DAMPING 决定。
-     *   2. 各轴**分别**右乘一小段角度（见 rotateAboutLocalAxis）：
-     *      绕相机 X / Y / Z 各转各的，谁也不会改变谁的轴。
+     *   2. 把本帧的角度增量右乘进四元数（见 applyLocalRotation）：
+     *      三根轴都是相机自身当前的 right / up / back。
      *   3. 速度按 exp(-k*dt) 衰减（拖动时目标非零，衰减只影响"追赶"的快慢）。
      *
      * 收敛 + 衰减写成同一个式子：
@@ -783,10 +821,9 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         panXVel += (tgtPanX - panXVel) * follow
         panYVel += (tgtPanY - panYVel) * follow
 
-        // 各轴**独立**右乘：轴永远是相机自己的 right / up / back
-        rotateAboutLocalAxis(0, pitchVel * step)
-        rotateAboutLocalAxis(1, yawVel * step)
-        rotateAboutLocalAxis(2, rollVel * step)
+        // 本帧的角度增量交给 applyLocalRotation 右乘进 q：
+        // 三根轴都是相机自身当前的 right / up / back，不碰世界系。
+        applyLocalRotation(pitchVel * step, yawVel * step, rollVel * step)
         // 平移是世界系里绕着中心走，与相机朝向无关，所以直接加
         panX += panXVel * step
         panY += panYVel * step
@@ -811,12 +848,12 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         requestRender()
     }
 
-    /** 当前视觉状态，供 HUD 显示。四元数姿态直接显示，不做欧拉角分解（分解会误导）。 */
+    /** 当前视觉状态，供 HUD 显示。两个环绕相机角度直接显示。 */
     fun viewState(): String =
         "q=(${"%.2f".format(qx)},${"%.2f".format(qy)},${"%.2f".format(qz)},${"%.2f".format(qw)}) " +
             "zoom=${"%.2f".format(scale)} pan=(${"%.2f".format(panX)},${"%.2f".format(panY)})"
 
-    /** 复位视角：姿态回单位四元数 + 缩放回 1.0 + 平移归零，并立刻重画一帧。 */
+    /** 复位视角：两个角回 0（正对目标）+ 缩放回 1.0 + 平移归零，并立刻重画一帧。 */
     fun resetView() {
         stopMotion()
         qx = 0f
@@ -861,7 +898,7 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
     // 而不再是整个 App 掉帧。
     private var renderThread: Thread? = null
 
-    /** 姿态快照：主线程写、渲染线程读。8 个 float 的可见性用 @Volatile 包一层。 */
+    /** 姿态快照：主线程写、渲染线程读。[qx, qy, qz, qw, scale, panX, panY] */
     @Volatile
     private var pendingPose = floatArrayOf(0f, 0f, 0f, 1f, 1f, 0f, 0f)
 
@@ -1002,13 +1039,25 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         // fps 统计窗口：短于 1 秒数值抖得没法看，长于 1 秒对"拖动时掉帧"反应太慢。
         const val FPS_WINDOW_NS = 1_000_000_000L
 
-        // 渲染线程每帧的目标预算(ms)：8 ≈ 120Hz 上限。
+        // 渲染线程每帧的目标预算(ms)：1 ≈ 1000Hz 上限，即"几乎不让路"。
         //
         // 为什么要"目标"而不是"能多快跑多快"：这条循环和 UI 线程是**两个**线程，
         // 但它们共享 CPU 与内存带宽。渲染线程狂飙会把 UI 线程挤到没时间片，
-        // 又变回"UI 卡"。给一个上界，SDK 再快也不会把 UI 拖死；
-        // SDK 变慢时超出预算的部分就自然表现为画面掉帧，UI 不受影响。
-        const val FRAME_BUDGET_MS = 8L
+        // 又变回"UI 卡"。给一个上界，SDK 再快也不会把 UI 拖死。
+        //
+        // 【2026-11-11 8 → 1】原来 8ms 是照着"预算 1/120s"写的，但它算的是
+        // **sleep 之前的剩余量**：sleepMs = 8 - elapsed，于是循环周期是
+        // max(8, elapsed)。
+        //   实测(MAILBOX + 3 帧在飞，2160x1440，MSAA 4x)：
+        //     ms_avg = 15.4ms —— SDK 侧 session.render() 本身就占 15.4ms，
+        //     早超过 8ms，所以那行 sleep 的 sleepMs 恒为负、**一次都没执行**。
+        //   也就是说 64fps 完全不是 sleep 造成的。真正的原因是 GPU 每帧都在做
+        //   一次 2160x1440 的整屏 CLEAR(见 scene_renderer.cpp 的 clear_color)，
+        //   那一趟的写带宽就是 ~12ms。这属于渲染内容问题，不该用"再让 CPU 睡
+        //   更多"来掩盖。
+        // 保留一个很小的让路量(1ms)只是防止 SDK 变得极快时把主线程饿死；
+        // 当前实测下它同样不会触发（15.4 > 1）。
+        const val FRAME_BUDGET_MS = 1L
 
         // 相机
         const val CAM_DIST = 2.6f
@@ -1017,8 +1066,7 @@ class EngineSurfaceView(context: Context) : SurfaceView(context), SurfaceHolder.
         // 灵敏度：0.006 rad/px。它乘的是**手指速度**（px/s）而不是位移：
         // 拖 1000px/s 就是目标角速度 6 rad/s。
         //
-        // **没有角度上限**：姿态是四元数，上下左右都能转满 360°，
-        // 也不需要 PITCH_LIMIT 那种夹取（夹取会造成"转到顶就贴墙"的错觉）。
+        // 四元数姿态没有任何角度夹取：水平、俯仰都能 360° 无死角转。
         // 2π 写成 Float：Kotlin 的 PI 是 Double，运算结果会升级成 Double。
         const val TWO_PI_F = (2.0 * Math.PI).toFloat()
 

@@ -225,9 +225,20 @@ class VulkanPagingAllocator final : public resources::IMemoryAllocator {
   // 也不产生新的分配路径 —— 只是把"页已经有的那块内存"报给绑定层。
   bool page_memory_handle(u32 page_id, std::uintptr_t* out_memory, u64* out_offset) const;
 
+  // ---- 所属设备(非拥有,可为 nullptr)----
+  //
+  // 资源对象(VulkanBuffer / VulkanTexture / …)析构时要通知设备把它们从
+  // known_* 反查表里摘掉,否则那张存裸指针的表会留下悬垂指针(ResourceId 会被
+  // 回收复用 → 反查命中已释放内存)。资源手上只有 ctx 与分配器,没有设备指针,
+  // 而分页分配器**由设备独占持有**且生命周期覆盖全部资源,所以它是最自然的
+  // 那条反向引用。纯软件态 / 单测构造时这里是 nullptr,资源侧按"无设备可通知"处理。
+  void set_owner_device(void* device) { owner_device_ = device; }
+  void* owner_device() const { return owner_device_; }
+
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
+  void* owner_device_ = nullptr;
 };
 
 }  // namespace magicblocks::backend

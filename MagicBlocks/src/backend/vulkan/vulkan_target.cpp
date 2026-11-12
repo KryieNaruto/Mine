@@ -6,6 +6,7 @@
 #include "backend/vulkan/vulkan_allocator.h"
 #include "backend/vulkan/vulkan_draw.h"
 #include "backend/vulkan/vulkan_resource_common.h"  // to_vk_samples(MSAA 共用唯一一份)
+#include "backend/vulkan/vulkan_sync_core.h"        // submit_and_wait_directed / wait_latest_frame
 
 namespace magicblocks::backend {
 
@@ -100,6 +101,16 @@ Status create_image(const VulkanContext& ctx, VkFormat fmt, VkImageUsageFlags us
 // ---------------------------------------------------------------- OffscreenTarget
 
 OffscreenTarget::~OffscreenTarget() {
+  // 【必须先等本设备已提交的帧跑完】
+  //
+  // 本目标的三张 VkImage 会被异步提交的命令缓冲引用(framebuffer → imageView →
+  // image)。销毁提前于 GPU 完成就是 VUID-vkDestroyImage-image-01000
+  // (实测触发),而且会让引用它的命令缓冲进入 invalid 状态。
+  //
+  // 用 wait_device_frames_idle(排空 N 个槽位 fence)而不是 vkDeviceWaitIdle:
+  // 前者只等本设备登记过的那几次提交。这里不在热路径上(目标销毁是装配期/
+  // 用例结束),多帧并行本身不受影响。
+  if (ctx_.device != VK_NULL_HANDLE) (void)wait_device_frames_idle(ctx_);
   // 顺序关键:先销毁 image,再把它占的分配器页退回去(页承载着这块 VkDeviceMemory)。
   if (color_) vkDestroyImage(ctx_.device, color_, nullptr);
   if (depth_) vkDestroyImage(ctx_.device, depth_, nullptr);
@@ -206,6 +217,14 @@ Status OffscreenTarget::readback_rgba8(std::uint8_t* out, std::size_t size_bytes
     return Status::Invalid("readback: 缓冲过小,需要 " + std::to_string(need) + " 字节");
   }
   if (!color_) return Status::Unsupported("readback: 无颜色附件");
+
+  // 【2026-11-11】读回前必须先等"最近一次提交"完成 —— 现在的 submit 是异步的,
+  // 不等就会读到还没写完的像素。改造前 submit_device_frame() 自己同步等 fence,
+  // 所以这里不需要;这一层保障被搬到了下面这个调用里。
+  //
+  // 等待是**定向**的:只等设备当前槽位的 fence(只等我们这一帧),不是
+  // vkQueueWaitIdle / vkDeviceWaitIdle 那种全停 —— 其余在飞帧该跑还跑。
+  if (Status w = wait_latest_frame(ctx_); !w.ok()) return w;
 
   // MSAA:读回的是**单采样 resolve 图像**,不是多重采样那张。
   // 多重采样图像禁止做 vkCmdCopyImageToBuffer;样本数 1 时 resolve_image()
@@ -322,15 +341,19 @@ Status OffscreenTarget::readback_rgba8(std::uint8_t* out, std::size_t size_bytes
                        0, 0, nullptr, 0, nullptr, 1, &back);
   r = vkEndCommandBuffer(cmd);
   if (r == VK_SUCCESS) {
-    VkSubmitInfo si{};
-    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &cmd;
-    r = vkQueueSubmit(ctx_.queue, 1, &si, VK_NULL_HANDLE);
-    if (r == VK_SUCCESS) r = vkQueueWaitIdle(ctx_.queue);
-  }
-  vkFreeCommandBuffers(ctx_.device, ctx_.cmd_pool, 1, &cmd);
-  if (r != VK_SUCCESS) {
+    // 【2026-11-11】原来是 vkQueueSubmit(…, VK_NULL_HANDLE) + vkQueueWaitIdle:
+    // 一个 queue 级全停,连别的在飞帧也一起停住。
+    // 现在改成"提交并**定向等待这一次提交**":有设备同步核心时借用它的槽位 fence,
+    // 没有时用临时 fence —— 两种都不碰设备/队列级别的全局停止。
+    Status sub = submit_and_wait_directed(ctx_, cmd, 1'000'000'000ull);
+    // 这条路径的 cmd 是**临时**分配的(不是同步核心的持久命令缓冲),用完即还。
+    vkFreeCommandBuffers(ctx_.device, ctx_.cmd_pool, 1, &cmd);
+    if (!sub.ok()) {
+      cleanup_buffer();
+      return Status::InitFailed("readback 提交: " + sub.message);
+    }
+  } else {
+    vkFreeCommandBuffers(ctx_.device, ctx_.cmd_pool, 1, &cmd);
     cleanup_buffer();
     return Status::InitFailed(fmt_err("readback 提交", r));
   }

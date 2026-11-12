@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "backend/vulkan/vk_common.h"
+#include "backend/vulkan/vulkan_sync_core.h"
 #include "backend/vulkan/vulkan_target.h"
 #include "magicblocks/device/result.h"
 #include "magicblocks/resources/command.h"
@@ -53,6 +54,16 @@ struct DeviceFrameStats {
   std::uint32_t skipped_commands = 0;    // 认不出内容的命令(理论上恒 0)
   // shader 采样器绑定用的是纹理视图:本后端无描述符集(R4),恒 0,保留以便观测。
   std::uint32_t sampler_binds = 0;
+  // 本帧在飞帧防护需要立标记/托管的资源页(page_id,去重)。
+  //
+  // 【为什么由 submit_device_frame 填、而不是 submit_command_list 自己扫一遍】
+  // 因为**翻译成功的命令才是真的提交了**:命令流里记了句柄、但设备帧提交因为
+  // 缺句柄/类型不符而跳过的那条(pipeline 缺失等)并没有下发。这里只收
+  // "真的进入了 vkCmdBind* / vkCmdDraw*"的 page_id,才不会有"绑了名字却
+  // 没被 GPU 读"的假在途页把 L1 的页淘汰永久卡住。
+  std::vector<std::uint32_t> pages;
+  // 同上,去重后的 VkBuffer 句柄(供退休托管的反查;只含本帧真实绑定的)。
+  std::vector<VkBuffer> buffers;
 };
 
 // 按 `list.recorded()` 的顺序把全部命令**真正编码**到一张 VkCommandBuffer 并提交。
@@ -62,11 +73,20 @@ struct DeviceFrameStats {
 //     (`in_pass() == false`)。
 //   - 参与绘制的 pipeline / vertex buffer / index buffer 都必须是本设备创建的
 //     backend 实现类型(否则返回 Unsupported,并指出是哪条命令)。
+//   - core 是设备的 N 槽同步核心(VulkanRenderDevice::sync_core_impl())。
+//     调用方必须已经对该设备调用过 begin_frame()(acquire 之前),否则本帧的
+//     image_available 语义量不会有对应的 acquire 去信号它。
 //
 // 失败语义(D8 不静默降级):任何一条命令无法翻译都返回非 Ok,不提交半帧。
+//
+// 【2026-11-11 重构】本函数**返回时 GPU 可能还在跑**(不再同步 vkWaitForFences)。
+// 帧内建的 framebuffer / imageView / renderPass 被压到该槽位的延迟销毁栈,
+// 由 VulkanSyncCore::begin_frame 在 N 帧后该槽位复用时销毁。
+// 需要"像素已经落地"的调用方(读回 / present)必须自己等:
+//   - present:present_current() 等 render_finished 信号量(swapchain 侧负责);
+//   - 读回:readback_rgba8() 内部先 wait_latest_frame()。
 device::Status submit_device_frame(const VulkanContext& ctx, const VulkanCommandList& list,
-                                   DeviceFrameStats* out_stats,
-                                                   VkFence* reusable_fence = nullptr);
+                                   DeviceFrameStats* out_stats, VulkanSyncCore* core);
 
 // ---------------------------------------------------------------- 目标缓存
 //

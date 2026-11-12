@@ -53,6 +53,8 @@ namespace magicblocks::backend {
 
 using namespace magicblocks::device;
 
+using ResourceId = magicblocks::resources::ResourceId;
+
 namespace {
 
 Status fail_cmd(std::uint32_t index, const char* what, const std::string& why) {
@@ -168,17 +170,58 @@ VkRenderPass create_pass(VkDevice device, const PassShape& shape, std::string* e
   sub.pDepthStencilAttachment = shape.has_depth ? &depth_ref : nullptr;
   sub.pResolveAttachments = resolve ? &resolve_ref : nullptr;
 
-  // subpass 依赖:没有它,loadOp=CLEAR 与随后的着色写入之间没有任何同步点。
-  // Vulkan 规范里这是"隐性竞争",SwiftShader 上表现为整片被清掉(画不出东西),
-  // 而且**不会报错** —— 与"render pass 不兼容"同属最难查的一类。
-  VkSubpassDependency dep{};
-  dep.srcSubpass = VK_SUBPASS_EXTERNAL;
-  dep.dstSubpass = 0;
-  dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-  dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-  dep.srcAccessMask = 0;
-  dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-  dep.dependencyFlags = 0;
+  // subpass 依赖(2026-11-11 补全:原来只有 1 条 EXTERNAL→0,缺出口依赖与深度写 mask)。
+  //
+  // ⚠️ **入口依赖 EXTERNAL→0 只能补、不能删**:没有它,loadOp=CLEAR 与随后的着色写入
+  // 之间没有任何同步点,Vulkan 规范里这是"隐性竞争",SwiftShader 上表现为整片被清掉
+  // (画不出东西),而且**不会报错** —— 与"render pass 不兼容"同属最难查的一类。
+  //
+  // 三条依赖各管一件事:
+  //   1) EXTERNAL→0:进入 pass 前(clear / load / layout 转换)必须等上一步的写完成。
+  //      srcStage 从 TOP_OF_PIPE 起(而不是 COLOR_ATTACHMENT_OUTPUT):上游可能是
+  //      TRANSFER(vkCmdClearColorImage)、也可能是别的 pass 的 COLOR_ATTACHMENT_OUTPUT。
+  //      dstAccessMask 补上 DEPTH_STENCIL_ATTACHMENT_WRITE —— 原来只有颜色写,
+  //      深度清屏/深度写没有对应的可见性保证。
+  //   2) 0→EXTERNAL:pass 末尾的写(以及 MSAA resolve)必须对后续访问可见:
+  //      离屏路径后续是 TRANSFER_READ(读回)、交换链路径是 vkQueuePresentKHR。
+  //      少了这条,读回/上屏可能看到旧的或部分写入的内容。
+  //   3) 为什么与"进 pass 前的手动 barrier"不冲突:两者是**串联**的 ——
+  //      手动 barrier(如 vulkan_ui_overlay.cpp 里的 UNDEFINED→GENERAL→COLOR_ATTACHMENT_OPTIMAL)
+  //      负责**布局转换**,它在 vkCmdBeginRenderPass 之前就完成了布局切换;
+  //      本依赖负责**执行/可见性**(srcAccessMask/dstAccessMask),不涉及布局。
+  //      当 attachment 的 initialLayout 与执行 barrier 得到的布局一致时,规范规定
+  //      render pass 内不再插入隐式布局转换,依赖里也就不需要 layout 字段。
+  //      submit_device_frame 这一路是 initialLayout 由 pass 自己声明(UNDEFINED/GENERAL/
+  //      PRESENT_SRC),隐式转换发生在 subpass 的第一次访问点 —— 由依赖 1 守。
+  VkSubpassDependency deps[2] = {};
+  deps[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+  deps[0].dstSubpass = 0;
+  deps[0].srcStageMask = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+  deps[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                         VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                         VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+  deps[0].srcAccessMask = 0;
+  deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+  if (shape.has_depth) {
+    // 深度:清屏与深度测试都要看到"上一步写完"的缓冲,写深度也必须被同步。
+    deps[0].dstAccessMask |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                             VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+  }
+  deps[0].dependencyFlags = 0;
+
+  // 出口依赖。交换链图上 present 由**信号量**守(submit 的 render_finished),
+  // 但 render pass 内的写对后续 TRANSFER_READ(读回)仍需要显式的可见性保证。
+  deps[1].srcSubpass = 0;
+  deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+  deps[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+  deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+  deps[1].dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+  deps[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+  if (shape.has_depth) {
+    deps[1].srcStageMask |= VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    deps[1].srcAccessMask |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+  }
+  deps[1].dependencyFlags = 0;
 
   VkRenderPassCreateInfo ci{};
   ci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
@@ -186,8 +229,8 @@ VkRenderPass create_pass(VkDevice device, const PassShape& shape, std::string* e
   ci.pAttachments = att;
   ci.subpassCount = 1;
   ci.pSubpasses = &sub;
-  ci.dependencyCount = 1;
-  ci.pDependencies = &dep;
+  ci.dependencyCount = 2;
+  ci.pDependencies = deps;
   VkRenderPass rp = VK_NULL_HANDLE;
   const VkResult r = vkCreateRenderPass(device, &ci, nullptr, &rp);
   if (r != VK_SUCCESS) {
@@ -200,10 +243,15 @@ VkRenderPass create_pass(VkDevice device, const PassShape& shape, std::string* e
 }  // namespace
 
 Status submit_device_frame(const VulkanContext& ctx, const VulkanCommandList& list,
-                           DeviceFrameStats* out_stats, VkFence* reusable_fence) {
+                           DeviceFrameStats* out_stats, VulkanSyncCore* core) {
   DeviceFrameStats stats{};
   if (ctx.device == VK_NULL_HANDLE || ctx.queue == VK_NULL_HANDLE) {
     return Status::InitFailed("submit_device_frame: 设备未初始化");
+  }
+  if (core == nullptr || !core->ready()) {
+    return Status::InitFailed(
+        "submit_device_frame: 需要设备的多帧同步核心(N 槽 semaphore/fence/持久命令缓冲);"
+        "无核心时无法记录『这一批提交由哪个信号量表示渲染完成』,present 就会与渲染竞争");
   }
 
   const std::vector<RecordedCommand>& cmds = list.recorded();
@@ -212,17 +260,24 @@ Status submit_device_frame(const VulkanContext& ctx, const VulkanCommandList& li
     return Status::Ok_();  // 空帧是合法的(与 L1 submit_and_wait 同口径)
   }
 
-  VkCommandBufferAllocateInfo cai{};
-  cai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-  cai.commandPool = ctx.cmd_pool;
-  cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-  cai.commandBufferCount = 1;
-  VkCommandBuffer cmd = VK_NULL_HANDLE;
-  VkResult vr = vkAllocateCommandBuffers(ctx.device, &cai, &cmd);
-  if (vr != VK_SUCCESS) return Status::InitFailed(fmt_err("submit_device_frame: vkAllocateCommandBuffers", vr));
+  // ---- 取本帧槽位并开始 ----
+  //
+  // 【改造前的串行点】这里是每帧 vkAllocateCommandBuffers + submit 后同步
+  // vkWaitForFences(1s) + 返回前 cleanup() 销毁全部帧内对象。
+  // 现在:命令缓冲来自槽位(只分配过一次,vkResetCommandBuffer 复用);
+  // begin_frame 只等**本槽**的 fence,并顺带销毁该槽"上一轮(N 帧前)"的退休对象。
+  const std::uint32_t slot_index = core->current_slot();
+  FrameSlot& slot = core->slot(slot_index);
+  constexpr std::uint64_t kFrameTimeoutNs = 1'000'000'000ull;
+  Status s = core->begin_frame(kFrameTimeoutNs);
+  if (!s.ok()) return s;
+  const VkCommandBuffer cmd = slot.cmd;
+  VkResult vr = VK_SUCCESS;  // 逐 pass 的 Vk 调用返回值(镜头/深度/解析视图与 framebuffer 用)
 
   VkCommandBufferBeginInfo bi{};
   bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+  // ONE_TIME_SUBMIT 仍然正确:本命令缓冲这一轮只会被提交一次。
+  // (复用靠的是每轮 vkResetCommandBuffer,而不是同一条缓冲多次提交。)
   bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
   {
     // 原实现没有检查这个返回值。若它失败,之后所有 vkCmd* 都是空操作,
@@ -234,6 +289,10 @@ Status submit_device_frame(const VulkanContext& ctx, const VulkanCommandList& li
   }
 
   // 每个 pass 一套资源:这些对象被命令缓冲引用,必须活到执行完成之后。
+  //
+  // 【延迟销毁】本帧建的对象一律压到**本槽位的退休栈**上,由
+  // VulkanSyncCore::begin_frame 在该槽位 fence 信号之后销毁 —— 不再
+  // "返回前删掉",所以不再需要在返回前等 GPU。
   struct PassResources {
     VkRenderPass rp = VK_NULL_HANDLE;
     VkFramebuffer fb = VK_NULL_HANDLE;
@@ -243,7 +302,8 @@ Status submit_device_frame(const VulkanContext& ctx, const VulkanCommandList& li
     std::vector<VkImageView> views;
   };
   std::vector<PassResources> passes;
-  auto cleanup = [&]() {
+  // 失败路径用:把本帧已建的对象销毁掉(这时它们还没被提交,可以立刻销毁)。
+  auto destroy_now = [&]() {
     for (PassResources& p : passes) {
       for (VkImageView v : p.views) {
         if (v != VK_NULL_HANDLE) vkDestroyImageView(ctx.device, v, nullptr);
@@ -252,11 +312,41 @@ Status submit_device_frame(const VulkanContext& ctx, const VulkanCommandList& li
       if (p.rp_owned && p.rp != VK_NULL_HANDLE) vkDestroyRenderPass(ctx.device, p.rp, nullptr);
     }
     passes.clear();
-    vkFreeCommandBuffers(ctx.device, ctx.cmd_pool, 1, &cmd);
+  };
+  // 成功路径用:把它们交给本槽位的退休栈。命令缓冲**不**在这里释放 ——
+  // 它归槽位所有,下一轮 begin_frame 复用。
+  auto retire_into_slot = [&]() {
+    for (PassResources& p : passes) {
+      for (VkImageView v : p.views) {
+        if (v != VK_NULL_HANDLE) slot.retire.push_owned_image_view(v);
+      }
+      if (p.fb != VK_NULL_HANDLE) slot.retire.push_framebuffer(p.fb);
+      if (p.rp_owned && p.rp != VK_NULL_HANDLE) slot.retire.push_owned_render_pass(p.rp);
+    }
+    passes.clear();
   };
 
-  Status s = Status::Ok_();
   bool in_pass = false;
+  // 本帧**真的绑定给 GPU 用过**的资源(去重)。
+  //
+  // 只收"翻译成功、真的发出了 vkCmdBind*"的那一条 —— 命令流里记了句柄但因
+  // 类型不符被 fail_cmd 跳过的不算,否则会把没人读的页标成在途,L1 的页淘汰
+  // 就被永久卡住。这两份表最终经由 out_stats 交给设备层做「在飞帧防护」
+  // (标页在途)与「延迟销毁托管」(缓冲区票据)。
+  auto record_live_resource = [&stats](const ResourceId& id, VkBuffer vkb) {
+    if (id.valid() && id.page_id != ResourceId::kInvalidPage) {
+      if (std::find(stats.pages.begin(), stats.pages.end(), id.page_id) == stats.pages.end()) {
+        stats.pages.push_back(id.page_id);
+      }
+    }
+    if (vkb != VK_NULL_HANDLE &&
+        std::find(stats.buffers.begin(), stats.buffers.end(), vkb) == stats.buffers.end()) {
+      stats.buffers.push_back(vkb);
+    }
+  };
+  // 本帧是否渲染到**交换链图像**。决定提交时要不要等 image_available 信号量
+  // (只有交换链路径才有 vkAcquireNextImageKHR 去 signal 它,见提交段注释)。
+  bool swapchain_image_target = false;
   // 本帧是否已经有 pass 真正写过深度。
   //
   // 深度附件的"清/不清"与颜色**不同**:颜色不清时旧内容是上一 pass 留下的
@@ -320,6 +410,8 @@ Status submit_device_frame(const VulkanContext& ctx, const VulkanCommandList& li
           break;
         }
         const bool from_swapchain = frame_img->frame_from_swapchain();
+        // 记到函数级:提交时要用它决定是否等 image_available(见提交段的注释)。
+        swapchain_image_target = swapchain_image_target || from_swapchain;
         PassResources pr;
         PassShape shape;
         shape.color_format = vk_format_of(target->color_format());
@@ -532,6 +624,7 @@ Status submit_device_frame(const VulkanContext& ctx, const VulkanCommandList& li
           s = fail_cmd(idx, "bind_vertex_buffer", ": 缓冲不是本设备的 VulkanBuffer");
           break;
         }
+        record_live_resource(c.resource, buf->vk_buffer());
         // 64 位偏移以 off64 为准(见 RecordedCommand::off64 的注释)。
         const VkDeviceSize off = static_cast<VkDeviceSize>(c.off64);
         const VkBuffer vkb = buf->vk_buffer();
@@ -544,6 +637,7 @@ Status submit_device_frame(const VulkanContext& ctx, const VulkanCommandList& li
           s = fail_cmd(idx, "bind_index_buffer", ": 缓冲不是本设备的 VulkanBuffer");
           break;
         }
+        record_live_resource(c.resource, buf->vk_buffer());
         vkCmdBindIndexBuffer(cmd, buf->vk_buffer(), static_cast<VkDeviceSize>(c.off64),
                              to_vk_index(static_cast<IndexFormat>(c.a)));
         break;
@@ -661,73 +755,95 @@ Status submit_device_frame(const VulkanContext& ctx, const VulkanCommandList& li
 
   if (s.ok()) {
     if (in_pass) s = Status::Invalid("submit_device_frame: 帧结束时仍有未 end_pass 的 pass");
-    vkEndCommandBuffer(cmd);
+    const VkResult er = vkEndCommandBuffer(cmd);
+    if (er != VK_SUCCESS && s.ok()) {
+      s = Status::InitFailed(fmt_err("submit_device_frame: vkEndCommandBuffer", er));
+    }
   }
 
-  if (s.ok()) {
-    // 这个等待**必须**保留:紧随其后的 cleanup() 会销毁本帧的 framebuffer /
-    // imageView / renderPass,调用方在函数返回后也会立刻丢弃命令列表。
-    // 丢掉等待就是 use-after-free + VUID。
+  if (!s.ok()) {
+    // 失败:这一批**从未提交**,命令缓冲里的对象与命令都可立刻丢弃(D8 不提交半帧)。
+    // 命令缓冲本身归槽位所有,这里只保证它回到"可复位"状态。
+    destroy_now();
+    (void)vkResetCommandBuffer(cmd, 0);
+    return s;
+  }
+
+  // ---- 提交(异步)----
+  //
+  // 【改造前】这里同步 vkWaitForFences(1s),然后无条件 cleanup() 把 framebuffer /
+  // imageView / renderPass 与命令缓冲全部销毁 —— 注释自认"等待必须保留,否则 UAF"。
+  // 于是每帧 CPU 录完就干等 GPU,严格串行,这就是"最开始的设计没有多帧并行"。
+  //
+  // 【现在】提交时挂上本槽位的两个信号量,不等待:
+  //   wait   : image_available(slot)  —— 由本帧的 vkAcquireNextImageKHR 信号化;
+  //                                    交换链图在它信号前不可写(这正是 acquire 必须
+  //                                    带信号量的原因;改造前 acquire 传的是 NULL)。
+  //   signal : render_finished(slot)  —— present 会等它,GPU 画完展示端才可用这张图。
+  //   fence  : in_flight(slot)        —— 只用来"第 N 帧后复用本槽"时定向等待,
+  //                                    以及本槽的延迟销毁。
+  // 帧内对象的销毁时机:retire_into_slot() 把对象压到本槽退休栈,由
+  // VulkanSyncCore::begin_frame 在该槽 fence 信号之后销毁(见 vulkan_sync_core.cpp)。
+  // 这就是"去掉同步等待"的前置条件 —— 没有它,删等待就是 use-after-free。
+  {
+    const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    // 【只有交换链图才等 image_available】2026-11-11 修(VUID-vkQueueSubmit-pWaitSemaphores-03238)
     //
-    // 但不该每帧 vkCreateFence + vkDestroyFence,也不该 UINT64_MAX 无界等:
-    //   * 调用方(VulkanRenderDevice)可以传入同一个可复用的 fence(reusable_fence),
-    //     池的建立与销毁归它自己,生命周期严格绑定 VkDevice。
-    //   * 等待改成有界超时。上个月那个 1fps 事故正是那次无界等待的表现:
-    //     acquire 拿不到 fence 时进程静默空转,CPU 0%、没有任何报错。
-    //     有界超时把"默默卡死"变成一条能查的错误。
-    constexpr std::uint64_t kSubmitTimeoutNs = 1'000'000'000ull;  // 1s
-
-    VkFence fence = VK_NULL_HANDLE;
-    // "池"是否存在,决定谁负责销毁:
-    //   reusable_fence == nullptr -> 临时 fence,本函数建、本函数销毁;
-    //   否则 -> fence 归调用方的池,本函数**绝不**销毁(哪怕这一帧是它刚建出来的),
-    //   否则池里会留下悬垂句柄,后续帧复用即无效对象 + 崩溃。
-    const bool pool_owned_by_caller = (reusable_fence != nullptr);
-    const bool need_create = (!pool_owned_by_caller || *reusable_fence == VK_NULL_HANDLE);
-    if (!need_create) {
-      // 复用同个还处于 signaled 的 fence:提交前必须先复位,否则 vkWaitForFences
-      // 会立刻返回,等于没等(这正是 1fps 事故的形态)。
-      fence = *reusable_fence;
-      vr = vkResetFences(ctx.device, 1, &fence);
-      if (vr != VK_SUCCESS) {
-        s = Status::InitFailed(fmt_err("submit_device_frame: vkResetFences", vr));
-      }
-    } else {
-      VkFenceCreateInfo fci{};
-      fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-      vr = vkCreateFence(ctx.device, &fci, nullptr, &fence);
-      if (vr != VK_SUCCESS) {
-        s = Status::InitFailed(fmt_err("submit_device_frame: vkCreateFence", vr));
-      } else if (reusable_fence != nullptr) {
-        *reusable_fence = fence;  // 交给调用方保管,不在本函数销毁
-      }
+    // image_available 的唯一 signal 来源是 vkAcquireNextImageKHR,那一步只发生在
+    // 交换链路径上(vulkan_swapchain.cpp 的 acquire_next_image)。目标若是
+    // **离屏目标**(远端的 OffscreenTarget、CLI 出图、gtest 里的离屏渲染),
+    // 根本没有 acquire 步骤 —— 此时若仍然无条件把 image_available 挂进
+    // pWaitSemaphores,校验层直接报:
+    //   "pWaitSemaphores[0] ... is waiting on semaphore ... that has no way to be signaled"
+    // 而 GPU 侧会**永远等不到**,该槽 fence 永不 signal → 下一次 begin_frame 等满
+    // 超时(实测:SteadyState.InstancedDrawDoesNotAllocateAfterWarmup 报
+    // "等待槽位 0 的 fence 超时",随后一连串 vkDestroyBuffer/image/pipeline 在用
+    // VUID)。这个信号量本来就是"等图像可用",离屏路径没有图像可等,就不该挂。
+    const bool wait_for_acquire = swapchain_image_target && slot.image_available != VK_NULL_HANDLE;
+    VkSubmitInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    if (wait_for_acquire) {
+      si.waitSemaphoreCount = 1;
+      si.pWaitSemaphores = &slot.image_available;
+      si.pWaitDstStageMask = &wait_stage;
+    }
+    // render_finished 的**唯一消费者**是交换链路径上的 vkQueuePresentKHR
+    // (vulkan_swapchain.cpp 的 pWaitSemaphores)。离屏路径没有 present,没人 wait 它,
+    // 于是它一旦被 signal 就**永远停留在 signaled 态**,下一次 submit 再 signal 就撞
+    // VUID-vkQueueSubmit-pSignalSemaphores-00067:
+    //   "is being signaled ... but it was previously signaled ... and has not since been waited on"
+    // 所以:只有交换链图才 signal render_finished;离屏提交既不 wait 也不 signal 信号量,
+    // 同步只靠 in_flight fence(它才是离屏路径真正的完成凭据,读回前由
+    // wait_latest_frame 定向等待)。
+    if (swapchain_image_target) {
+      si.signalSemaphoreCount = 1;
+      si.pSignalSemaphores = &slot.render_finished;
     }
 
-    if (s.ok()) {
-      VkSubmitInfo si{};
-      si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-      si.commandBufferCount = 1;
-      si.pCommandBuffers = &cmd;
-      vr = vkQueueSubmit(ctx.queue, 1, &si, fence);
-      if (vr != VK_SUCCESS) {
-        s = Status::InitFailed(fmt_err("submit_device_frame: 提交", vr));
-      } else {
-        vr = vkWaitForFences(ctx.device, 1, &fence, VK_TRUE, kSubmitTimeoutNs);
-        if (vr == VK_TIMEOUT) {
-          s = Status::DeviceLost("submit_device_frame: 等待本帧 GPU 完成超时(1s)");
-        } else if (vr != VK_SUCCESS) {
-          s = Status::InitFailed(fmt_err("submit_device_frame: 等待本帧完成", vr));
-        }
-      }
+    // fence 必须先复位再提交:submitted 的 fence 必须处于 unsignaled 状态。
+    // (begin_frame 已经等到它 signaled,这里复位它,然后交给 vkQueueSubmit。)
+    const VkResult rr = vkResetFences(ctx.device, 1, &slot.in_flight);
+    if (rr != VK_SUCCESS) {
+      destroy_now();
+      return Status::InitFailed(fmt_err("submit_device_frame: vkResetFences", rr));
     }
-    // 只有自己建的 fence 才在这里销毁;复用池里的归调用方。
-    if (!pool_owned_by_caller && fence != VK_NULL_HANDLE) {
-      vkDestroyFence(ctx.device, fence, nullptr);
+    const VkResult sr = vkQueueSubmit(ctx.queue, 1, &si, slot.in_flight);
+    if (sr != VK_SUCCESS) {
+      destroy_now();
+      return Status::DeviceLost(fmt_err("submit_device_frame: 提交", sr));
     }
   }
-  cleanup();
-  if (s.ok() && out_stats != nullptr) *out_stats = stats;
-  return s;
+
+  // 对象交给槽位托管(提交已发出,不能再立刻销毁)。
+  retire_into_slot();
+  // 推进帧序号:下一帧换到槽 (i+1) % N。注意 submit 路径**不**复位 fence
+  // (已在上面的提交前复位并绑定给本帧),所以 end_frame 传 nullptr。
+  s = core->end_frame(VK_NULL_HANDLE);
+  if (!s.ok()) return s;
+  if (out_stats != nullptr) *out_stats = stats;
+  return Status::Ok_();
 }
 
 }  // namespace magicblocks::backend

@@ -352,45 +352,50 @@ bool SceneRenderer::record_into(dev::IRenderTarget* target, float qx, float qy, 
   res::ICommandList* cmd = cr.value().get();
 
   // ==========================================================================
-  // 相机：**四元数**姿态，永远绕**机体系三轴**转（arcball / turntable）
+  // 相机：**自由四元数**（Kotlin 侧每帧右乘增量进来）
   // ==========================================================================
   //
-  // 历史教训，别改回去：
-  //   1. 最早的版本转的是**物体**（world = rot_yaw * rot_pitch）。两次旋转不
-  //      可交换，pitch 一大幅度 yaw 就不再是干净的水平转 —— 就是"旋转会改变
-  //      旋转轴"。
-  //   2. 第二版改成 (yaw, pitch) 球面参数相机。单看还行，但它仍然把方向写成
-  //      "世界 Y 多少度 + 抬升多少度"，本质是万向节：俯仰到顶时水平方向会退化成
-  //      绕世界 Y 而不是绕相机自己的 Y。
-  //   3. 现在是**累积四元数**：拖动时右乘"相对相机自身轴"的小旋转，
-  //          q ← q * Δq,  Δq = Δq_pitch(局部 X) * Δq_yaw(局部 Y)
-  //      相机轴 = q 的列向量，所以"上下拖 = 绕相机 X、左右拖 = 绕相机 Y"，
-  //      无论当前朝向如何都成立，360° 任意角度无死角、无夹取。
+  // 三个硬要求必须同时满足：
+  //   1. 左右拖 → 绕**当前相机自己的 up** 转（不是世界 Y）
+  //   2. 上下拖 → 绕**当前相机自己的 right** 转
+  //   3. 360° 无死角，**不能有任何角度夹取**
   //
-  // 符号（拖动方向 → 画面方向，物体跟手）：
-  //   往右推 dx > 0 → 绕相机 +Y 转 -dx*c：物体跟着手指往右转，露出左侧面
-  //   往下推 dy > 0 → 绕相机 +X 转 +dy*c：物体跟着手指往下走，露出顶面
+  // 欧拉角做不到：它把“水平”写死成世界 Y（违反 1），且
+  // 俯仰过 ±90° 会万向节锁死（违反 3）。
   //
-  // 相机位置由姿态反推：q 把世界系的 (0,0,1) 转到相机系的 +Z，
-  // 于是 eye = center + dist * q * (0,0,1)。q 恒为单位四元数 → 不会缩水。
+  // 只有四元数能全部满足：四元数乘法里 **右乘 = 绕机体轴**，
+  // 而“机体轴”的定义就是相机此刻的 right / up。Kotlin 侧每帧做
+  //
+  //       q ← q * Rx(Δpitch) * Ry(Δyaw)
+  //
+  // 于是第 1、2 条自动成立（完全不需要“取轴”这个动作），
+  // 四元数没有奇点所以第 3 条也成立。
+  //
+  // 这里只把四个数还原成旋转矩阵并取列向量：
+  //
+  //     R = | 1-2(y²+z²)   2(xy-wz)     2(xz+wy)   |
+  //         | 2(xy+wz)     1-2(x²+z²)   2(yz-wx)   |
+  //         | 2(xz-wy)     2(yz+wx)     1-2(x²+y²) |
+  //
+  //     列 0 = right、列 1 = up、列 2 = back（相机看向 -back）
+  //
+  // 环绕关系：eye = center + dist * back，看向 center，up 用 R 的列 1。
+  // 列 1 与列 2 天然正交，所以 make_look_at 不会退化——前提是
+  // 四元数保持单位长度（Kotlin 每次右乘后都归一化）。
   const float dist = 2.6f / (scale > 0.05f ? scale : 0.05f);
   const prim::Vec3 orbit_center{pan_x, pan_y, 0.f};
-  // 归一化一次再求逆：连续相乘几千次后浮点会漂，不归一化会慢慢变形。
+
   const float qn = std::sqrt(qx * qx + qy * qy + qz * qz + qw * qw);
   const float iq = qn > 1e-6f ? 1.f / qn : 1.f;
   const float ux = qx * iq, uy = qy * iq, uz = qz * iq, uw = qw * iq;
-  // q 的列向量就是**相机自身的轴**（单位四元数 → 旋转矩阵 R，列 0=右、1=上、2=后）：
-  //   back  = 2(xz - wy, yz + wx, 0.5 - x² - y²)
-  // 相机看向 -back，所以"环绕中心 → eye"的方向就是 back。
-  const prim::Vec3 back{2.f * (ux * uz - uw * uy), 2.f * (uy * uz + uw * ux),
+
+  const prim::Vec3 up{2.f * (ux * uy - uw * uz), 1.f - 2.f * (ux * ux + uz * uz),
+                      2.f * (uy * uz + uw * ux)};
+  const prim::Vec3 back{2.f * (ux * uz + uw * uy), 2.f * (uy * uz - uw * ux),
                         1.f - 2.f * (ux * ux + uy * uy)};
-  // up 取相机自身的上轴（列 1）。它天然与 back 正交，俯视/仰视都不会退化；
-  // 只有四个极点附近（看正上/正下方）叉乘才不稳，可实际拖动不可能一像素不差
-  // 地命中奇点，且 make_look_at 内部对退化情形已有兜底。
-  const prim::Vec3 up{2.f * (ux * uy + uw * uz), 1.f - 2.f * (ux * ux + uz * uz),
-                      2.f * (uy * uz - uw * ux)};
-  const prim::Vec3 eye{orbit_center.x - dist * back.x, orbit_center.y - dist * back.y,
-                       orbit_center.z - dist * back.z};
+
+  const prim::Vec3 eye{orbit_center.x + dist * back.x, orbit_center.y + dist * back.y,
+                       orbit_center.z + dist * back.z};
   const prim::Mat4 view = prim::make_look_at(eye, orbit_center, up);
 
   // 投影宽高比必须用**屏幕上实际呈现**的尺寸，而不是 swapchain image 的尺寸。
@@ -402,9 +407,17 @@ bool SceneRenderer::record_into(dev::IRenderTarget* target, float qx, float qy, 
   // 若直接用 image 的 2160/1440 = 1.5 当 aspect，画出来的正方体会被横向拉长
   // 1.5 倍（实测 891x396，宽高比 2.25 = 1.5 x 1.5），看起来就是个长方体。
   // 遇到 90/270 旋转时取倒数，让投影在最终屏幕朝向下正确。
-  const bool rot90 = (rotation_deg_ == 90 || rotation_deg_ == 270);
-  const float img_aspect = static_cast<float>(width_) / static_cast<float>(height_);
-  const float aspect = rot90 ? (1.f / img_aspect) : img_aspect;
+  // 【2026-11-11 修】这张 cube / 模型的画面被拉成"竖直长条"的根因就在这里。
+  //
+  // 上面写的是对的：内容画在 2160x1440 的 image 里，合成器再整体转 90° 上屏，
+  // 所以**投影必须按 image 自己的宽高比 1.5**，旋转由合成器负责。
+  // 原代码在 rot90 时取倒数 → 用 0.667 做投影，x 方向被压 2.25 倍。
+  // 合成器又把它转回横屏铺满，结果是：竖直方向占满、水平方向只剩 1/2.25
+  // —— 屏幕上就是一根又高又窄的竖条（实测 891 宽 x 890 高那块颜色团）。
+  //
+  // 曾经这里的原因写的是"物理竖置面板，两个方向像素密度差 1.5 倍"，
+  // 那个推理不成立：旋转是**刚性**变换，不改像素密度。
+  const float aspect = static_cast<float>(width_) / static_cast<float>(height_);
   const prim::Mat4 proj = prim::make_perspective(60.f * kPi / 180.f, aspect, 0.1f, 100.f);
   const prim::Mat4 view_proj = proj * view;
 
@@ -496,8 +509,8 @@ bool SceneRenderer::record_into(dev::IRenderTarget* target, float qx, float qy, 
   return true;
 }
 
-bool SceneRenderer::render_frame(float qx, float qy, float qz, float qw, float scale, float pan_x,
-                                 float pan_y, std::string* err) {
+bool SceneRenderer::render_frame(float qx, float qy, float qz, float qw, float scale,
+                                 float pan_x, float pan_y, std::string* err) {
   std::lock_guard<std::mutex> lk(mutex_);
   auto fail = [&](const std::string& m) {
     if (err) *err = m;

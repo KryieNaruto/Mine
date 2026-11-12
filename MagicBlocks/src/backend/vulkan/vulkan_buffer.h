@@ -39,6 +39,8 @@
 // VulkanContext / backend::Status 别名来自 L0 的后端公共头(必须在 resources 头之后,
 // 这样 backend::Status 才不会抢在 device::Status 的声明之前被当成类型使用)。
 #include "backend/vulkan/vulkan_target.h"
+// retire_ticket() 返回 FrameRetireList::BufferRef —— 托管票据的类型定义在这里。
+#include "backend/vulkan/vulkan_sync_core.h"
 
 namespace magicblocks::backend {
 
@@ -92,6 +94,31 @@ class VulkanBuffer final : public IBuffer {
   // 本缓冲所在页号(== id().page_id 的便捷写法,断言"同页"用)。
   u32 page_id() const { return id_.page_id; }
 
+  // ---- VkBuffer 的销毁移交(2026-11-11,提交异步化)----
+  //
+  // 问题:改造前 submit 返回即 GPU 完成,"缓冲随手扔"成立;现在提交是异步的,
+  // 调用方在 submit_command_list() 返回后立刻销毁网格/实例缓冲是合法用法
+  // (gtest 的 FrameRig 出作用域、F-VX 的 slot->reset()),此时 GPU 可能还在读。
+  //
+  // 解法(纯 CPU 记账,零等待):共享票据 + 引用计数,**所有权始终留在本对象**。
+  //   - 本缓冲存活期间拥有 VkBuffer,句柄照常可绑、可多帧复用(调用方无感);
+  //   - 每次提交把票据托管给**当前槽**(计数 +1);
+  //   - 某槽 fence 信号后排空,计数 -1;
+  //   - 本对象析构时:若仍有槽托管着(计数 > 1),就只记账"待销毁",
+  //     由最后一个排空的槽真正 vkDestroyBuffer;否则当场销毁。
+  //
+  // 关键:计数不会单调增长 —— 槽每次排空都会把上一轮那份放掉。
+  //
+  // 为什么不用"析构里排空所有槽":那等于每销毁一个缓冲就把 CPU/GPU 重叠清零,
+  // 多帧并行在最热路径上退化为串行(vkDeviceWaitIdle 换了个名字)。
+  std::shared_ptr<FrameRetireList::BufferRef> retire_ticket() {
+    if (retire_ref_ == nullptr && vk_buffer_ != VK_NULL_HANDLE) {
+      retire_ref_ = std::make_shared<FrameRetireList::BufferRef>();
+      retire_ref_->handle = vk_buffer_;
+    }
+    return retire_ref_;
+  }
+
   // R5 上传队列的可观测面:累积入队的上传次数 / 字节数(单调累计)。
   u64 upload_begin_count() const { return upload_begin_count_; }
   u64 upload_bytes_total() const { return upload_bytes_total_; }
@@ -132,6 +159,8 @@ class VulkanBuffer final : public IBuffer {
 
   VkBuffer vk_buffer_ = VK_NULL_HANDLE;
   u64 vk_offset_ = 0;  // 子块在所属页 VkDeviceMemory 内的偏移(不用 vkBindBufferMemory2)
+  // VkBuffer 的托管票据(见 retire_ticket)。非空 = 销毁已交给帧槽退休栈。
+  std::shared_ptr<FrameRetireList::BufferRef> retire_ref_;
 
   std::vector<PendingUpload> pending_;
   std::string upload_commit_error_;  // 最近一次 flush 里第一条失败原因(空 = 全成功)

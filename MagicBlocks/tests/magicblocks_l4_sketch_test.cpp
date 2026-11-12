@@ -410,11 +410,15 @@ TEST(SketchEmpty, EmptyDocumentProducesNoMeshAndNoError) {
 #include <string>
 
 #if defined(_WIN32)
+#include <process.h>  // _getpid
 #define MB_POPEN _popen
 #define MB_PCLOSE _pclose
+#define MB_GETPID _getpid
 #else
+#include <unistd.h>  // getpid
 #define MB_POPEN popen
 #define MB_PCLOSE pclose
+#define MB_GETPID getpid
 #endif
 
 namespace {
@@ -464,8 +468,46 @@ bool is_png(const std::string& bytes) {
   return bytes.size() > 8 && std::memcmp(bytes.data(), sig, 8) == 0;
 }
 
+// 中间产物必须**带进程号**（与 magicblocks_l4_stack_golden_test.cpp 同一根因）。
+// 固定文件名 + _popen 子进程 ⇒ 两个测试进程会写同一路径、互相 remove/覆盖，
+// 偶发红。2026-11-11 实测 8 并发 2 红、单跑 20/20 绿。别改回固定名。
+//
+// 带进程号的副作用是旧文件不再被覆盖，产物会累积（qa 实测堆到 766 个 / 170.9 MB）。
+// 所以登记本进程写过的路径，进程退出时统一删。
+// 【为什么是"泄漏的"指针而不是普通的函数内 static 对象】
+//
+// atexit 回调与静态局部对象的析构注册在**同一张退出表**里,后注册者先执行。
+// 而 process_tmp_files() 的 vector 是在 arm_tmp_cleanup() **之后**才首次构造的
+// (arm 里只碰了另一个 static bool),于是它的析构比 atexit 回调**后注册**、
+// 也就**先执行** —— 回调真正跑起来时列表已经被析构清空,std::remove 一个都删不到。
+// 实测就是这个现象:push 时 size=1/2/3,atexit 里恒为 0,文件全部残留。
+//
+// 这里故意让容器永不析构(进程退出时由 OS 回收),把它的寿命拉到所有
+// atexit 回调之后。代价是 sizeof(vector) 的常量泄漏,收益是清理真的会发生。
+std::vector<std::string>& process_tmp_files() {
+  static std::vector<std::string>* files = new std::vector<std::string>();
+  return *files;
+}
+
+void remove_process_tmp_files() {
+  for (const auto& f : process_tmp_files()) std::remove(f.c_str());
+  process_tmp_files().clear();
+}
+
+void arm_tmp_cleanup() {
+  static bool armed = false;
+  if (armed) return;
+  armed = true;
+  std::atexit(&remove_process_tmp_files);
+}
+
 std::string tmp_png(const char* name) {
-  return std::string(MB_TEST_DATA_DIR) + "/_out_l4_" + name + ".png";
+  arm_tmp_cleanup();
+  const auto pid = static_cast<unsigned long>(MB_GETPID());
+  std::string p =
+      std::string(MB_TEST_DATA_DIR) + "/_out_l4_" + name + "_" + std::to_string(pid) + ".png";
+  process_tmp_files().push_back(p);
+  return p;
 }
 
 }  // namespace

@@ -117,7 +117,7 @@ class EngineSession {
     /**
      * 渲染并直接呈现一帧。
      *
-     * yaw/pitch 单位是弧度，scale 是双指缩放倍数，
+     * qx/qy/qz/qw 是相机姿态的单位四元数，scale 是双指缩放倍数，
      * panX/panY 是世界空间的平移偏移（Kotlin 侧已按可视宽度换算）。
      */
     fun render(qx: Float, qy: Float, qz: Float, qw: Float, scale: Float, panX: Float, panY: Float): Boolean {

@@ -486,7 +486,24 @@ TEST(Swapchain, HiddenWindowCreate) {
   ASSERT_FALSE(modes.empty());
   EXPECT_NE(std::find(modes.begin(), modes.end(), dev::PresentMode::Fifo), modes.end())
       << "FIFO 必须始终在支持列表内";
-  EXPECT_EQ(chain.present_mode(), dev::PresentMode::Fifo) << "默认 present mode 必须是 FIFO";
+  // 默认 present mode 由"设备支不支持 MAILBOX"决定，不再恒为 FIFO：
+  //   - 支持 MAILBOX → 选 MAILBOX（防撕裂的同时不被 vsync 队列卡住）；
+  //   - 不支持      → 退回 FIFO（FIFO 恒可用）。
+  // 两者都**不会撕裂**（Vulkan 规范禁止除 IMMEDIATE 外的所有 mode 撕裂），
+  // 差别只在"多余的帧是排队还是被顶掉"。所以这里守的不是"必须是 FIFO"，
+  // 而是"必须是一个不撕裂、且确实在支持列表里的 mode"。
+  const dev::PresentMode pm_now = chain.present_mode();
+  EXPECT_TRUE(pm_now == dev::PresentMode::Fifo || pm_now == dev::PresentMode::Mailbox)
+      << "默认 present mode 只能是 FIFO 或 MAILBOX（IMMEDIATE 会撕裂）；实测 "
+      << static_cast<int>(pm_now);
+  EXPECT_NE(std::find(modes.begin(), modes.end(), pm_now), modes.end())
+      << "选中的 present mode 必须出现在 supported_present_modes() 里";
+  // 支持 MAILBOX 的设备上必须真的用上 MAILBOX，否则"防撕裂 + 不限帧"
+  // 的意图被静默退回 FIFO，用户看到的就是 60fps 封顶。
+  const bool has_mailbox =
+      std::find(modes.begin(), modes.end(), dev::PresentMode::Mailbox) != modes.end();
+  EXPECT_EQ(pm_now == dev::PresentMode::Mailbox, has_mailbox)
+      << "设备支持 MAILBOX 时必须选 MAILBOX，不支持时才回退 FIFO";
   EXPECT_TRUE(chain.current_target() != nullptr);
 }
 

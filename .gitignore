@@ -1,20 +1,20 @@
-# 第三方池:源码 / 中间构建 / 预编译产物 / 状态锁
+# 绗笁鏂规睜:婧愮爜 / 涓棿鏋勫缓 / 棰勭紪璇戜骇鐗?/ 鐘舵€侀攣
 third_party/_src/
 third_party/_build/
 third_party/_install/
 third_party/.pool.lock.json
 
-# 用户级系统依赖部署(无 sudo):Vulkan SDK / X11 头 / lavapipe / Xvfb
+# 鐢ㄦ埛绾х郴缁熶緷璧栭儴缃?鏃?sudo):Vulkan SDK / X11 澶?/ lavapipe / Xvfb
 .user-deps/
 
-# 构建产物
+# 鏋勫缓浜х墿
 build/
 *.o
 *.a
 *.so
 *.dylib
 
-# ImGui 布局持久化文件(运行 easypainter 时在 CWD 生成)
+# ImGui 甯冨眬鎸佷箙鍖栨枃浠?杩愯 easypainter 鏃跺湪 CWD 鐢熸垚)
 imgui.ini
 
 # Python
@@ -28,14 +28,14 @@ __pycache__/
 # Claude Code worktrees
 .claude/worktrees/
 
-# 编译诊断产物(误生成在仓库根,由 ./ 编译散落的 .obj)
+# 缂栬瘧璇婃柇浜х墿(璇敓鎴愬湪浠撳簱鏍?鐢?./ 缂栬瘧鏁ｈ惤鐨?.obj)
 *.obj
 
 
-# ��������ʱ�������м�ͼ(�� golden;golden_*.png �����)
+# 测试运行时产生的中间图(非 golden;golden_*.png 仍入库)
 MagicBlocks/tests/data/_out_*.png
 
-# Android / Gradle �����м����
+# Android / Gradle 构建中间产物
 MagicBlocks/android/.gradle/
 MagicBlocks/android/app/.cxx/
 MagicBlocks/android/local.properties
@@ -45,3 +45,6 @@ MagicBlocks/android/local.properties
 build-*/
 tmp_*/
 MagicBlocks/diffout.txt
+
+# 本次同步/抓帧审计的临时日志(只作证据, 不入库)
+.captain_logs/

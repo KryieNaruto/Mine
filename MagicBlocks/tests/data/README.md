@@ -97,6 +97,16 @@ MagicBlocks\build\magicblocks-l2-cli.exe record --scene demo --width 320 --heigh
 重生成后必须跑一遍 `magicblocks_test.exe --gtest_filter=L2Golden.*` 确认通过，
 并核对左上角确实是纯绿、背景确实偏蓝。
 
+> **2026-11-11 重新签发过一次。**
+> `l2_scene.vert` 自 `20dd05e` 起就按 **TRIANGLE_LIST 的 6 顶点**四边形展开
+> `kCorners`（注释明写「0,1,2 → 三角形 A；3,4,5 → 三角形 B」），而
+> `draw_selftest_grid` 当时硬编码的是 **TRIANGLE_STRIP + 4 顶点**——两者不匹配，
+> 只会画出三角形 (0,1,2)，四边形缺一半。旧版 `golden_l2.png` 就是用这个
+> 不匹配的拓扑固化下来的。拓扑按着色器的约定改正后（`vulkan_draw.cpp`），
+> 这份基线必须同步重新签发，否则逐像素比对会差 21216 字节。
+> 上面的结构断言（左上角纯绿 / 右上角非纯绿 / 背景偏蓝）在拓扑改正前后
+> 都成立，所以它们**不能**代替这一项比对。
+
 ## golden_fsk_*.png —— L4 魔法涂鸦（F-SK）基线
 
 审计 `docs/superpowers/specs/2026-11-11-magicblocks-fsk-fvx-completion-audit.md` 的 GAP-07

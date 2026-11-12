@@ -63,6 +63,15 @@ resources::IPipelineFactory* resolve_vulkan_pipeline_factory(device::IRenderDevi
 
 
 VulkanRenderDevice::~VulkanRenderDevice() {
+  // 【白名单第 1 处 / 全仓仅剩 2 处 vkDeviceWaitIdle 之一】设备析构。
+  //
+  // 为什么这里必须保留 device 级全停,而不能像渲染路径那样改成槽位 fence:
+  // 紧随其后的操作是 vkDestroyCommandPool / vmaDestroyAllocator / vkDestroyDevice,
+  // 它们会**一次性**拆掉所有帧槽、所有资源、所有分配器页。任何一帧只要还在 GPU 上
+  // 跑,销毁就是 use-after-free + VUID-vkDestroyDevice-device-05137(leaked objects)。
+  // 槽位 fence 只能证明"我们提交过的那几批完成",证明不了"外部通过 ctx_ 发起的一次性
+  // 提交都完成了" —— 析构点必须用最强的等待。
+  // 析构是每进程一次,不是 per-frame,代价可接受。
   if (ctx_.device) vkDeviceWaitIdle(ctx_.device);
   // 清空已知资源表:表里存的是裸指针,这里先清掉,避免之后(或在 vkDestroyDevice
   // 之后)仍持有采样器的析构钩子 —— 那个钩子的 lambda 捕获了 this,设备析构完成
@@ -71,18 +80,24 @@ VulkanRenderDevice::~VulkanRenderDevice() {
   known_textures_.clear();
   known_cubes_.clear();
   known_buffers_.clear();
+  pages_in_flight_.clear();
+  page_slot_refs_.clear();
   // 顺序关键:fence 必须在 VkDevice 之前销毁;
   // 分配器要在 VkDevice 之前销毁(VMA 持有 VkDevice),但晚于所有资源。
   frame_sync_.reset();
-  // 逐帧提交的 fence 池同样必须在 VkDevice 之前销毁,否则 VUID-vkDestroyDevice-device-05137
-  // (leaked objects: VkFence)。上面那句 vkDeviceWaitIdle 已保证没有在飞的帧。
-  for (std::uint32_t fi = 0; fi < kSubmitFenceSlots; ++fi) {
-    if (submit_fences_[fi] != VK_NULL_HANDLE) {
-      vkDestroyFence(ctx_.device, submit_fences_[fi], nullptr);
-      submit_fences_[fi] = VK_NULL_HANDLE;
-    }
+  // 逐帧提交的 fence 池 → 已被 VulkanSyncCore 取代(见 vulkan_render_device.h 的注释)。
+  // 同步核心同样必须在 VkDevice 之前销毁:它持有 N 槽的 VkSemaphore / VkFence /
+  // 持久 VkCommandBuffer,还持有各槽的**延迟销毁栈**(framebuffer/imageView/renderPass)。
+  // 上面的 vkDeviceWaitIdle 已保证没有在飞的帧,所以这里的销毁是安全的。
+  if (sync_core_) {
+    sync_core_->shutdown();
+    sync_core_.reset();
   }
   if (ctx_.cmd_pool) vkDestroyCommandPool(ctx_.device, ctx_.cmd_pool, nullptr);
+  // 摘掉分配器上的反向引用:它在 allocator_.reset() 之后就不存在了,
+  // 而活着的资源(调用方还持有的 unique_ptr)析构时会经它回头找本设备。
+  // 设备先死的情况下那些资源只会看到 nullptr(见 forget_* 的说明)。
+  if (allocator_ != nullptr) allocator_->set_owner_device(nullptr);
   allocator_.reset();
   ctx_.allocator = nullptr;
   if (ctx_.device) {
@@ -264,8 +279,47 @@ Status VulkanRenderDevice::init(const DeviceDesc& desc, const std::string& devic
     ctx_.allocator = allocator_.get();
   }
 
-  // 帧同步:in_flight 已校验
-  frame_sync_ = std::make_unique<VulkanFrameSync>(ctx_.device, desc.in_flight_frames);
+  // ---- L0 多帧并行同步核心 ----
+  //
+  // N 就是 desc.in_flight_frames(与 IFrameSync 同一个数,不再有"fence 池 4 个、
+  // in-flight 2 个"这种两套口径)。每槽:image_available/render_finished 语义量
+  // 各一、submit fence、**持久**命令缓冲、延迟销毁栈。
+  // 命令池已带 RESET_COMMAND_BUFFER_BIT(见上面的 cpci.flags),所以复用只需
+  // vkResetCommandBuffer,不必新建池。
+  //
+  // 【顺序关键:core 先建,frame_sync 后建】IFrameSync 现在只是 core 的薄委托
+  // (它不再自己持有任何 VkFence),所以必须先有 core 才能建它 —— 这也是
+  // "帧号单一真源"的结构保证:FrameSync 读不到任何属于自己的计数器。
+  sync_core_ = std::make_unique<VulkanSyncCore>();
+  Status sync_status = sync_core_->init(ctx_.device, ctx_.cmd_pool, desc.in_flight_frames);
+  if (!sync_status.ok()) {
+    sync_core_.reset();
+    return sync_status;  // 硬失败:没有同步核心就没有多帧并行,绝不静默退回串行
+  }
+  // 帧同步:纯委托,不拥有 core(core 由本设备独占持有)。
+  frame_sync_ = std::make_unique<VulkanFrameSync>(sync_core_.get());
+  // ---- 帧边界接线:让 L1 分配器的"在飞帧防护"从死代码变成活代码 ----
+  //
+  // 改造前 trim() 的唯一调用点在 IMemoryAllocator::begin_frame() 内部,而它在
+  // src/ 里**零调用**;于是 set_page_in_flight() 也从没人调用、p.in_flight 恒为
+  // false,trim() 的 `if (p.in_flight) continue;` 是一道恒假的判断。
+  // 一旦 begin_frame 接上生产路径,trim() 就变成每帧都跑的真淘汰路径 ——
+  // 那道防护必须同时变成真的,否则就是"页刚被淘汰、GPU 还在读"。
+  //
+  // 所以:同步核心每确认一个槽位跑完(begin_frame/drain),就回调这里;
+  // 这里按顺序做 解除在途标记 → 推帧号(内部 trim)。
+  // 帧号来源是 frame_index_(单调递增),**不是** current_slot()(0..N-1 循环),
+  // 两者语义不同:分配器要的是"哪一帧已经彻底出清",槽号给不出这个信息。
+  // 按槽记账的在途页表:槽数与同步核心的 N 必须一致,所以在这里一次分配好,
+  // 之后 mark/clear 只按下标访问,不再扩容(扩容会在指针/迭代期间改变大小)。
+  pages_in_flight_.assign(static_cast<std::size_t>(desc.in_flight_frames), {});
+  sync_core_->set_frame_tick([this](std::uint64_t frame_index, std::uint32_t slot) {
+    on_frame_boundary(frame_index, slot);
+  });
+  // 资源 → 设备的反向引用:资源析构时要通知本设备把裸指针从 known_* 表里摘掉。
+  // 走分配器转一手是因为资源手上只有 (ctx, allocator),而分配器由本设备独占持有
+  // 且生命周期覆盖全部资源(见 VulkanPagingAllocator::set_owner_device)。
+  if (allocator_ != nullptr) allocator_->set_owner_device(this);
   logical_ready_ = true;
   return Status::Ok_();
 }
@@ -317,9 +371,105 @@ Status VulkanRenderDevice::notify_lifecycle(const AppLifecycleEvent& ev) {
 
 Status VulkanRenderDevice::wait_idle() {
   if (!ctx_.device) return Status::Ok_();
-  VkResult r = vkDeviceWaitIdle(ctx_.device);
-  if (r != VK_SUCCESS) return Status::DeviceLost(fmt_err("vkDeviceWaitIdle", r));
-  return Status::Ok_();
+  // 【改动】原先直接 vkDeviceWaitIdle —— 渲染路径上每调一次就把 CPU/GPU 重叠清零。
+  //
+  // 现在语义不变("调用返回后,本设备发起的 GPU 工作全部完成"),但实现是
+  // **排空在飞帧的槽位 fence**,而不是 queue/device 级全停。
+  // 设备一定登记过自己(create_render_device → init → sync_core_->init),
+  // 所以这里不会命中"未登记"分支。
+  Status s = wait_device_frames_idle(ctx_);
+  return s;
+}
+
+// ---------------------------------------------------------------- 资源自注销
+
+// 三个泛型版本,只做"按指针相等删一条"。
+namespace {
+
+template <typename Entry>
+void erase_entry_by_pointer(std::vector<Entry>& table, const void* victim) {
+  if (victim == nullptr) return;
+  for (auto it = table.begin(); it != table.end(); ++it) {
+    if (static_cast<const void*>(it->second) == victim) {
+      table.erase(it);
+      return;
+    }
+  }
+}
+
+}  // namespace
+
+void VulkanRenderDevice::forget_known_buffer(const resources::IBuffer* buffer) {
+  erase_entry_by_pointer(known_buffers_, buffer);
+}
+
+void VulkanRenderDevice::forget_known_texture(const resources::ITexture* texture) {
+  erase_entry_by_pointer(known_textures_, texture);
+}
+
+void VulkanRenderDevice::forget_known_cube_map(const resources::ICubeMap* cube) {
+  erase_entry_by_pointer(known_cubes_, cube);
+}
+
+// ---------------------------------------------------------------- 帧边界 / 在飞页防护
+
+void VulkanRenderDevice::mark_pages_in_flight(std::uint32_t slot,
+                                              const std::vector<resources::u32>& pages) {
+  if (allocator_ == nullptr) return;
+  if (slot >= pages_in_flight_.size()) return;
+  auto& slot_pages = pages_in_flight_[slot];
+  for (resources::u32 page_id : pages) {
+    // 同一槽内去重:这一个槽对同一个页只持有一份引用。
+    //
+    // 去重只能发生在"本槽"这一层,并且必须与 clear_pages_in_flight 的
+    // 逐页 −1 严格对称,否则就是"页被永远钉住、trim() 的整页淘汰静默失效"。
+    if (std::find(slot_pages.begin(), slot_pages.end(), page_id) != slot_pages.end()) continue;
+    slot_pages.push_back(page_id);
+    // 引用计数 +1;0 → 1 时才需要真的告诉分配器"这一个页在途"。
+    auto it = std::find_if(page_slot_refs_.begin(), page_slot_refs_.end(),
+                           [page_id](const std::pair<resources::u32, std::uint32_t>& kv) {
+                             return kv.first == page_id;
+                           });
+    if (it == page_slot_refs_.end()) {
+      page_slot_refs_.emplace_back(page_id, 1u);
+      allocator_->set_page_in_flight(page_id, true);
+    } else {
+      ++it->second;
+    }
+  }
+}
+
+void VulkanRenderDevice::clear_pages_in_flight(std::uint32_t slot) {
+  if (slot >= pages_in_flight_.size()) return;
+  auto& slot_pages = pages_in_flight_[slot];
+  // 与 mark_pages_in_flight 严格对称:遍历本槽登记过的**每一个**页,逐个 −1。
+  //
+  // 计数 >1 说明还有别的槽持有同一个页:本槽这份引用已经退还,但对分配器
+  // 仍要继续报 in_flight(其余槽可能还在 GPU 上读它),所以只 −1 不解除。
+  for (resources::u32 page_id : slot_pages) {
+    auto it = std::find_if(page_slot_refs_.begin(), page_slot_refs_.end(),
+                           [page_id](const std::pair<resources::u32, std::uint32_t>& kv) {
+                             return kv.first == page_id;
+                           });
+    if (it == page_slot_refs_.end()) continue;  // 记账已丢:不该发生,但别越界
+    if (it->second > 1) {
+      --it->second;
+      continue;
+    }
+    page_slot_refs_.erase(it);
+    // 最后一个引用也没了 —— 这才是唯一可以解除保护的时刻。
+    if (allocator_ != nullptr) allocator_->set_page_in_flight(page_id, false);
+  }
+  // 本槽这一轮的登记全部出清(与上面逐页 −1 一一对应)。
+  slot_pages.clear();
+}
+
+void VulkanRenderDevice::on_frame_boundary(std::uint64_t frame_index, std::uint32_t slot) {
+  // 到这里,同步核心已经用 fence 证明"槽 slot 上那一帧跑完了"。
+  // **只清这一个槽**的在途标记:其余 N−1 个槽可能还在 GPU 上跑,它们的页不能松手。
+  // (曾经无条件全清 —— 那会在第 f+1 帧的边界就解开第 f 帧仍在读的页。)
+  clear_pages_in_flight(slot);
+  if (allocator_ != nullptr) allocator_->begin_frame(frame_index);
 }
 
 // ---------------------------------------------------------------- L1 资源层工厂
@@ -349,6 +499,16 @@ Result<std::unique_ptr<resources::IBuffer>> VulkanRenderDevice::create_buffer(
     }
     if (!replaced) known_buffers_.emplace_back(id, b.get());
   }
+  // 返回裸 VulkanBuffer(所有权在调用方的 unique_ptr)。
+  //
+  // 【曾在这里加过"退役缓冲包装"做延迟销毁,已删除】
+  // 起因是 F-VX 的 src/features/stack/stack_render.cpp:124 每帧 `slot->reset()`,
+  // 会销毁上一帧 GPU 可能还在读的 VkBuffer。我在 L0 造了一套"退役栈"来兜住它,
+  // 但那是让全仓基础设施(create_buffer)去承担某一个 feature 的生命周期 ——
+  // 影响面覆盖所有层,收益却只服务于一处。而正确的修法成本低一到两个数量级:
+  // IFrameSync 已提供 in_flight_count()/slot_for_frame()/wait_slot(),
+  // StackRenderer 通过 device_->frame_sync() 直接就能拿到,把那两个缓冲成员
+  // 改成 N 元素环即可,**只动 stack_render.cpp 一个文件**。已交 F-VX。
   return std::unique_ptr<resources::IBuffer>(std::move(b));
 }
 
@@ -631,26 +791,138 @@ Status VulkanRenderDevice::submit_command_list(resources::ICommandList& list) {
   // 纹理/采样器同理(bind_sampled_texture 的设备态需要 ITexture*/ISampler*)。
   bind_known_textures(*cmd);
 
-  // 走已经实现完整的设备帧提交通路(11 类命令 → vkCmd* → fence 等待)。
+  // ---- 【进入设备帧提交之前】先丢掉旁路 render pass ----
+  //
+  // t23 实测(不是推测):begin_pass 的 simple_shape 分支(vulkan_command.cpp)
+  // 会在设备态**另建**一条真实 VkRenderPass(initialLayout=UNDEFINED,
+  // finalLayout=GENERAL)+ framebuffer + 视图,把 vkCmdBeginRenderPass 录进旁路
+  // vk_cmd_ —— 而 submit_device_frame() 根本不执行 vk_cmd_,它用槽位命令缓冲
+  // 重放 recorded_ 并**自己**建 pass。
+  //
+  // 只要旁路对象还活着,调用方 target 的 VkImage 就同时挂在两个布局链矛盾的
+  // pass 上;submit_device_frame 内部 begin_frame 复位命令缓冲之后,
+  // 回放的这次绘制就**静默不出片元**,整屏只剩清屏色(校验层不一定报警)。
+  // 所以丢弃必须发生在这里,而不是像原来那样等提交返回后才做 ——
+  // 那样已经晚了:被吃掉的是**这一次**绘制。
+  //
+  // 丢弃是安全的:命令流 recorded_ 是值语义的独立副本;走设备帧提交这条路,
+  // vk_cmd_ 里的内容全是死代码(真正要它的 submit_and_wait() 是另一条通路)。
+  cmd->abandon_vk_side_channel();
+
+  // 走设备帧提交通路(11 类命令 → vkCmd* → 本槽位 semaphore/fence,异步)。
   // 统计只用于本地断言:录了命令却一个 draw 都没下发属于配置错误,要报出来,
   // 而不是返回成功让上层去翻一张空图。
   DeviceFrameStats stats{};
-  // fence 池轮转:每帧复用同一个 slot,避免每帧 vkCreateFence/vkDestroyFence。
-  // 这里的 fence 语义是"本帧提交完成",所以池只需保证不重叠使用即可。
-  const std::uint32_t fence_slot = submit_fence_next_;
-  submit_fence_next_ = (submit_fence_next_ + 1) % kSubmitFenceSlots;
-  Status s = submit_device_frame(ctx_, *cmd, &stats, &submit_fences_[fence_slot]);
-  // 提交(fence 已等到)后,立刻丢弃本列表在 begin_pass 期间顺带建的
+  // 【fence 池已并入 VulkanSyncCore】原来这里用 submit_fences_[4] 轮转把 fence 传给
+  // submit_device_frame();现在 N 槽的 fence/信号量/命令缓冲都在 sync_core_ 里,
+  // 数量与 IFrameSync::in_flight_count() 是同一个数。
+  //
+  // 【提交不再同步阻塞】submit_device_frame 返回时 GPU 可能还在跑:
+  //   - present 侧由 render_finished 信号量守(vulkan_swapchain.cpp);
+  //   - 需要像素的调用方读回时由 readback_rgba8() 自己定向等(见 vulkan_target.cpp)。
+  Status s = sync_core_ ? submit_device_frame(ctx_, *cmd, &stats, sync_core_.get())
+                        : Status::InitFailed("submit_command_list: 缺少同步核心(设备未初始化?)");
+  // ---- 在飞帧防护:把本批提交实际引用的内存页标成"在途" ----
+  //
+  // 提交成功之后,这批命令绑定的页(顶点/索引/Uniform)在被 GPU 读完之前
+  // 都不允许被 L1 的 trim() 整页退掉。改造前这一步根本不存在:begin_frame
+  // 零调用 → trim() 零调用 → `if (p.in_flight) continue;` 恒假。
+  // 现在改成真淘汰路径了,这里必须成对地立起标记:
+  //   置 true:提交时(此处);
+  //   置 false:该槽位 fence 确认信号后(见 on_frame_boundary → clear_pages_in_flight)。
+  // 句柄是 M3 的值语义(page_id + offset),而页淘汰的粒度正是 page_id。
+  //
+  // ⚠️ 页清单来自 submit_device_frame 的 `stats.pages`(**翻译成功并入过
+  //    vkCmdBind\* 的**那些),不是从 recorded() 里扫出来的。命令流里记了句柄、
+  //    但设备帧提交因为类型不符而跳过的那条没有下发,把它标成在途就等于
+  //    让一页永远淘汰不掉。
+  if (s.ok()) {
+    // 记入**刚提交完的那一帧所在槽**。
+    //
+    // 【必须是 last_submitted_slot(),不是 current_slot()】2026-11-11 修(t20 复核发现)。
+    // submit_device_frame 内部先 core->begin_frame() 认领槽,提交后再调
+    // core->end_frame() —— 而 end_frame 会执行 ++frame_index_,于是**本函数返回时**
+    // current_slot() 已经指向**下一帧**的槽。用它会一错到底:
+    //   - 在飞页标记记到下一帧的槽上:下一帧 begin_frame 一来就 clear_pages_in_flight
+    //     把本帧的页全当"已跑完"松手 → trim() 可在这帧还在 GPU 上时整页退给 VMA;
+    //   - 缓冲退休票据托管到下一帧的槽上:下一帧 begin_frame 一进来就对该槽
+    //     destroy_all() → 本帧还在读的 VkBuffer 被销毁(use-after-free)。
+    // last_submitted_slot() 给的是 (frame_index_ + N - 1) % N,即真正的本帧槽。
+    const std::uint32_t slot = sync_core_ ? sync_core_->last_submitted_slot() : 0u;
+    mark_pages_in_flight(slot, stats.pages);
+    // ---- 把这些 VkBuffer 的销毁托管给**本帧槽** ----
+    //
+    // 提交已经发出,调用方随时可能销毁这些缓冲(gtest 的 FrameRig 出作用域、
+    // F-VX 的 slot->reset())。这里把它们的托管票据压进本帧槽的退休栈,
+    // 该槽 fence 信号后才真正 vkDestroyBuffer。
+    //
+    // 只托管**本帧真的绑定给 GPU 的**缓冲(stats.buffers 里那些 VkBuffer),
+    // 按句柄反查登记表:托管全表会让每帧把所有历史缓冲都拖住 N 帧。
+    // 反查以**句柄相等**(kv.second->vk_buffer())为准 —— 表里存的是裸指针,
+    // 而 VulkanBuffer 析构时会把自己从表里摘掉(见 ~VulkanBuffer →
+    // VulkanRenderDevice::forget_known_buffer),所以表里不会有悬垂指针。
+    if (sync_core_ && sync_core_->ready()) {
+      for (const std::pair<resources::ResourceId, resources::IBuffer*>& kv : known_buffers_) {
+        auto* vb = dynamic_cast<VulkanBuffer*>(kv.second);
+        if (vb == nullptr) continue;
+        const VkBuffer handle = vb->vk_buffer();
+        if (handle == VK_NULL_HANDLE) continue;
+        if (std::find(stats.buffers.begin(), stats.buffers.end(), handle) ==
+            stats.buffers.end()) {
+          continue;
+        }
+        auto ticket = vb->retire_ticket();
+        if (ticket != nullptr) sync_core_->slot(slot).retire.push_shared_buffer(ticket);
+      }
+    }
+  }
+  // 立刻丢弃本列表在 begin_pass 期间顺带建的
   // VkCommandBuffer / framebuffer / render pass / image view:
-  // submit_device_frame 用的是它自己的命令缓冲,这一套从未被使用,
+  // submit_device_frame 用的是它自己的(槽位持久)命令缓冲,这一套从未被使用,
   // 却一直处于录制态并引用调用方 target 的 VkImage。留到析构就会在
   // image 已被调用方销毁后调 vkEndCommandBuffer → VUID-...-00059。
   // 返回值只用于决定是否继续,丢弃动作本身必须无条件执行。
-  cmd->discard_vk_side_channel();
-  if (!s.ok()) return s;
+  //
+  // 【2026-11-11 / t23】不止是"留到析构会 00059",它还直接**吃掉一次绘制**。
+  // 除命令缓冲外,旁路里还有一条**从未被执行**的真实 render pass:
+  //   begin_pass 的 simple_shape 分支(vulkan_command.cpp)建了
+  //   VkRenderPass(initialLayout=UNDEFINED, finalLayout=GENERAL)、
+  //   framebuffer,并把 vkCmdBeginRenderPass 录进 vk_cmd_。
+  //   而 submit_device_frame() 重放 recorded_ 时**另建**其自己的 pass。
+  // 两个问题:
+  //   1. attach 到同一张 VkImage 的布局链有两套互相矛盾的声明;
+  //   2. 更要命的是 —— 一旦这条旁路 pass 建过,靶图在调用方眼里就已经
+  //      "被某个 pass 占着",后续同一张图上的**第二次**绘制会静默不出片元。
+  // 实测现象:UiAndSdkChannelsStayIndependent 里 SDK 通道在同一目标上
+  // 退化成"整屏只剩清屏色"。所以这里改成 abandon_vk_side_channel(),
+  // 把这些对象真正销毁并复位命令缓冲,而不只是丢句柄。
+  if (!s.ok()) {
+    cmd->abandon_vk_side_channel();
+    return s;
+  }
+  // ---- 旁路 render pass 必须挡在 vkBeginCommandBuffer 之前丢掉 ----
+  //
+  // 【t23 实测】只做上面那次"收尾丢弃"是不够的:
+  //   submit_device_frame() 内部先 core->begin_frame()(它会复位槽位命令缓冲,
+  //   这一步就是 vkBeginCommandBuffer),**之后**才回放 recorded_ 建它自己的
+  //   render pass。此时旁路的 VkRenderPass / VkFramebuffer 仍然活着,而
+  //   framebuffer 里挂的就是调用方 target 的 VkImageView。
+  //   在驱动看来,这张图同时被两个活动 pass 引用、布局链互相矛盾 ——
+  //   结果是**这一次**绘制就静默不出片元(整屏只剩清屏色),而不是下一次。
+  //
+  // 所以顺序必须是:进入设备帧提交**之前**先丢掉旁路,提交之后再兜一次底。
+  //
+  // 为什么可以安全丢弃:别的地方要的 vk_cmd_(见 ICommandList::discard_vk_side_channel
+  // 的注释)是给 submit_and_wait() 用的;而 submit_command_list() 这一路
+  // 走的是 submit_device_frame() 的槽位命令缓冲,vk_cmd_ 全程死代码。
+  // 命令流 recorded_ 是**值语义**独立副本,不受命令缓冲销毁影响。
   if (stats.draw_calls == 0) {
     return Status::Invalid("submit_command_list: 提交成功但没有任何 draw 被下发");
   }
+  // 帧环不变量探针:本帧到底在提交**之前**丢弃过几次旁路。
+  // 记在这里(成功路径的末尾),供 SyncCore.FrameRingAdvancesPerSubmit 在
+  // 外部调用方跑完之后复核 —— 见 vulkan_render_device.h 的说明。
+  last_frame_side_channel_abandons_ = cmd->side_channel_abandon_count();
   return Status::Ok_();
 }
 

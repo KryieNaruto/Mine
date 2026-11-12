@@ -186,6 +186,10 @@ add_library(magicblocks STATIC
   src/backend/vulkan/vulkan_command.cpp
   src/backend/vulkan/vulkan_frame_sync.h
   src/backend/vulkan/vulkan_frame_sync.cpp
+  # L0 多帧并行同步核心:N 槽 image_available/render_finished 信号量 + submit fence +
+  # 持久命令缓冲 + 帧内对象延迟销毁栈(取代 vulkan_render_device 里的 fence 轮转池)。
+  src/backend/vulkan/vulkan_sync_core.h
+  src/backend/vulkan/vulkan_sync_core.cpp
   src/backend/vulkan/vulkan_swapchain.h
   src/backend/vulkan/vulkan_swapchain.cpp
   src/backend/vulkan/vulkan_swapchain_android.cpp

@@ -170,6 +170,38 @@ class VulkanCommandList final : public ICommandList {
   // 命令流快照(按录制顺序;值语义,不含指针)。
   const std::vector<RecordedCommand>& recorded() const { return recorded_; }
 
+  // 设备态旁路 render pass 是否已录进 vk_cmd_(见 begin_pass 的 simple_shape 分支)。
+  //
+  // 存在的理由:submit_command_list() 走的是 submit_device_frame(),它**另建**
+  // 命令缓冲重放 recorded_,压根不执行 vk_cmd_。于是 vk_cmd_ 里那条真实
+  // vkCmdBeginRenderPass 永远不会被执行,却把调用方 target 的 VkImage 绑进了
+  // framebuffer。该 render pass 的 attachment 是 initialLayout=UNDEFINED /
+  // finalLayout=GENERAL,与实际执行的那条 pass 的布局链互不相干 —— 两条链
+  // 对同一张图给出矛盾的布局声明,属于未定义行为。
+  //
+  // 该 gotcha 由本任务(t23)的 SyncModel.UiAndSdkChannelsStayIndependent 暴露。
+  bool has_vk_pass_target() const { return has_vk_pass_target_; }
+  // 丢弃"只录不执行"的旁路。submit_device_frame() 用自己的命令缓冲重放
+  // recorded_,submit_and_wait() 才需要 vk_cmd_ —— 走设备帧提交这条路上,
+  // vk_cmd_ 里的一切都是死代码。销毁 target 的 pass 对象、结束并复位命令
+  // 缓冲,避免两条矛盾的布局链同时存在。
+  void abandon_vk_side_channel();
+
+  // 【帧环不变量探针,只读】本列表自本帧 begin_frame 起 `abandon_vk_side_channel()`
+  // 被调用了几次。
+  //
+  // 为什么需要一个探针,而不是"看代码就知道":这个丢弃动作必须发生在
+  // submit_device_frame() **之前**(见 vulkan_render_device.cpp 的注释),而
+  // `SyncCore.FrameRingAdvancesPerSubmit` 要在**外部调用方**跑完之后复核这条
+  // 不变量 —— 那条用例只能拿到 ICommandList&,拿不到后端内部状态。
+  //
+  // 计数**不**在 abandon 里清零:清零发生在 `reset()`(帧环每次换槽都会调它,
+  // 见 vulkan_render_device.cpp 提交前的那次 reset),所以"本帧提交前丢弃过 1 次"
+  // 与"提交后又丢弃了 1 次"(那会把这一次绘制吃掉)在计数上可区分。
+  //
+  // 它不是性能计数器,也不进命令流、不参与哈希。
+  u32 side_channel_abandon_count() const { return side_channel_abandon_count_; }
+
   // ------------------------------------------------------------ 设备帧提交用的指针视图
   //
   // RecordedCommand 刻意只存值(可序列化),但设备帧提交
@@ -236,7 +268,12 @@ class VulkanCommandList final : public ICommandList {
   std::function<void(VulkanCommandList&)> on_sync_resources_;
   device::Status check_draw_state(const char* what) const;
   device::Status ensure_vk_command_buffer();
+  // 结束并销毁旁路命令缓冲。**不**销毁 pass 对象(vk_render_pass_ / vk_framebuffer_ /
+  // 视图):submit_and_wait() 在 fence 等到之后才需要它们,见
+  // pass_targets_pending_cleanup_ 的注释。
   void destroy_vk_command_buffer();
+  // 真正销毁 pass / framebuffer / 视图并把 pass 相关标志复位。
+  void release_pass_targets();
 
   VulkanContext ctx_{};
   bool has_ctx_ = false;
@@ -254,6 +291,10 @@ class VulkanCommandList final : public ICommandList {
   // 必须等 submit_and_wait 的 fence 等到后再销毁,否则 vkQueueSubmit 会读到
   // 已释放的句柄(随机访问冲突)。
   bool pass_targets_pending_cleanup_ = false;
+  // 本帧内 abandon_vk_side_channel() 的调用次数(只读探针,见该访问器的注释)。
+  // **只在 reset() 里清零** —— 帧环每次换槽前都会 reset 一次,所以它天然是
+  // "本帧"的计数;提交后再清零就等于把"提交之后又丢弃一次"抹掉,那恰恰是要抓的。
+  u32 side_channel_abandon_count_ = 0;
 
   std::vector<RecordedCommand> recorded_;
   // 与 recorded_ 等长的旁路表:每条命令对应的 IPipeline*(仅 bind_pipeline 非空)。

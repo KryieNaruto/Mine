@@ -843,6 +843,9 @@ void VulkanCommandList::reset() {
   bound_ = Bound{};
   last_pass_ = RenderPassDesc{};
   recording_ = !has_ctx_;  // 软件态复位后直接进入可录制状态
+  // 帧环不变量探针:一次 reset = 一帧的开始,计数在这里归零。
+  // 见 vulkan_command.h 里 side_channel_abandon_count() 的说明。
+  side_channel_abandon_count_ = 0;
 }
 
 u32 VulkanCommandList::op_count(CommandOp op) const {
@@ -873,6 +876,40 @@ bool VulkanCommandList::all_resource_handles_packed() const {
 }
 
 // ---------------------------------------------------------------- 提交(G5 单队列)
+
+void VulkanCommandList::release_pass_targets() {
+  if (!has_ctx_ || ctx_.device == VK_NULL_HANDLE) return;
+  if (vk_framebuffer_ != VK_NULL_HANDLE) {
+    vkDestroyFramebuffer(ctx_.device, vk_framebuffer_, nullptr);
+    vk_framebuffer_ = VK_NULL_HANDLE;
+  }
+  if (vk_color_view_ != VK_NULL_HANDLE) {
+    vkDestroyImageView(ctx_.device, vk_color_view_, nullptr);
+    vk_color_view_ = VK_NULL_HANDLE;
+  }
+  if (vk_depth_view_ != VK_NULL_HANDLE) {
+    vkDestroyImageView(ctx_.device, vk_depth_view_, nullptr);
+    vk_depth_view_ = VK_NULL_HANDLE;
+  }
+  if (vk_render_pass_ != VK_NULL_HANDLE) {
+    vkDestroyRenderPass(ctx_.device, vk_render_pass_, nullptr);
+    vk_render_pass_ = VK_NULL_HANDLE;
+  }
+  has_vk_pass_target_ = false;
+  pass_targets_pending_cleanup_ = false;
+}
+
+void VulkanCommandList::abandon_vk_side_channel() {
+  if (!has_ctx_ || ctx_.device == VK_NULL_HANDLE) return;
+  // 旁路命令缓冲从未被提交通往 GPU:它只是"录制态"里一条没人执行的重放流。
+  // 先结束/销毁它(顺带清掉 vk_recording_),再销毁 pass 对象 —— 这些对象没进过
+  // 任何队列,不存在"被在途命令引用"的问题。
+  destroy_vk_command_buffer();
+  release_pass_targets();
+  // 帧环不变量探针:本帧丢弃了几次。submit_device_frame 之前丢弃 = 1(正确),
+  // 提交之后再丢弃 = 2 —— 后者会把这一次绘制吃掉(见 render_device.cpp 的注释)。
+  ++side_channel_abandon_count_;
+}
 
 Status VulkanCommandList::submit_and_wait() {
   // 未 end_pass 就提交 → InvalidArgument(command.h 明文:不放过半个 pass)。
@@ -930,23 +967,7 @@ Status VulkanCommandList::submit_and_wait() {
   // 命令缓冲已执行完毕(fence 已等到),此时才能安全销毁 pass 期间创建的
   // render pass / framebuffer / image view。
   if (pass_targets_pending_cleanup_) {
-    if (vk_framebuffer_ != VK_NULL_HANDLE) {
-      vkDestroyFramebuffer(ctx_.device, vk_framebuffer_, nullptr);
-      vk_framebuffer_ = VK_NULL_HANDLE;
-    }
-    if (vk_color_view_ != VK_NULL_HANDLE) {
-      vkDestroyImageView(ctx_.device, vk_color_view_, nullptr);
-      vk_color_view_ = VK_NULL_HANDLE;
-    }
-    if (vk_depth_view_ != VK_NULL_HANDLE) {
-      vkDestroyImageView(ctx_.device, vk_depth_view_, nullptr);
-      vk_depth_view_ = VK_NULL_HANDLE;
-    }
-    if (vk_render_pass_ != VK_NULL_HANDLE) {
-      vkDestroyRenderPass(ctx_.device, vk_render_pass_, nullptr);
-      vk_render_pass_ = VK_NULL_HANDLE;
-    }
-    pass_targets_pending_cleanup_ = false;
+    release_pass_targets();
   }
   // 提交后命令列表回到可复用状态:命令缓冲释放,下一轮 begin_pass 重新走 begin 录制路径。
   destroy_vk_command_buffer();

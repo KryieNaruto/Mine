@@ -8,6 +8,7 @@
 #include "magicblocks_shaders.h"
 
 #include "backend/vulkan/vulkan_resource_common.h"  // to_vk_samples(MSAA 共用的唯一一份)
+#include "backend/vulkan/vulkan_sync_core.h"        // submit_and_wait_directed(定向等待本次提交)
 
 namespace magicblocks::backend {
 
@@ -33,7 +34,7 @@ Status draw_selftest_grid(const VulkanContext& ctx, OffscreenTarget* target, u64
   VkImage color = target->color_image();
   if (!color) return Status::Unsupported("draw: 目标无颜色附件");
 
-  // 两套 shader 都是「4 顶点 unit quad + 16 实例」的形状,差别只在配色与清屏色。
+  // 两套 shader 都是「6 顶点(两个三角形)unit quad + 16 实例」的形状,差别只在配色与清屏色。
   const bool l2 = (shaders_kind == SelftestShaders::L2Scene);
   const std::uint32_t* vs_code = l2 ? shaders::kL2_sceneVert : shaders::kFullscreenVert;
   const std::size_t vs_bytes = l2 ? shaders::kL2_sceneVertSize : shaders::kFullscreenVertSize;
@@ -178,7 +179,14 @@ Status draw_selftest_grid(const VulkanContext& ctx, OffscreenTarget* target, u64
   vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
   VkPipelineInputAssemblyStateCreateInfo ia{};
   ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-  ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+  // 拓扑必须与所用着色器的 gl_VertexIndex 约定一致:
+  //   - fullscreen.vert:6 顶点 TRIANGLE_LIST 四边形(左下,右下,右上)+(左下,右上,左上)
+  //   - l2_scene.vert  :同样的 6 顶点 TRIANGLE_LIST 排布
+  // 这里曾硬编码 TRIANGLE_STRIP + 4 顶点 —— 对 fullscreen.vert 只会画出三角形
+  // (0,1,2):四边形缺一半、实例 0 的标定点也落不进去,而且不报任何错。
+  // 与 resources::PrimitiveType 的口径也一致:vulkan_pipeline.cpp 的
+  // to_vk_topology 对非 LineList 一律给 TRIANGLE_LIST。
+  ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
   VkViewport vp{0.f, 0.f, static_cast<float>(ext.width), static_cast<float>(ext.height), 0.f, 1.f};
   VkRect2D sc{{0, 0}, {ext.width, ext.height}};
   VkPipelineViewportStateCreateInfo vps{};
@@ -270,7 +278,7 @@ Status draw_selftest_grid(const VulkanContext& ctx, OffscreenTarget* target, u64
     rbi.pClearValues = &clear;
     vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
-    vkCmdDraw(cmd, 4, 16, 0, static_cast<std::uint32_t>(frame_index & 1u));  // 4 顶点 x 16 实例
+    vkCmdDraw(cmd, 6, 16, 0, static_cast<std::uint32_t>(frame_index & 1u));  // 6 顶点 x 16 实例
     vkCmdEndRenderPass(cmd);
     vkEndCommandBuffer(cmd);
 
@@ -278,10 +286,13 @@ Status draw_selftest_grid(const VulkanContext& ctx, OffscreenTarget* target, u64
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1;
     si.pCommandBuffers = &cmd;
-    r = vkQueueSubmit(ctx.queue, 1, &si, VK_NULL_HANDLE);
-    if (r == VK_SUCCESS) r = vkQueueWaitIdle(ctx.queue);
+    // 【2026-11-11】原来是 vkQueueSubmit(…, VK_NULL_HANDLE) + vkQueueWaitIdle:
+    // 一个 queue 级全停。这里要的其实只是"这本函数返回前 GPU 已经画完" ——
+    // 因为紧随其后就要销毁 pipeline / framebuffer / view,并且调用方会立刻读回。
+    // 改成"提交并定向等待这一次提交"(槽位 fence 或临时 fence),不碰队列全局状态。
+    Status sub = submit_and_wait_directed(ctx, cmd, 1'000'000'000ull);
     vkFreeCommandBuffers(ctx.device, ctx.cmd_pool, 1, &cmd);
-    if (r != VK_SUCCESS) out = Status::InitFailed(fmt_err("draw 提交", r));
+    if (!sub.ok()) out = Status::InitFailed("draw 提交: " + sub.message);
   }
 
   if (pipe) vkDestroyPipeline(ctx.device, pipe, nullptr);

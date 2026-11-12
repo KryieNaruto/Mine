@@ -1177,6 +1177,32 @@ device::Status VulkanPagingAllocator::validate() const {
       return Status::Invalid("validate: 页 " + std::to_string(p.id) + " 的下标是 " +
                              std::to_string(i) + ",违反 page_id == pages 下标 不变量");
     }
+    if (p.image_bound || p.buffer_bound) {
+      // 【t23 修】专用页(图像/读回缓冲)不切 64 KiB 槽位:
+      // allocate_image_page 明确写 `p.slot_count = 0;  // 不切槽位`
+      // (见该函数),[image_bound] 页整块绑一张 VkImage,slots 也清空。
+      // 而下面原有的几何检查**无条件**要求 slot_count != 0 且子块从 0 开始、
+      // 首尾相接覆盖整页 —— 对专用页根本无从谈起。
+      //
+      // 后果(实测):readback_rgba8 / create_offscreen_target 都会建图像页,
+      // 于是**任何一次读回之后** allocator->validate() 恒返回
+      // "页 N 槽位数非法"。validate() 是"分配器账本自洽"的权威判据,
+      // 它恒假等于判据失效 —— 所有在 readback 之后做的账本校验全部失真。
+      // 既有用例从没在 readback 之后调 validate(),所以一直没暴露。
+      //
+      // 这里只豁免**槽位几何**这一段;页 id/下标不变量、页大小、预算等
+      // 其余检查对专用页照做,不是"整个页跳过校验"。
+      if (p.slot_count != 0 || !p.slots.empty()) {
+        return Status::Invalid("validate: 专用页 " + std::to_string(p.id) +
+                               " 不该有槽位几何(slot_count=" +
+                               std::to_string(p.slot_count) + ", slots=" +
+                               std::to_string(p.slots.size()) + ")");
+      }
+      if (p.page_size == 0) {
+        return Status::Invalid("validate: 专用页 " + std::to_string(p.id) + " 页大小为 0");
+      }
+      continue;
+    }
     if (p.slot_count == 0 || p.slot_count > kMaxSlotsPerPage) {
       return Status::Invalid("validate: 页 " + std::to_string(p.id) + " 槽位数非法");
     }

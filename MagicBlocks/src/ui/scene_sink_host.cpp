@@ -118,8 +118,14 @@ bool ShellSurfaceSink::submit_frame(resources::ICommandList& list) {
     last_status_ = SinkStatus::NoSurface;
     return false;
   }
-  // 真正的提交：IRenderDevice::submit_command_list() 会把命令流翻译成 vkCmd*，
-  // 然后 vkQueueSubmit + fence 等待。这就是本轮打通的路径。
+  // 真正的提交：IRenderDevice::submit_command_list() 会把命令流翻译成 vkCmd*。
+  //
+  // 【2026-11-11】这里不再"提交 + fence 等待"。现在的时序是:
+  //   acquire_image()  → 设备的 N 槽同步核心 begin_frame(只等本槽 fence)+ acquire 信号量
+  //   submit_frame()   → 提交并挂到同一槽位(等 acquire 信号量、发 render_finished)
+  //   present_image()  → present 等 render_finished 信号量
+  // 三件事必须在**同一槽位**上完成,槽位由设备按帧序轮转。
+  // 顺序保证:acquire 已经推进了帧序号,所以这里提交用的就是 acquire 占的那个槽。
   auto s = device_->submit_command_list(list);
   if (!s.ok()) {
     last_status_ = SinkStatus::SubmitFailed;

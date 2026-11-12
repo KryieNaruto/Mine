@@ -6,6 +6,8 @@
 #include <cstring>
 
 #include "backend/vulkan/vulkan_resource_common.h"
+// 析构里的"从设备反查表摘掉自己"需要 VulkanRenderDevice 的完整定义(见 ~VulkanTexture)。
+#include "backend/vulkan/vulkan_render_device.h"
 
 namespace magicblocks::backend {
 
@@ -97,6 +99,12 @@ VulkanTexture::VulkanTexture(const VulkanContext& ctx, resources::IMemoryAllocat
     : ctx_(ctx), has_ctx_(true), allocator_(allocator), desc_(desc) {}
 
 VulkanTexture::~VulkanTexture() {
+  // 先从设备的 known_textures_ 里摘掉自己(裸指针表,ResourceId 会被复用)。
+  // 理由见 ~VulkanBuffer 的同一段注释。设备先于资源析构时 owner 为 nullptr。
+  if (auto* paging = dynamic_cast<VulkanPagingAllocator*>(allocator_)) {
+    auto* owner = static_cast<VulkanRenderDevice*>(paging->owner_device());
+    if (owner != nullptr) owner->forget_known_texture(this);
+  }
   // 未提交的上传批先丢弃(暂存子块归还)。
   discard_pending();
   if (ctx_.device != VK_NULL_HANDLE) {

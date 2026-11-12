@@ -21,11 +21,12 @@
 //   3. 签名不变,UI 层零改动。
 #include "backend/vulkan/vulkan_ui_overlay.h"
 
-#include "backend/vulkan/vulkan_allocator.h"
-
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+
+#include "backend/vulkan/vulkan_allocator.h"
+#include "backend/vulkan/vulkan_sync_core.h"  // submit_and_wait_directed(定向等待本次提交)
 
 #include "magicblocks_shaders.h"
 // <windows.h> 鐨?min/max 瀹忎細鎶?std::min/std::max 鎷嗗潖(C2589)銆?
@@ -617,19 +618,26 @@ Status UiOverlayPass::render_offscreen() {
   vkCmdEndRenderPass(cmd);
   vkEndCommandBuffer(cmd);
   draw_calls_ = 1;
-  // 4) 单次 submit(离屏路径;UI 层 Presenter 不再为它提交)
-  VkSubmitInfo si{};
-  si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-  si.commandBufferCount = 1;
-  si.pCommandBuffers = &cmd;
-  r = vkQueueSubmit(ctx_.queue, 1, &si, VK_NULL_HANDLE);
-  if (r == VK_SUCCESS) r = vkQueueWaitIdle(ctx_.queue);
-  vkFreeCommandBuffers(ctx_.device, ctx_.cmd_pool, 1, &cmd);
-  vkDestroyFramebuffer(ctx_.device, fb, nullptr);
-  vkDestroyImageView(ctx_.device, view, nullptr);
-  if (att_views[1] != VK_NULL_HANDLE) vkDestroyImageView(ctx_.device, att_views[1], nullptr);
-  if (r != VK_SUCCESS) return Status::InitFailed(fmt_err("UI pass 绘制失败", r));
-  return Status::Ok_();
+  // 4) 提交(离屏路径;UI 层 Presenter 不再为它提交)
+  //
+  // 【2026-11-11】原来这里是 vkQueueSubmit(…, VK_NULL_HANDLE) + vkQueueWaitIdle ——
+  // **渲染主路径上唯一真正每帧都会走到的 queue 级全停**。它把"本帧 UI 画完"的成本
+  // 扩大成"整条队列上的一切都停",CPU 与 GPU 的重叠在这里被清零。
+  //
+  // 现在改为"提交并定向等待这一次提交"(submit_and_wait_directed):
+  // 借用设备同步核心的槽位 fence(或没有核心时的临时 fence),只等这一批。
+  // 为什么这里仍然需要等(而不是像上屏路径那样交给信号量):紧接着就要销毁
+  // framebuffer / imageView,而且 render_to_memory() 返回后调用方会立即读回。
+  // 不等就是 use-after-free + 读到未写完的像素。
+  {
+    const Status sub = submit_and_wait_directed(ctx_, cmd, 1'000'000'000ull);
+    vkFreeCommandBuffers(ctx_.device, ctx_.cmd_pool, 1, &cmd);
+    vkDestroyFramebuffer(ctx_.device, fb, nullptr);
+    vkDestroyImageView(ctx_.device, view, nullptr);
+    if (att_views[1] != VK_NULL_HANDLE) vkDestroyImageView(ctx_.device, att_views[1], nullptr);
+    if (!sub.ok()) return Status::InitFailed("UI pass 绘制失败: " + sub.message);
+    return Status::Ok_();
+  }
 }
 
 Status UiOverlayPass::readback(std::uint8_t* out, std::size_t bytes) {

@@ -9,7 +9,7 @@
 // 生命周期由 Kotlin 侧驱动：
 //   nativeCreate()             → 建设备/管线/缓冲
 //   nativeSurfaceCreated(w)    → 建 swapchain（拿到 ANativeWindow*）
-//   nativeRenderFrame(yaw,pitch,scale) → 取图 → 录制 → 提交 → 呈现
+//   nativeRenderFrame(qx,qy,qz,qw,scale) → 取图 → 录制 → 提交 → 呈现
 //   nativeSurfaceDestroyed()   → 拆 swapchain
 //   nativeDestroy()            → 拆设备
 #pragma once
@@ -64,19 +64,19 @@ class SceneRenderer {
 
   // 渲染一帧并直接呈现到 Surface。全程无 CPU 回读。
   //
-  // 相机约定（见 record_into 里的说明，别再改成"转物体"或欧拉角）：
-  //   **相机姿态是一个单位四元数 (qx,qy,qz,qw)**，不在这里做任何角度分解。
-  //   Kotlin 侧按"绕**相机自身轴**的小旋转"累积 q，因此：
-  //     左右拖 = 绕相机 Y 轴（画面左右转）
-  //     上下拖 = 绕相机 X 轴（画面上下转）
-  //   两个方向永远只作用于机体系，360° 任意角度都不会改变旋转轴、不会万向节锁、
-  //   也没有任何角度夹取。物体在世界里不动，动的永远是摄像机。
-  //   scale     : 缩放（双指捏合），本质是相机沿视线拉近拉远。
-  //   pan_x/y   : 平移（双指拖动），单位是**世界空间**的偏移量 ——
-  //               由 Kotlin 侧按"屏幕像素 / 当前可视宽度"换算好再传进来，
-  //               这样平移速度与缩放级别无关（贴着手指走）。
-  bool render_frame(float qx, float qy, float qz, float qw, float scale, float pan_x, float pan_y,
-                    std::string* err);
+  // 相机约定（见 record_into 里的说明）：
+  //   **姿态是一个单位四元数 (qx,qy,qz,qw)**，表示相机（机体系 → 世界系）。
+  //   Kotlin 侧每帧右乘三个增量：
+  //       q ← normalize( q * Rx(上下拖动角) * Ry(左右拖动角) * Rz(滚转角) )
+  //   右乘 = 绕机体轴，所以：
+  //       左右拖永远绕**当前相机自己的 up**；
+  //       上下拖永远绕**当前相机自己的 right**；
+  //       双指拧永远绕**当前相机自己的 back**。
+  //   四元数没有欧拉角那种万向节奇点，360° 无死角，且**不做任何夹取**。
+  //   scale     : 缩放（双指捏合）。
+  //   pan_x/y   : 平移（双指拖动），世界空间偏移量。
+  bool render_frame(float qx, float qy, float qz, float qw, float scale, float pan_x,
+                    float pan_y, std::string* err);
 
   bool surface_ready() const { return swapchain_ != nullptr; }
 
@@ -117,8 +117,8 @@ class SceneRenderer {
   bool create_resources(std::string* err);
   void release_window();
   bool rebuild_pipeline_for_swapchain(std::string* err);
-  bool record_into(dev::IRenderTarget* target, float qx, float qy, float qz, float qw, float scale,
-                   float pan_x, float pan_y, std::string* err);
+  bool record_into(dev::IRenderTarget* target, float qx, float qy, float qz, float qw,
+                   float scale, float pan_x, float pan_y, std::string* err);
 
   std::unique_ptr<dev::IRenderDevice> device_;
   std::unique_ptr<dev::ISwapchain> swapchain_;

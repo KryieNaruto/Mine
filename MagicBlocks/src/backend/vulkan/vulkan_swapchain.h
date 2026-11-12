@@ -12,6 +12,8 @@
 
 namespace magicblocks::backend {
 
+class VulkanSyncCore;
+
 // 不透明句柄探针:让 UI 层(`src/ui/`)能在**不认识 Vk*** 的前提下问到
 // "当前 swapchain image 的句柄值"。句柄值只被当成不透明整数转发给后端内部,
 // G3 分层因此保持干净(G3 只看源码里有没有 Vk 字样,这里只是一个 uint64)。
@@ -111,6 +113,12 @@ class VulkanSwapchain final : public device::ISwapchain, public SwapchainImagePr
   device::ISwapchain::ImageResult acquire_next_image() override;
   device::ISwapchain::ImageStatus present_current() override;
 
+  // ---- 帧环探针(给测试用;G3:backend 之外不许出现 Vk* 类型)----
+  // 最近一次 acquire 是否走了设备的 N 槽同步核心,用的哪个槽,N 是多少。
+  bool frame_aligned_with_sync_core() const { return probe_.aligned; }
+  std::uint32_t frame_slot() const { return probe_.slot; }
+  std::uint32_t in_flight_slots() const { return probe_.in_flight; }
+
   // 索引 → 目标视图。越界返回 nullptr(**不**回退到 0 号图：把索引算错伪装成正常结果，
   // 正是 current_target() 硬编码 views_[0] 那个 bug 能潜伏这么久的原因)。
   // current_target() 就是 target_at(current_index_)。
@@ -119,6 +127,16 @@ class VulkanSwapchain final : public device::ISwapchain, public SwapchainImagePr
  private:
   device::Status destroy_swapchain();
   device::Status create_swapchain_objects(device::Extent2D extent);
+
+  // 本交换链的"帧环"是否与设备的同步核心对齐(acquire 拿到了信号量)。
+  //
+  // 为什么需要这个探针:acquire/present 的同步正确性只能靠"句柄来自哪里"来断言,
+  // 而 Vk* 类型不许出现在 backend 之外(G3)。所以把事实投影成两个布尔 + 一个整数。
+  struct FrameSyncProbe {
+    bool aligned = false;         // 最近一次 acquire 走了设备同步核心的槽位
+    std::uint32_t slot = 0;       // 用的哪个槽位
+    std::uint32_t in_flight = 0;  // N(>=2 才叫多帧并行)
+  };
 
   VulkanContext ctx_;
   device::NativeSurface native_{};
@@ -134,6 +152,19 @@ class VulkanSwapchain final : public device::ISwapchain, public SwapchainImagePr
   std::vector<std::unique_ptr<device::IRenderTarget>> views_;
   // acquire 用 fence:保证覆盖写之前 GPU 已经用完这张图。
   VkFence acquire_fence_ = VK_NULL_HANDLE;
+  // 本帧 acquire / submit / present 用的设备同步核心槽位(非拥有;核心归设备)。
+  //
+  // 改造前三件事都不成立:
+  //   acquire 传 VK_NULL_HANDLE/VK_NULL_HANDLE,拿不到"图可写"的信号量;
+  //   present 从不设 pWaitSemaphores;
+  //   于是 GPU 还在画这张图,展示端就已经拿到它了。
+  VulkanSyncCore* frame_sync_ = nullptr;
+  std::uint32_t frame_slot_ = 0;
+  // 本帧是否已经**开始**(begin_frame + acquire 都成功)。present 用它判断
+  // render_finished 是否真的会被信号化 —— 没有帧就没有信号量可等。
+  bool frame_acquired_ = false;
+  // 探针(见上面 FrameSyncProbe 的注释)。
+  FrameSyncProbe probe_{};
   bool surface_lost_ = false;
   std::uint32_t pre_transform_ = 0;
 

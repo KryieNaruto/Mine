@@ -5,6 +5,10 @@
 #include <string>
 
 #include "backend/vulkan/vulkan_resource_common.h"
+// 析构里的"从设备反查表摘掉自己"需要 VulkanRenderDevice 的完整定义(见 ~VulkanBuffer)。
+#include "backend/vulkan/vulkan_render_device.h"
+// 销毁托管票据(BufferRef)与帧槽退休栈的类型定义在这里。
+#include "backend/vulkan/vulkan_sync_core.h"
 
 namespace magicblocks::backend {
 
@@ -73,10 +77,39 @@ VulkanBuffer::VulkanBuffer(const VulkanContext& ctx, resources::IMemoryAllocator
     : ctx_(ctx), has_ctx_(true), allocator_(allocator), desc_(desc) {}
 
 VulkanBuffer::~VulkanBuffer() {
+  // 【先从设备的反查表里摘掉自己】必须在任何 Vk 调用之前、也必须无条件执行。
+  //
+  // 设备的 known_buffers_ 存的是**裸指针**(所有权在调用方的 unique_ptr),
+  // 而 ResourceId 会被分页分配器回收复用。表若留着已析构的对象,下一次
+  // create_buffer 拿到同一个 id 时反查就会命中已释放内存 —— 实测表现是
+  // 0xC0000005 / 堆损坏 0xC0000409 / "vkBeginCommandBuffer: Invalid commandBuffer",
+  // 且只在全量串跑时出现。设备先于资源析构时 owner 为 nullptr,这里跳过。
+  if (auto* paging = dynamic_cast<VulkanPagingAllocator*>(allocator_)) {
+    auto* owner = static_cast<VulkanRenderDevice*>(paging->owner_device());
+    if (owner != nullptr) owner->forget_known_buffer(this);
+  }
   // M4:先丢弃未提交的上传批(它们的暂存子块也要归还),再归还本缓冲的子块。
   flush_pending();
   if (vk_buffer_ != VK_NULL_HANDLE && ctx_.device != VK_NULL_HANDLE) {
-    vkDestroyBuffer(ctx_.device, vk_buffer_, nullptr);
+    // 【谁负责 vkDestroyBuffer】2026-11-11,提交异步化。
+    //
+    // 本对象存活期间**始终拥有** VkBuffer,所以句柄一直有效、可被多帧复用。
+    // 一旦被某帧提交用过,就有一张共享票据托管在"用它的那些槽"上:
+    //
+    //   还有槽托管着(use_count > 1)→ 只把句柄交到票据上并**放弃本对象这一份**,
+    //                                    由最后一个排空的槽真正销毁;
+    //   没有槽托管(use_count == 1)→ 没有在飞命令能引用它,当场销毁。
+    //
+    // ⚠️ 这里**绝不等待任何 fence**。曾经写成 wait_device_frames_idle(ctx_),
+    // 那是错的:每销毁一个缓冲就排空全部槽位,把 CPU/GPU 重叠清零,
+    // 多帧并行在最热路径上退化为串行 —— 只是把 vkDeviceWaitIdle 换了个名字。
+    if (retire_ref_ != nullptr && retire_ref_.use_count() > 1) {
+      // 票据已持有同一个句柄(retire_ticket 时填入);本对象这一份引用放掉即可,
+      // 真正销毁发生在最后一个槽的 destroy_all 里。
+      retire_ref_.reset();
+    } else {
+      vkDestroyBuffer(ctx_.device, vk_buffer_, nullptr);
+    }
   }
   vk_buffer_ = VK_NULL_HANDLE;
   if (allocator_ != nullptr && id_.valid()) {

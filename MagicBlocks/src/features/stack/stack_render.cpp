@@ -115,13 +115,28 @@ u64 fnv1a(const void* data, std::size_t n, u64 seed) {
 
 class StackRenderer final : public IStackRenderer {
  public:
-  // 把一份实例数组变成设备上的 Vertex 缓冲。
+  // 把一份实例数组变成设备上的 Vertex 缓冲，写进**帧槽环的第 slot 格**。
   //
   // 与顶点缓冲同口径：`InstanceAttribs` 也落在**设备页**，CPU 不可映射，
   // 必须 upload() + flush_pending()。漏 flush 的表现是"图上一片空但不报错"。
+  //
+  // ======================== 这里原本是一处 use-after-free ========================
+  // 改造前本函数第一行是 `slot->reset()`，即**无条件、立即**销毁上一帧的
+  // VkBuffer。在旧的同步 submit 模型下这没问题（submit 返回时 GPU 已画完），
+  // 但 t19 把 submit 改成异步之后它就是 UAF，且不是竞态而是**严格帧序**：
+  //   `build_instances()` 在全部调用点上都先于本帧的 `submit_command_list`，
+  //   所以第 2 帧一进来就销毁"第 1 帧已提交、GPU 可能仍在读"的缓冲 —— 100% 必现。
+  //   SwiftShader 太快，所以此前一直没崩出可观测症状，只是静默读已释放显存。
+  //
+  // 现在：`reset()` 已删除。写 `slot` 格时，被覆盖的那个旧 unique_ptr 自然析构，
+  // 而**调用方在 `record_frame` 里已经先 `wait_slot(slot)` 过** —— 销毁点从
+  // "无保护"变成"该槽上一轮提交的 fence 之后"。缓冲区生命周期因此由
+  // 帧槽环 + IFrameSync 共同保证，不再依赖"调用方会读回"这种外部约定。
   StackStatus upload_instances(std::unique_ptr<res::IBuffer>* slot,
                                const std::vector<mbp::InstanceAttribs>& data) {
-    slot->reset();
+    if (slot == nullptr) {
+      return StackStatus::Fail(StackCode::OutOfGrid, "upload_instances: 环格为空");
+    }
     if (device_ == nullptr) {
       return StackStatus::Fail(StackCode::OutOfGrid, "upload_instances: device 为空");
     }
@@ -163,6 +178,41 @@ class StackRenderer final : public IStackRenderer {
   StackStatus create_passes(IRenderDevice* device, std::uint32_t samples) override {
     if (device == nullptr) return StackStatus::Fail(StackCode::OutOfGrid, "create_passes: device 为空");
     device_ = device;
+
+    // ---- 实例缓冲帧槽环：N 必须与 L0 的 in-flight 数**同源** ----
+    //
+    // 为什么必须是 N 而不是 1（见 stack_render.h 顶部的 UAF 说明）：
+    //   N=1 时"下一帧绑定时等槽 0"等的是**本帧自己**那批提交，而绑定发生在
+    //   submit **之前**，fence 还是 signaled（上一轮已等过）→ wait_slot 立即返回
+    //   → 立刻销毁 → 照样读已释放显存。**N=1 不是"不并行"，是"错"。**
+    //   所以这里绝不降级到 1：拿不到可信的 N 就整帧报错。
+    //
+    // 取值依据：`IFrameSync::in_flight_count()` 就是 DeviceDesc::in_flight_frames
+    //   （L0 校验 2|3），也是 VulkanSyncCore 的槽数（vulkan_frame_sync.cpp:22-28
+    //   同源转发）。L4 若另立一个 N，就会出现"同步核心 N=3、缓冲环 N=2"的两套口径：
+    //   环比槽多则白占显存，环比槽少则复用得太早 —— 正是本函数要消灭的那个 UAF。
+    frame_sync_ = device->frame_sync();
+    if (frame_sync_ == nullptr) {
+      return StackStatus::Fail(
+          StackCode::OutOfGrid,
+          "create_passes: device->frame_sync() 为空，无法建实例缓冲帧槽环"
+          "（拒绝降级到单缓冲：那会在 GPU 仍可能读取时销毁缓冲）");
+    }
+    const u32 n_slots = frame_sync_->in_flight_count();
+    if (n_slots < 2) {
+      return StackStatus::Fail(
+          StackCode::OutOfGrid,
+          "create_passes: in_flight_count()=" + std::to_string(n_slots) +
+              "，实例缓冲帧槽环至少要 2 格"
+              "（N=1 时绑定发生在 submit 之前、fence 仍 signaled，wait_slot 立即返回"
+              "→ 仍然 UAF）");
+    }
+    // 环格初始为空（unique_ptr 不可拷贝，用 resize 而不是 assign(n, nullptr)）。
+    surface_ring_.clear();
+    surface_ring_.resize(n_slots);
+    inner_ring_.clear();
+    inner_ring_.resize(n_slots);
+    inner_same_as_surface_.assign(n_slots, false);
 
     // 先建表面 pass。若内面 pass 建失败，**整帧报错**，不降级成"只画表面"——
     // 半功能的渲染器在画面上表现为"能看但不对"，比直接报错更难归因。
@@ -314,14 +364,36 @@ class StackRenderer final : public IStackRenderer {
       return StackStatus::Fail(StackCode::OutOfGrid, "build_instances: 内面序烘焙失败(格子丢失)");
     }
 
-    // ---- 3) 上传 ----
-    // 顺序相同时共用同一个 Buffer（内面 pass 与表面 pass 绑同一个 id）。
-    if (auto s = upload_instances(&surface_buffer_, surface_instances_); !s.ok()) return s;
+    // ---- 3) 上传到本帧槽位 ----
+    //
+    // 槽位只算**一次**，表面与内面共用同一个 slot（两根环必须同槽）。
+    // 分开算两次看着也没错，但一旦 slot_for_frame 的语义将来变化（例如 L0 改成
+    // 非取模的分配策略），两次调用就可能落在不同槽上 —— 那种错位会表现为
+    // "内面用着别的帧的缓冲"，既不报错也难归因。
+    if (frame_sync_ == nullptr) {
+      return StackStatus::Fail(StackCode::OutOfGrid, "build_instances: 尚未 create_passes(无帧同步)");
+    }
+    const u32 slot = frame_sync_->slot_for_frame(frame_sync_->frame_index());
+    if (slot >= surface_ring_.size()) {
+      return StackStatus::Fail(StackCode::OutOfGrid,
+                               "build_instances: 槽号 " + std::to_string(slot) + " 超出环大小 " +
+                                   std::to_string(surface_ring_.size()));
+    }
+
+    // 顺序相同时表面与内面共用本槽的同一个 Buffer（内面 pass 绑同一个 id）。
+    // 用标志位而不是 reset 第二根环：环格一旦建出来就不再销毁，
+    // 销毁时机只由"该槽被下一轮覆盖且此前已 wait_slot"决定。
+    if (auto s = upload_instances(&surface_ring_[slot], surface_instances_); !s.ok()) return s;
+    inner_same_as_surface_[slot] = same_order;
     if (same_order) {
-      inner_buffer_.reset();  // 显式表明"不持有第二份"
-    } else if (auto s = upload_instances(&inner_buffer_, inner_instances_); !s.ok()) {
+      // 显式表明"本槽不持有第二份"：把该格旧的内面缓冲交出去。
+      // 这里立即析构是安全的 —— 它属于**同一个槽**，调用方在 record_frame
+      // 里已经先 wait_slot(slot) 等过该槽上一轮的提交。
+      inner_ring_[slot].reset();
+    } else if (auto s = upload_instances(&inner_ring_[slot], inner_instances_); !s.ok()) {
       return s;
     }
+    last_slot_ = slot;
 
     surface_hash_ = hash_instances(surface_instances_);
     inner_hash_ = hash_instances(inner_instances_);
@@ -354,9 +426,50 @@ class StackRenderer final : public IStackRenderer {
     if (passes_.surface_pass == nullptr || passes_.inner_pass == nullptr) {
       return StackStatus::Fail(StackCode::OutOfGrid, "record_frame: 尚未 create_passes");
     }
-    if (surface_buffer_ == nullptr || !vertex_buffer_id_.valid()) {
-      return StackStatus::Fail(StackCode::OutOfGrid, "record_frame: 尚未 build_instances");
+    // 本帧用的槽位。build_instances() 已经把实例写进 last_slot_，
+    // 这里重新按同一条公式求值一次并**核对**它与 last_slot_ 一致 ——
+    // 两者不一致意味着"上传到了 A 槽、渲染却绑 B 槽"，那是读错帧的缓冲，
+    // 画面会像是"上一帧的积木"，不崩也不报错。所以不一致即报错。
+    if (frame_sync_ == nullptr) {
+      return StackStatus::Fail(StackCode::OutOfGrid, "record_frame: 无帧同步");
     }
+    const u32 slot = frame_sync_->slot_for_frame(frame_sync_->frame_index());
+    if (slot >= surface_ring_.size()) {
+      return StackStatus::Fail(StackCode::OutOfGrid,
+                               "record_frame: 槽号 " + std::to_string(slot) + " 超出环大小 " +
+                                   std::to_string(surface_ring_.size()));
+    }
+    if (slot != last_slot_) {
+      return StackStatus::Fail(StackCode::OutOfGrid,
+                               "record_frame: 槽号不一致（上传写的是 " + std::to_string(last_slot_) +
+                                   "，录制要绑的是 " + std::to_string(slot) +
+                                   "）：帧号在 build_instances 与 record_frame 之间被推进了");
+    }
+    if (surface_ring_[slot] == nullptr || !vertex_buffer_id_.valid()) {
+      return StackStatus::Fail(StackCode::OutOfGrid, "record_frame: 本槽尚未 build_instances");
+    }
+
+    // ================= 槽位复用前的等待（本修复的安全支点） =================
+    //
+    // 在**绑定之前**等该槽上一轮的提交真正完成，然后才允许本帧引用它。
+    // 三个理由，缺一不可：
+    //   ① 为什么在绑定前而不是提交后：`record_frame` 契约上**不 submit**
+    //      （见 stack_render.h:229 与 UIG1/UIG2），提交权在调用方。若改到提交后等，
+    //      等于把 t19 刚做出来的异步提交又改回同步，正好抵消多帧并行的全部收益。
+    //      绑定前等则落在"录制窗口"里 —— CPU 本来就要录这一帧，等的代价≈0。
+    //   ② 为什么 N 帧延迟够：槽 s 在第 f 帧被占用，下一次被覆写是第 f+N 帧。
+    //      这里等的正是第 f 帧挂给槽 s 的那颗 fence（vulkan_device_frame.cpp:832
+    //      的 vkQueueSubmit(..., slot.in_flight)），它 signal ⟺ 第 f 帧命令缓冲
+    //      执行完成 ⟺ 对实例缓冲的读已结束。**间隔恰好 N 帧，正好差一代。**
+    //   ③ 为什么同时也在保护"销毁"：build_instances 里覆盖 ring[slot] 会析构
+    //      该格旧缓冲。上一轮走到这里时已经 wait 过，所以那时析构是安全的。
+    //      两根环同槽，因此这一等同时覆盖 surface 与 inner 两份。
+    if (auto ws = frame_sync_->wait_slot(slot); !ws.ok()) {
+      return StackStatus::Fail(StackCode::OutOfGrid,
+                               "record_frame: 等待槽 " + std::to_string(slot) +
+                                   " 上一轮提交完成失败: " + ws.message);
+    }
+
     if (surface_instances_.empty()) {
       return StackStatus::Fail(StackCode::EmptyStroke, "record_frame: 场景为空");
     }
@@ -388,10 +501,14 @@ class StackRenderer final : public IStackRenderer {
       CellOrder order;
     };
     // 表面 pass 绑真源下标序，内面 pass 绑 `(y,z,x)` 升序（D-VX-5）。
-    // 顺序相同（内面缓冲为空）时两者共用表面缓冲。
-    res::IBuffer* inner_buf = (inner_buffer_ != nullptr) ? inner_buffer_.get() : surface_buffer_.get();
+    // 顺序相同的槽上两道 pass 共用本槽的同一个缓冲（见 inner_same_as_surface_）。
+    res::IBuffer* inner_buf =
+        inner_same_as_surface_[slot] ? surface_ring_[slot].get() : inner_ring_[slot].get();
+    if (inner_buf == nullptr) {
+      return StackStatus::Fail(StackCode::OutOfGrid, "record_frame: 本槽内面实例缓冲为空");
+    }
     PassRec surf{passes_.surface_pass, passes_.surface_hash, true, "surface",
-                 surface_buffer_.get(), desc.surface_order};
+                 surface_ring_[slot].get(), desc.surface_order};
     PassRec inner{passes_.inner_pass, passes_.inner_hash, false, "inner", inner_buf,
                   desc.inner_order};
     PassRec order[2] = {surf, inner};
@@ -485,6 +602,9 @@ class StackRenderer final : public IStackRenderer {
     stats_.instances = n_inst;
     stats_.instance_buffer_bound = true;
     stats_.inner_order = desc.inner_order;
+    // 本帧内面 pass 是否真的绑了**独立**的内面实例缓冲（false = 复用表面缓冲）。
+    // 这是该字段唯一的写入点：语义"这一帧实际绑了什么"，不是"这一帧理论上该绑什么"。
+    stats_.inner_buffer_distinct = !inner_same_as_surface_[slot];
 
     // ---- 网格指示（需求「带网格指示」）----
     //
@@ -535,10 +655,20 @@ class StackRenderer final : public IStackRenderer {
   std::unique_ptr<mbp::IMeshFactory> mesh_factory_;
   std::unique_ptr<res::IBuffer> vertex_buffer_;
   std::unique_ptr<res::IBuffer> index_buffer_;
-  // 两份实例缓冲：表面序 与 内面序（D-VX-5）。
-  // 顺序相同时 inner_buffer_ 为空，record_frame 会退回用 surface_buffer_。
-  std::unique_ptr<res::IBuffer> surface_buffer_;
-  std::unique_ptr<res::IBuffer> inner_buffer_;
+  // 实例缓冲**帧槽环**（每槽一格，共 N = in_flight_count() 格）。
+  //
+  // 为什么是环而不是两个单缓冲：L0 的 submit 已异步化，单个缓冲每帧都得等
+  // GPU 画完才能复用，等于把并行又取消。N 格环让每个槽只在 N 帧后被覆写，
+  // 而那时该帧早已被 fence 确认完成（见 record_frame 里 wait_slot 的三条理由）。
+  //
+  // 两根环**同槽**：surface_ring_[s] 与 inner_ring_[s] 属于同一帧。
+  // 顺序相同的槽上内面 pass 复用表面缓冲，由 inner_same_as_surface_ 标记，
+  // 而不是把某根环的格子 reset 掉 —— 环格建出来就不再单独销毁。
+  std::vector<std::unique_ptr<res::IBuffer>> surface_ring_;
+  std::vector<std::unique_ptr<res::IBuffer>> inner_ring_;
+  std::vector<bool> inner_same_as_surface_;
+  device::IFrameSync* frame_sync_ = nullptr;  // 非拥有者，生命周期归 IRenderDevice
+  u32 last_slot_ = 0;                         // build_instances 写入的槽（record_frame 核对）
   res::ResourceId vertex_buffer_id_{};
   res::ResourceId index_buffer_id_{};
   std::uint32_t index_count_ = 0;

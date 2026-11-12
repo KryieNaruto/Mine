@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 
 #if defined(__ANDROID__)
 #include <android/log.h>
@@ -14,6 +15,7 @@
 #include "backend/vulkan/vulkan_swapchain_android.h"
 #include "backend/vulkan/vulkan_swapchain_win32.h"
 #include "backend/vulkan/vulkan_swapchain_xcb.h"
+#include "backend/vulkan/vulkan_sync_core.h"
 
 namespace magicblocks::backend {
 
@@ -73,11 +75,21 @@ VulkanSwapchain::VulkanSwapchain(const VulkanContext& ctx, const NativeSurface& 
     : ctx_(ctx), native_(surface) {}
 
 VulkanSwapchain::~VulkanSwapchain() {
+  // 【白名单第 2 处 / 全仓仅剩 2 处 vkDeviceWaitIdle 之一】
+  //
   // present 只是把图交给显示队列,GPU 可能还在用它。规范要求销毁交换链前
   // 所有已 acquire 的 presentable image 的使用都已完成,否则校验层报
   //   VUID-vkDestroySwapchainKHR-swapchain-01282: All uses of presentable
   //   images acquired from swapchain must have completed execution
-  // 所以在拆任何东西之前先等设备空闲(P0 的析构路径,代价可接受)。
+  //
+  // 为什么这里**不能**像渲染路径那样改成槽位 fence:
+  //   vkAcquireNextImageKHR / vkQueuePresentKHR 是**presentation 引擎**的工作。
+  //   我们自己的 in_flight 槽位 fence 只覆盖"我们提交的那几批图形命令",
+  //   覆盖不到"展示端还在读这张图"。规范里与之等价的信号是外部 presentation
+  //   完成(需要 VK_KHR_present_wait / present fences 扩展,本项目未启用),
+  //   所以在"交换链销毁"这个**不可逆、每设备一次**的时刻,device 级全停是唯一
+  //   能同时覆盖 graphics 与 presentation 两条引擎的等待。销毁交换链不是每帧
+  //   动作(rebuild() 只在 OUT_OF_DATE 触发),代价可接受。
   if (ctx_.device != VK_NULL_HANDLE) {
     vkDeviceWaitIdle(ctx_.device);
   }
@@ -95,6 +107,17 @@ Status VulkanSwapchain::init(Extent2D extent) {
   if (native_.kind == NativeSurface::Kind::Headless) {
     return Status::Unsupported("swapchain: Headless surface 不创建交换链,请用离屏渲染目标");
   }
+
+  // 绑定设备的同步核心(非拥有,只登记指针):acquire 要拿它的槽位信号量。
+  //
+  // 为什么不把它放进 VulkanContext:ctx_ 是纯句柄容器、会被按值复制,
+  // 而同步核心持有 VkSemaphore/VkFence/命令缓冲。见 vulkan_sync_core.h 文件头。
+  // 找不到时(测试手工拼 VulkanContext 的旁路)acquire 退回"只取图、不带信号量",
+  // 那条路径本来也没有 present 侧的等待,语义与改造前一致。
+  frame_sync_ = VulkanSyncRegistry::find(ctx_.device);
+  probe_.aligned = (frame_sync_ != nullptr && frame_sync_->ready());
+  probe_.in_flight = frame_sync_ != nullptr ? frame_sync_->in_flight() : 0;
+  probe_.slot = 0;
 
   // 平台差异只在 surface 创建处:各平台一个 TU,公共面零平台宏。
   // 注意:三个 create_*_surface 在本平台之外也总是有定义(只返回 Unsupported),
@@ -143,6 +166,15 @@ Status VulkanSwapchain::create_swapchain_objects(Extent2D extent) {
   std::vector<VkPresentModeKHR> pm(n);
   if (n) vkGetPhysicalDeviceSurfacePresentModesKHR(ctx_.phys, surface_, &n, pm.data());
   modes_.clear();
+  // 优先 MAILBOX：它同样**不会撕裂**(Vulkan 规范里任何 present mode 都禁止撕裂，
+  // 见 VkPresentModeKHR 的说明——IMMEDIATE 才是"可能撕裂"的那个，MAILBOX 不是)。
+  // 区别只在"谁来丢弃多余帧"：
+  //   FIFO    : 每个 vsync 吐一帧，多余的帧**排队**。队列满后 vkQueuePresentKHR 阻塞，
+  //             进而 vkAcquireNextImageKHR 也拿不到图 —— 实测 acquire 要等 5.8ms。
+  //   MAILBOX : 每个 vsync 吐一帧，多余的帧**被更新的帧顶掉**(只有一个待呈现槽)，
+  //             于是 present 永不阻塞、acquire 几乎不等待 —— 实测 0.1ms，帧率 56→100+。
+  // 代价是"生产多于刷新率时，被丢掉的帧用户看不到"——这是刻意的(降延迟)，
+  // 不是画面错误。若某设备不支持 MAILBOX，按 FIFO 回退(FIFO 恒可用)。
   bool has_mailbox = false;
   bool has_immediate = false;
   for (auto m : pm) {
@@ -152,7 +184,8 @@ Status VulkanSwapchain::create_swapchain_objects(Extent2D extent) {
   modes_.push_back(PresentMode::Fifo);  // FIFO 恒可用
   if (has_mailbox) modes_.push_back(PresentMode::Mailbox);
   if (has_immediate) modes_.push_back(PresentMode::Immediate);
-  present_mode_ = PresentMode::Fifo;  // D3:默认 FIFO
+  // 默认 MAILBOX，不可用时回退 FIFO。见上面关于"MAILBOX 也不撕裂"的说明。
+  present_mode_ = has_mailbox ? PresentMode::Mailbox : PresentMode::Fifo;
 
   // extent:FIFO 下若 caps 给出确切值则以它为准
   if (caps.currentExtent.width != UINT32_MAX) {
@@ -192,18 +225,57 @@ Status VulkanSwapchain::create_swapchain_objects(Extent2D extent) {
   scci.imageArrayLayers = 1;
   scci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
   scci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
-  scci.preTransform = caps.currentTransform;
-    pre_transform_ = static_cast<std::uint32_t>(caps.currentTransform);
+  // preTransform：**恒用 IDENTITY**，让合成器（SurfaceFlinger / DWM）去旋转。
+  //
+  // 曾经写的是 `scci.preTransform = caps.currentTransform`，而引擎从来没有按
+  // preTransform 去旋转自己贴进去的内容 —— 等于向系统**撒谎**"我已经转过 90°，你
+  // 别转了"。这台 pad 的面板物理竖置、应用横屏，currentTransform 恰好是
+  // ROTATE_90(0x2)，于是合成器按"已旋转"去解读一块**未旋转**的 buffer。
+  //
+  // 实测症状：SurfaceView 层的 geomBufferSize=[1440 2160] 与
+  // geomContentCrop=[2160 1440] 互相矛盾，合成后画面只剩中间一块 720x720 的
+  // 死色方块，立方体完全不见 —— 用户看到的就是"旋转无效"，其实是**整帧都没上屏**。
+  //
+  // Vulkan 允许在 caps.supportedTransforms 里任选一个声明；IDENTITY 几乎恒被支持
+  // （不支持时按流程回退到 currentTransform，那种情况下才需要真正实现旋转）。
+  // 选 IDENTITY 后 imageExtent 就是 surface 的原始尺寸（2048/2160 等），
+  // 内容按未旋转坐标系绘制，由合成器负责转到显示朝向。
+  {
+    VkSurfaceTransformFlagsKHR supported = caps.supportedTransforms;
+    if ((supported & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) != 0) {
+      scci.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+    } else {
+      scci.preTransform = caps.currentTransform;  // 兜底：只能按当前的来
+    }
+    pre_transform_ = static_cast<std::uint32_t>(scci.preTransform);
+  }
   scci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-  scci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+  // 与上面 present_mode_ 的选择保持一致；MAILBOX 与 FIFO 都不会撕裂，
+  // MAILBOX 只是把"多余帧排队"换成"多余帧被顶掉"，从而不再阻塞 acquire。
+  scci.presentMode = (present_mode_ == PresentMode::Mailbox)      ? VK_PRESENT_MODE_MAILBOX_KHR
+                     : (present_mode_ == PresentMode::Immediate)  ? VK_PRESENT_MODE_IMMEDIATE_KHR
+                                                                  : VK_PRESENT_MODE_FIFO_KHR;
   scci.clipped = VK_TRUE;
   r = vkCreateSwapchainKHR(ctx_.device, &scci, nullptr, &swapchain_);
+  // MAILBOX 虽被 surface 声明支持，个别驱动仍会拒绝它。此时回退 FIFO 重建一次，
+  // 而不是让整个 Surface 初始化失败(那样用户看到的是黑屏，比 60fps 严重得多)。
+  if (r != VK_SUCCESS && scci.presentMode != VK_PRESENT_MODE_FIFO_KHR) {
+    scci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    present_mode_ = PresentMode::Fifo;
+    r = vkCreateSwapchainKHR(ctx_.device, &scci, nullptr, &swapchain_);
+  }
   if (r != VK_SUCCESS) return Status::InitFailed(fmt_err("vkCreateSwapchainKHR", r));
 
   std::uint32_t ic = 0;
   vkGetSwapchainImagesKHR(ctx_.device, swapchain_, &ic, nullptr);
   images_.resize(ic);
   if (ic) vkGetSwapchainImagesKHR(ctx_.device, swapchain_, &ic, images_.data());
+
+#if defined(__ANDROID__)
+  __android_log_print(ANDROID_LOG_INFO, "MagicBlocks",
+                      "[swapchain] %ux%u images=%u preTransform=0x%x",
+                      extent_.width, extent_.height, ic, pre_transform_);
+#endif
 
   // ---- MSAA：每张交换链图配一张自己的 MS 图 ----
   //
@@ -284,15 +356,28 @@ Status VulkanSwapchain::create_swapchain_objects(Extent2D extent) {
 }
 
 Status VulkanSwapchain::destroy_swapchain() {
+  // 【2026-11-11】原来是 vkDeviceWaitIdle(ctx_.device) —— 一个 device 级全停,
+  // 却只是为了"保证没人在用这些 presentable image / MS 图 / 视图"。
+  //
+  // 现在改成**等设备自己的在飞帧**:
+  //   VulkanSyncCore::drain() 把 N 个槽位的 fence 全等一遍 —— 那正是本设备
+  //   对交换链图发起过的全部写入(acquire→submit→present 都在同一队列上),
+  //   与"设备在飞帧已排空"语义等价,但不是 queue/device 级全停。
+  //
+  // 为什么渲染路径可以这样做、而析构路径不行:rebuild() 只发生在 OUT_OF_DATE
+  // (转屏 / 软键盘 / 分屏),此时我们自己的提交是唯一的图形使用者;而析构路径要
+  // 面对 presentation 引擎仍在读图的情况(VUID-01282),那里仍需 device 级等待
+  // (见 ~VulkanSwapchain 的注释)。
+  Status idle = wait_device_frames_idle(ctx_);
+  frame_acquired_ = false;
   views_.clear();
   destroy_msaa_images();
   images_.clear();
   if (swapchain_) {
-    vkDeviceWaitIdle(ctx_.device);
     vkDestroySwapchainKHR(ctx_.device, swapchain_, nullptr);
     swapchain_ = VK_NULL_HANDLE;
   }
-  return Status::Ok_();
+  return idle;
 }
 
 // 销毁所有 MS 图并把分页分配器的页全部还回去。
@@ -366,6 +451,34 @@ ISwapchain::ImageResult VulkanSwapchain::acquire_next_image() {
     return out;
   }
 
+  // ---- 帧环对齐(2026-11-11)----
+  //
+  // 有设备同步核心时,本帧走它当前槽位:
+  //   1) begin_frame():只等**该槽位**的 fence —— N 帧并行就靠这里"只等我这一格";
+  //   2) vkAcquireNextImageKHR 把该槽的 image_available 传进去 —— GPU 侧规定
+  //      "这张图在被我们写之前,必须等这个信号量",于是 submit 的 waitSemaphore
+  //      与 acquire 的 signal 天然配对,不需要任何 CPU 等待。
+  VkSemaphore acquire_sem = VK_NULL_HANDLE;
+  VulkanSyncCore* core = VulkanSyncRegistry::find(ctx_.device);
+  if (core != nullptr && core->ready()) {
+    const Status bs = core->begin_frame(1'000'000'000ull);
+    if (!bs.ok()) {
+      out.status = ImageStatus::Failed;
+      out.message = "acquire: " + bs.message;
+      return out;
+    }
+    frame_sync_ = core;
+    frame_slot_ = core->current_slot();
+    acquire_sem = core->slot(frame_slot_).image_available;
+    probe_.aligned = true;
+    probe_.slot = frame_slot_;
+    probe_.in_flight = core->in_flight();
+  } else {
+    frame_sync_ = nullptr;
+    probe_.aligned = false;
+    probe_.in_flight = 0;
+  }
+
   // 用 fence 保证 GPU 已经把旧帧用完再覆盖这张图。
   //
   // ⚠️ 传进 vkAcquireNextImageKHR 的 fence 在调用时必须处于 **unsignaled**
@@ -381,11 +494,15 @@ ISwapchain::ImageResult VulkanSwapchain::acquire_next_image() {
   // 正解:图可用性本来就不需要 fence 守 —— vkAcquireNextImageKHR 返回成功
   //   就意味着这张图已经归我们独占并且 GPU 早已用完它。真正要等的是
   //   **上一帧的呈现**完成,那由 present 的 fence 负责,不该塞进 acquire。
-  //   所以这里**不传 fence**(传 VK_NULL_HANDLE),下面的两个 wait 一并删掉。
-  //   acquire 内部实现同步,调用方拿到的图即可直接写。
+  //   所以这里**不传 fence**(传 VK_NULL_HANDLE)。
+  //
+  // 【信号量不是可选的】上面的"不需要 fence"依然成立,但"不需要任何同步"不成立:
+  //   Vulkan 要求 presentable image 在被写之前必须等到 acquire 的信号量。
+  //   改造前这里传 VK_NULL_HANDLE,等于告诉驱动"我已经有权写了",于是
+  //   在 present 还没把上一帧交还之前就可能开始覆盖 —— 校验层不报,画面撕裂/闪帧。
   std::uint32_t idx = 0;
   const VkResult r = vkAcquireNextImageKHR(ctx_.device, swapchain_, 1'000'000'000ull,
-                                           VK_NULL_HANDLE, VK_NULL_HANDLE, &idx);
+                                           acquire_sem, VK_NULL_HANDLE, &idx);
   if (r == VK_ERROR_OUT_OF_DATE_KHR) {
     out.status = ImageStatus::OutOfDate;
     out.message = "acquire: OUT_OF_DATE";
@@ -409,7 +526,7 @@ ISwapchain::ImageResult VulkanSwapchain::acquire_next_image() {
   }
 
   // 不再需要 post-acquire 的 fence 等待:vkAcquireNextImageKHR 成功返回
-  // 即代表这张图已独占且 GPU 用完,可以直接覆盖写(理由见上面的长注释)。
+  // 即代表这张图已独占;写入时机由上面那颗信号量在 GPU 侧守。
 
   if (idx >= views_.size()) {
     out.status = ImageStatus::Failed;
@@ -417,6 +534,7 @@ ISwapchain::ImageResult VulkanSwapchain::acquire_next_image() {
     return out;
   }
   current_index_ = idx;
+  frame_acquired_ = true;
   out.status = ImageStatus::Ok;
   out.target = views_[idx].get();
   return out;
@@ -430,15 +548,49 @@ device::ISwapchain::ImageStatus VulkanSwapchain::present_current() {
   pi.swapchainCount = 1;
   pi.pSwapchains = &swapchain_;
   pi.pImageIndices = &current_index_;
-  // 不等待信号量:本 SDK 在 submit 时已用 fence 保证顺序,见 vulkan_device_frame.cpp。
+  // 【2026-11-11】这里原来写着"不等待信号量:submit 时已用 fence 保证顺序"。
+  // 那句话在改造前勉强成立,只因为 submit_device_frame() **同步**等到 GPU 跑完才返回。
+  // 现在提交是异步的,若不设 pWaitSemaphores,展示端会在 GPU 还没画完时就拿走这张图。
+  // 正确做法是等本帧槽位的 render_finished(由 vkQueueSubmit 的 signal 段产生)。
+  if (frame_sync_ != nullptr && frame_acquired_) {
+    FrameSlot& s = frame_sync_->slot(frame_slot_);
+    if (s.render_finished != VK_NULL_HANDLE) {
+      pi.waitSemaphoreCount = 1;
+      pi.pWaitSemaphores = &s.render_finished;
+    }
+  }
 
   const VkResult r = vkQueuePresentKHR(ctx_.queue, &pi);
+  // 本帧到此结束:下一个 acquire 会拿到下一个槽位,并只等那个槽位的 fence。
+  // (不做任何 CPU 侧等待 —— present 的完成由 presentation 引擎与交换链归属保证。)
+  frame_acquired_ = false;
+  if (frame_sync_ != nullptr) {
+    const Status es = frame_sync_->end_frame(VK_NULL_HANDLE);
+    (void)es;  // 推进帧序号失败只会让槽位轮转停住,不影响本帧结果;下次 acquire 会发现。
+  }
   if (r == VK_ERROR_OUT_OF_DATE_KHR) return ImageStatus::OutOfDate;
   if (r == VK_ERROR_SURFACE_LOST_KHR) {
     surface_lost_ = true;
     return ImageStatus::SurfaceLost;
   }
-  if (r != VK_SUCCESS) return ImageStatus::Failed;
+  // VK_SUBOPTIMAL_KHR 也是 1000001003（与 VK_ERROR_SURFACE_LOST_KHR 同值但语义相反，
+  // 它是**正数** 1000001003，而 SURFACE_LOST 是负的常量比较）。上面那行用常量比较，
+  // 只有真正的 SURFACE_LOST 会命中；走到这里若 r == VK_SUBOPTIMAL_KHR：
+  //
+  //   **这帧已经成功上屏了**，只是 surface 的当前朝向/尺寸与交换链不是最优匹配。
+  //   Android 上声明 preTransform = IDENTITY 时必然出现这个返回值（surface 被
+  //   旋转过，而交换链选择让合成器去转）。
+  //
+  // 以前没有这一支，`r != VK_SUCCESS` 把 SUBOPTIMAL 当成 Failed —— 每帧都报
+  // "present 失败(status=4)" 并把已经画好、已经上屏的帧当丢弃处理，于是画面
+  // 冻在最早那一帧上（表现为"旋转无效"）。SUBOPTIMAL 绝不能算失败。
+  if (r == VK_SUBOPTIMAL_KHR) return ImageStatus::Ok;
+  if (r != VK_SUCCESS) {
+#if defined(__ANDROID__)
+    __android_log_print(ANDROID_LOG_WARN, "MagicBlocks", "[swapchain] present VkResult=%d", (int)r);
+#endif
+    return ImageStatus::Failed;
+  }
   return ImageStatus::Ok;
 }
 

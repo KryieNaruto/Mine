@@ -43,11 +43,15 @@
 #include "core/image_io.h"
 
 #if defined(_WIN32)
+#include <process.h>  // _getpid
 #define MBG_POPEN _popen
 #define MBG_PCLOSE _pclose
+#define MBG_GETPID _getpid
 #else
+#include <unistd.h>  // getpid
 #define MBG_POPEN popen
 #define MBG_PCLOSE pclose
+#define MBG_GETPID getpid
 #endif
 
 namespace {
@@ -157,8 +161,54 @@ std::string golden_path(const char* name) {
   return std::string(MB_GOLDEN_DIR) + "/golden_l4_stack_" + name + ".png";
 }
 
+// 中间产物必须**带进程号**。
+//
+// 2026-11-11 实测：原先这里是纯固定名 `_out_l4_stack_golden_<name>.png`，
+// 而本文件的出图靠 `_popen` 拉起子进程。于是两份测试进程（并行 ctest、
+// 或两个构建目录同时跑）会写同一个文件：A 刚写完、B 的 std::remove 就把它删了，
+// A 再 load_png 就拿到空/半截图 → 偶发红。实测 8 个并发进程里 2 红，
+// 同一组用例单跑 20/20 全绿 —— 是测试自身的写冲突，不是渲染缺陷。
+//
+// 加进程号后每个进程各写各的，互不可见。绝不要为了"文件名好看"把它改回去。
+//
+// 【副作用与对策】带进程号意味着不再覆盖旧文件，中间产物会**累积**。
+// qa 实测多轮 j8/j16/全量跑之后 tests/data 里堆到 766 个 / 170.9 MB
+// （已被 .gitignore 的 `_out_*.png` 挡住，不污染仓库，但会持续吃盘）。
+// 所以下面登记本进程写过的每个路径，进程退出时统一删掉 ——
+// 不依赖"谁记得手动清"，也不需要额外的 ctest 清理脚本。
+//
+// 【为什么是"永不析构"的指针而不是普通的函数内 static 对象】
+// atexit 回调与静态局部对象的析构注册在**同一张退出表**里，后注册者先执行。
+// 而这里的 vector 是在 arm_tmp_cleanup() **之后**才首次构造的（arm 里只碰了
+// 另一个 static bool），于是它的析构比 atexit 回调后注册、也就先执行 ——
+// 回调真正跑起来时列表已经被析构清空，std::remove 一个都删不到。
+// 实测就是这个现象：push 时 size=1/2/3，atexit 里恒为 0，文件全部残留。
+// 故意让容器永不析构（进程退出时由 OS 回收），把它的寿命拉到所有 atexit
+// 回调之后。代价是 sizeof(vector) 的常量泄漏，收益是清理真的会发生。
+std::vector<std::string>& process_tmp_files() {
+  static std::vector<std::string>* files = new std::vector<std::string>();
+  return *files;
+}
+
+void remove_process_tmp_files() {
+  for (const auto& f : process_tmp_files()) std::remove(f.c_str());
+  process_tmp_files().clear();
+}
+
+void arm_tmp_cleanup() {
+  static bool armed = false;
+  if (armed) return;
+  armed = true;
+  std::atexit(&remove_process_tmp_files);
+}
+
 std::string tmp_path(const char* name) {
-  return std::string(MB_TEST_DATA_DIR) + "/_out_l4_stack_golden_" + name + ".png";
+  arm_tmp_cleanup();
+  const auto pid = static_cast<unsigned long>(MBG_GETPID());
+  std::string p = std::string(MB_TEST_DATA_DIR) + "/_out_l4_stack_golden_" + name + "_" +
+                  std::to_string(pid) + ".png";
+  process_tmp_files().push_back(p);
+  return p;
 }
 
 // 一次完整的「跑 CLI → 结构断言 → 与 golden 比像素」。

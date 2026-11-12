@@ -67,7 +67,7 @@ struct DeviceDesc {
   bool enable_validation = true;       // 打开校验层(默认开:验证层消息是默认能力)
   bool request_rev_z = false;          // 请求 reverse-Z(能力不足即 Unsupported)
   u32 requested_msaa = 1;              // 请求 MSAA 采样数(不在 supported_msaa_levels 即 Unsupported)
-  u32 in_flight_frames = 2;            // 帧环大小,必须 ∈ {2,3}
+  u32 in_flight_frames = 3;            // 帧环大小,必须 ∈ {2,3}
   // 软件光栅强筛:true 时只接受 is_software_rasterizer 的设备,
   // 否则 CreateRenderDevice 返回 Unsupported(绝不回退到物理 GPU)。
   bool require_software_rasterizer = true;

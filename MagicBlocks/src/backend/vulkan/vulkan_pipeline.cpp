@@ -6,6 +6,8 @@
 #include <set>
 
 #include "backend/vulkan/vulkan_resource_common.h"
+// 析构里的"销毁前排空在飞帧"需要 wait_device_frames_idle(见 ~VulkanPipeline)。
+#include "backend/vulkan/vulkan_sync_core.h"
 
 namespace magicblocks::backend {
 
@@ -410,8 +412,18 @@ VulkanPipeline::VulkanPipeline(const VulkanContext& ctx, const PipelineDesc& des
     : ctx_(ctx), has_ctx_(true), desc_(desc), shape_(shape) {}
 
 VulkanPipeline::~VulkanPipeline() {
-  if (ctx_.device != VK_NULL_HANDLE) {
-    if (vk_pipeline_ != VK_NULL_HANDLE) vkDestroyPipeline(ctx_.device, vk_pipeline_, nullptr);
+  // 【必须先等本设备已提交的帧跑完】
+  //
+  // 管线会在**命令录制期**被 vkCmdBindPipeline 引用,而那些命令缓冲的提交是
+  // 异步的(多帧并行)。管线在这里被销毁时,GPU / 驱动侧可能还在执行引用它的
+  // 命令 —— 校验层直接报 VUID-vkDestroyPipeline-pipeline-00765,随后驱动在
+  // 内部表里踩到已释放的 VkPipeline(实测 SEH 0xC0000005,崩在一条毫不相干的语句上)。
+  //
+  // 用 wait_device_frames_idle(排空 N 个槽位 fence)而不是 vkDeviceWaitIdle:
+  // 前者只等**本设备登记过的那几次提交**,后者会把 queue 上一切外来的工作也停住。
+  // 这里不是热路径(管线销毁是装配期/用例结束),代价可接受。
+  if (ctx_.device != VK_NULL_HANDLE) (void)wait_device_frames_idle(ctx_);
+  if (ctx_.device != VK_NULL_HANDLE) {    if (vk_pipeline_ != VK_NULL_HANDLE) vkDestroyPipeline(ctx_.device, vk_pipeline_, nullptr);
     if (vk_layout_ != VK_NULL_HANDLE) vkDestroyPipelineLayout(ctx_.device, vk_layout_, nullptr);
     if (vk_render_pass_ != VK_NULL_HANDLE) {
       vkDestroyRenderPass(ctx_.device, vk_render_pass_, nullptr);
@@ -662,14 +674,43 @@ Status VulkanPipeline::create_render_pass() {
   // create_pass()(vulkan_device_frame.cpp)与这里必须保持一致:
   // 设备帧提交会优先复用**管线自带的 render pass**(见 BeginPass 回放分支),
   // 所以两条路径的依赖缺失会得到两种不同行为,更难排查。
+  //
+  // ⚠️ 而且 render pass **兼容性**本身就把 dependencyCount 算进去了:
+  // 校验层原文 `vkCmdDraw(): dependencyCount is incompatible between
+  // VkRenderPass ... and VkRenderPass ... (2 != 1)`(VUID-vkCmdDraw-renderPass-02684)。
+  // 也就是说"管线自带 pass 与 create_pass 的依赖条数不同"会让 vkCmdDraw
+  // 直接被判成不兼容 —— 画面静默变空。所以这里**必须逐条对齐 create_pass**:
+  // 入口依赖(EXTERNAL→0)+ 出口依赖(0→EXTERNAL)。
   VkSubpassDependency dep{};
   dep.srcSubpass = VK_SUBPASS_EXTERNAL;
   dep.dstSubpass = 0;
-  dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-  dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+  // 入口:srcStage 从 TOP_OF_PIPE 起,上游可能是 TRANSFER 或别的 pass 的颜色写。
+  dep.srcStageMask = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+  dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                     VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                     VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
   dep.srcAccessMask = 0;
   dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+  if (shape_.has_depth) {
+    // 与 create_pass 同口径:深度清屏/深度写的可见性。
+    dep.dstAccessMask |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                         VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+  }
   dep.dependencyFlags = 0;
+  // 出口:pass 末尾的写(含 MSAA resolve)对后续 TRANSFER_READ / present 可见。
+  VkSubpassDependency deps[2] = {};
+  deps[0] = dep;
+  deps[1].srcSubpass = 0;
+  deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+  deps[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+  deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+  deps[1].dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+  deps[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+  if (shape_.has_depth) {
+    deps[1].srcStageMask |= VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    deps[1].srcAccessMask |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+  }
+  deps[1].dependencyFlags = 0;
 
   VkRenderPassCreateInfo rpci{};
   rpci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
@@ -677,8 +718,8 @@ Status VulkanPipeline::create_render_pass() {
   rpci.pAttachments = atts;
   rpci.subpassCount = 1;
   rpci.pSubpasses = &sub;
-  rpci.dependencyCount = 1;
-  rpci.pDependencies = &dep;
+  rpci.dependencyCount = 2;
+  rpci.pDependencies = deps;
   const VkResult r = vkCreateRenderPass(ctx_.device, &rpci, nullptr, &vk_render_pass_);
   if (r != VK_SUCCESS) return Status::InitFailed(fmt_err("vkCreateRenderPass(管线)", r));
   return Status::Ok_();

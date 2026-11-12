@@ -16,9 +16,24 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
+#include <iostream>
+#include <memory>
 #include <set>
 #include <vector>
+
+// 负控要直接观测帧槽退休栈（sync_core_impl()->slot(i).retire），
+// 这两个是 backend 的内部头 —— 只有测试会用到，生产代码不依赖它们。
+//
+// ⚠️ 必须先定义 NOMINMAX：backend 头会间接拉进 windows.h，
+// 它的 `min`/`max` 宏会把本文件里既有的 `std::min` / `std::max` 打成 C2589。
+// 本仓其它包含 backend 头的测试（magicblocks_l1_test.cpp）也踩过同一个坑。
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include "backend/vulkan/vulkan_render_device.h"
+#include "backend/vulkan/vulkan_sync_core.h"
 
 #include "magicblocks/features/stack/block_brush.h"
 #include "magicblocks/features/stack/color_mode.h"
@@ -2003,11 +2018,15 @@ TEST(ShapeTemplate, ExpandOutOfGridFailsWithoutClipping) {
 namespace {
 
 #if defined(_WIN32)
+#include <process.h>  // _getpid
 #define MB6_POPEN _popen
 #define MB6_PCLOSE _pclose
+#define MB6_GETPID _getpid
 #else
+#include <unistd.h>  // getpid
 #define MB6_POPEN popen
 #define MB6_PCLOSE pclose
+#define MB6_GETPID getpid
 #endif
 
 // 跑 l3-cli 的 stack 子命令。cmd.exe 的引号规则与 sketch 那边一致：
@@ -2039,8 +2058,45 @@ bool is_png_signature(const std::string& bytes) {
   return bytes.size() > 8 && std::memcmp(bytes.data(), sig, 8) == 0;
 }
 
+// 中间产物必须**带进程号**（与 magicblocks_l4_stack_golden_test.cpp 同一根因）。
+// 固定文件名 + _popen 子进程 ⇒ 两个测试进程会写同一路径、互相 remove/覆盖，
+// 偶发红。2026-11-11 实测 8 并发 2 红、单跑 20/20 绿。别改回固定名。
+//
+// 带进程号的副作用是旧文件不再被覆盖，产物会累积（qa 实测堆到 766 个 / 170.9 MB）。
+// 所以登记本进程写过的路径，进程退出时统一删。
+//
+// 【为什么是"永不析构"的指针而不是普通的函数内 static 对象】
+// atexit 回调与静态局部对象的析构注册在**同一张退出表**里，后注册者先执行。
+// 而这里的 vector 是在 arm_tmp_cleanup() **之后**才首次构造的（arm 里只碰了
+// 另一个 static bool），于是它的析构比 atexit 回调后注册、也就先执行 ——
+// 回调真正跑起来时列表已经被析构清空，std::remove 一个都删不到。
+// 实测就是这个现象：push 时 size=1/2/3，atexit 里恒为 0，文件全部残留。
+// 故意让容器永不析构（进程退出时由 OS 回收），把它的寿命拉到所有 atexit
+// 回调之后。代价是 sizeof(vector) 的常量泄漏，收益是清理真的会发生。
+std::vector<std::string>& process_tmp_files() {
+  static std::vector<std::string>* files = new std::vector<std::string>();
+  return *files;
+}
+
+void remove_process_tmp_files() {
+  for (const auto& f : process_tmp_files()) std::remove(f.c_str());
+  process_tmp_files().clear();
+}
+
+void arm_tmp_cleanup() {
+  static bool armed = false;
+  if (armed) return;
+  armed = true;
+  std::atexit(&remove_process_tmp_files);
+}
+
 std::string stack_png(const char* name) {
-  return std::string(MB_TEST_DATA_DIR) + "/_out_l4_stack_" + name + ".png";
+  arm_tmp_cleanup();
+  const auto pid = static_cast<unsigned long>(MB6_GETPID());
+  std::string p = std::string(MB_TEST_DATA_DIR) + "/_out_l4_stack_" + name + "_" +
+                  std::to_string(pid) + ".png";
+  process_tmp_files().push_back(p);
+  return p;
 }
 
 }  // namespace
@@ -2661,5 +2717,341 @@ TEST(StackCellOrder, InnerBufferIsDistinctWhenOrdersDiffer) {
       EXPECT_EQ(r->surface_cells()[i].y, r->inner_cells()[i].y);
       EXPECT_EQ(r->surface_cells()[i].z, r->inner_cells()[i].z);
     }
+  }
+}
+
+// ============================================================================
+// 实例缓冲帧槽环：UAF 修复的**主证据**
+// ============================================================================
+//
+// 背景（详见 src/features/stack/stack_render.cpp 的 upload_instances 注释）：
+// 改造前 upload_instances() 第一行是无条件 `slot->reset()`，在 L0 的 submit
+// 异步化之后会在"上一帧已提交、GPU 可能仍在读"时销毁 VkBuffer。
+// 由于 build_instances() 在所有调用点上都先于本帧 submit，这是**严格帧序**
+// 的必现 UAF，不是竞态；SwiftShader 太快所以此前从未崩出症状。
+//
+// 修复后：实例缓冲按 in_flight_count() 建 N 格环，每帧用 slot_for_frame(frame_index())
+// 选格，并在绑定前 wait_slot(slot) 等该槽上一轮的提交完成。
+//
+// 下面这条用例是**唯一**能证明"槽真的被复用"的形态：连出 N+1 帧。
+// 第 N+1 帧必然回到第 1 帧用过的槽 —— 少一帧就撞不到复用点，
+// 那种用例会恒绿但什么都没验到。
+
+namespace {
+
+// 连出 frames 帧，每帧都用**同一个 renderer**（因此共用同一个帧槽环），
+// 返回每一帧的像素。任何一帧失败返回空 vector。
+std::vector<std::vector<std::uint8_t>> render_frames_shared_renderer(
+    dev::IRenderDevice* device, mbst::IStackRenderer& r, const mbst::IBlockSet& set,
+    const mbst::GridSpec& g, int w, int h, const mbp::ICamera& cam, int frames) {
+  std::vector<std::vector<std::uint8_t>> out;
+  for (int f = 0; f < frames; ++f) {
+    dev::TargetDesc td;
+    td.kind = dev::TargetDesc::Kind::Offscreen;
+    td.extent.width = static_cast<std::uint32_t>(w);
+    td.extent.height = static_cast<std::uint32_t>(h);
+    td.samples = 1;
+    td.with_depth = true;
+    auto tgt = device->create_offscreen_target(td);
+    if (!tgt.ok()) return {};
+
+    if (!r.build_instances(g, set)) return {};
+
+    auto cl = device->create_command_list();
+    if (!cl.ok()) return {};
+
+    mbst::StackFrameDesc fd{};
+    fd.set = &set;
+    fd.width = static_cast<std::uint32_t>(w);
+    fd.height = static_cast<std::uint32_t>(h);
+    fd.clear_color[0] = 0.05f;
+    fd.clear_color[1] = 0.07f;
+    fd.clear_color[2] = 0.10f;
+    fd.clear_color[3] = 1.0f;
+    fd.inner_pass_enabled = true;
+    std::memcpy(fd.view_proj, cam.view_proj_matrix().m, sizeof(float) * 16);
+
+    if (!r.record_frame(*cl.value(), tgt.value().get(), fd)) return {};
+    if (!device->submit_command_list(*cl.value()).ok()) return {};
+
+    std::vector<std::uint8_t> px(static_cast<std::size_t>(w) * h * 4, 0u);
+    if (!tgt.value()->readback_rgba8(px.data(), px.size()).ok()) return {};
+    out.push_back(std::move(px));
+  }
+  return out;
+}
+
+}  // namespace
+
+// 连出 N+1 帧：**必然**触发一次槽复用（第 N+1 帧回到第 1 帧的槽）。
+//
+// 断言三件事，缺一不可：
+//   ① 每帧都成功（没有在复用点崩掉）；
+//   ② N+1 帧像素**逐字节完全相同** —— 槽复用后读到的仍是本帧数据，
+//      而不是"上一轮残留"。若环格串了帧，这里会出现花屏/旧帧积木；
+//   ③ 每帧恰好 2 个 draw —— 复用没有吞帧、没有少画 pass；
+//      且 N+1 帧能全程走通本身就证明环是按 L0 的 N 建的
+//      （`create_passes` 在 `in_flight_count() < 2` 时直接 Fail，
+//      见 stack_render.cpp:178-215，不存在 N=1 的单缓冲退化路径）。
+//
+// **本用例能证什么、不能证什么，见 ② 内部的长注释** —— 它抓不到"旧缓冲提前销毁"
+// 那个 UAF（验证见负控用例与 SyncModel.BufferLifecycleAcrossFrameRing）。
+TEST(StackInstanceSlotRing, ReusesSlotAfterNFramesWithoutCorruption) {
+  auto dev_r = dev::create_render_device(software_desc());
+  ASSERT_TRUE(dev_r.ok()) << dev_r.message();
+  auto device = std::move(dev_r).take();
+  ASSERT_NE(device, nullptr);
+  ASSERT_TRUE(reserve_pages(device.get())) << "预取显存页失败";
+
+  // 帧环大小 N 从设备读，**不写死** —— 契约允许 2 或 3。
+  dev::IFrameSync* fs = device->frame_sync();
+  ASSERT_NE(fs, nullptr) << "设备没有帧同步对象，实例缓冲环无处建立";
+  const std::uint32_t n = fs->in_flight_count();
+  ASSERT_GE(n, 2u) << "in_flight_count()=" << n
+                   << "，N<2 时绑定发生在 submit 之前、fence 仍 signaled，"
+                      "wait_slot 会立即返回，单缓冲必然 UAF";
+  ASSERT_LE(n, 3u) << "in_flight_count()=" << n << " 超出契约(2|3)";
+
+  const int W = 160, H = 120;
+  std::unique_ptr<mbp::ICamera> cam = make_oblique_camera(W, H);
+  ASSERT_NE(cam, nullptr);
+
+  mbst::GridSpec g = render_grid();
+  std::unique_ptr<mbst::IBlockSet> set = build_column(g);
+  ASSERT_NE(set, nullptr);
+
+  auto r = mbst::create_stack_renderer();
+  ASSERT_NE(r, nullptr);
+  auto st = r->create_passes(device.get(), 1);
+  ASSERT_TRUE(st) << "create_passes 失败: " << st.text();
+
+  // N+1 帧：第 N+1 帧一定落回第 1 帧用过的槽。
+  const int frames = static_cast<int>(n) + 1;
+  r->reset_stats();
+  const auto all = render_frames_shared_renderer(device.get(), *r, *set, g, W, H, *cam, frames);
+  ASSERT_EQ(all.size(), static_cast<std::size_t>(frames))
+      << "只成功渲染了 " << all.size() << " / " << frames << " 帧（复用点崩溃或失败）";
+
+  // ① 每帧都非空且尺寸正确。
+  for (int i = 0; i < frames; ++i) {
+    ASSERT_EQ(all[static_cast<std::size_t>(i)].size(), static_cast<std::size_t>(W) * H * 4)
+        << "第 " << i << " 帧读回尺寸不对";
+  }
+
+  // 先确认画面上**确实有东西**，否则 N+1 张全黑图逐字节相等，等于空过。
+  const std::uint8_t bg[3] = {13, 18, 26};
+  {
+    const auto& px = all[0];
+    std::size_t fg = 0;
+    for (std::size_t i = 0; i + 3 < px.size(); i += 4) {
+      if (px[i] != bg[0] || px[i + 1] != bg[1] || px[i + 2] != bg[2]) ++fg;
+    }
+    ASSERT_GT(fg, 200u) << "前景像素只有 " << fg << " 个，像素比较会退化成空过";
+  }
+
+  // ② 逐字节比较：第 1 帧（槽 s 首次占用）vs 第 N+1 帧（同一槽被复用后）。
+  //
+  // **这条能证什么、不能证什么必须写清楚**（实测得出，别照着注释想当然）：
+  //   能证：槽复用之后画出来的仍是本帧的实例数据 —— 环格没有串到别的帧、
+  //         没有读到上一轮残留、`inner_same_as_surface_` 的标记没有错位。
+  //   不能证：它**抓不到**"旧缓冲提前销毁"这个 UAF。原因有两层，缺一层都不成立：
+  //     ① `upload_instances()` → `flush_pending()` → `flush_pending_device_pages()`
+  //        → `submit_once_sync()`（vulkan_resource_common.h:105）内部是
+  //        `vkWaitForFences(..., UINT64_MAX)`：实例缓冲的**写入**本身就同步排空队列；
+  //     ② `~VulkanBuffer`（vulkan_buffer.cpp:106-112）见到 `retire_ref_.use_count() > 1`
+  //        时只放掉自己那份引用，真正的 `vkDestroyBuffer` 交给帧槽退休栈
+  //        （`FrameRetireList::destroy_all`，vulkan_sync_core.cpp:71-78）在
+  //        该槽 fence 信号之后做。
+  //   所以"销毁提前"在这里表现为**像素不变 + 不报错**。
+  //   实测：把 `record_frame` 里的 `wait_slot(slot)` 整段删掉重新构建，
+  //   本用例依然全绿 —— 即本用例对那个变异**没有判别力**。
+  //   真正的判据在负控用例
+  //   `StackInstanceSlotRing.NegativeControlDetectsDestroyWhileInFlight`
+  //   （观测帧槽退休栈是否接管了缓冲）与 `SyncModel.BufferLifecycleAcrossFrameRing`。
+  {
+    const auto& first = all[0];
+    const auto& reused = all[static_cast<std::size_t>(n)];
+    std::size_t first_diff = first.size();
+    for (std::size_t i = 0; i < first.size(); ++i) {
+      if (first[i] != reused[i]) { first_diff = i; break; }
+    }
+    if (first_diff != first.size()) {
+      const std::size_t px = first_diff / 4;
+      FAIL() << "槽复用后画面与首轮不一致：第 1 帧与第 " << (n + 1) << " 帧(同一槽)在 ("
+             << (px % W) << "," << (px / W) << ") 通道 " << (first_diff % 4)
+             << " 不同  首帧=" << static_cast<int>(first[first_diff])
+             << " 复用帧=" << static_cast<int>(reused[first_diff])
+             << "  —— 环格串了帧(读到了别的帧/残留的实例数据)";
+    }
+  }
+
+  // ③ 环确实建起来了、且与 L0 的 in-flight 数同源（不另立账）。
+  //
+  // 这里**不**用"wait_slot 调用次数"当判据：那个计数原本要加进公开头
+  // `StackRenderStats`，而 `include/` 不在本任务的 inScope 内，为了不越界
+  // 私自扩公开面，已把它撤掉（实现里也不再加）。改成钉住**已经公开的**事实：
+  //
+  //   ① `create_passes` 在 `in_flight_count() < 2` 或拿不到 frame_sync 时直接 Fail
+  //      （stack_render.cpp:178-215）—— 所以本用例能走到这里，就已经证明
+  //      "环是按 L0 的 N 建的"，不存在 N=1 的单缓冲退化路径；
+  //   ② 每帧恰好 2 个 draw（表面 + 内面）—— 环复用没有吞帧、没有少画 pass；
+  //   ③ N+1 帧全部成功且画面一致（②）—— 若环大小 < N，"第 N+1 帧复用未等待的槽"
+  //      会在这里表现为失败或错格。
+  EXPECT_EQ(r->stats().draw_calls, static_cast<std::uint32_t>(frames) * 2u)
+      << "每帧应当恰好 2 个 draw（表面 + 内面），共 " << (frames * 2)
+      << "；不等说明有帧少画/多画了 pass";
+
+  // ④ 每帧确实是"同槽同帧"—— build_instances 与 record_frame 的槽号交叉校验
+  //    （slot != last_slot_ ⇒ Fail）没有在本用例里被触发，否则上面的 render 会返回空。
+  EXPECT_EQ(r->surface_cells().size(), r->inner_cells().size())
+      << "表面序与内面序格子数不等，pad/排序逻辑分叉";
+}
+
+// ---------------------------------------------------------------------------
+// 负控：证明上面那条"全绿"不是恒绿
+// ---------------------------------------------------------------------------
+//
+// 用**构造的坏路径**证明"环+等待"这套机制真的在起作用，而不是恰好本仓调用顺序
+// 碰巧安全。这套设计来自 t22 评审：任何"修好了"的断言，必须同时存在一个
+// "如果退回旧写法就必红"的对照，否则无法区分"修好了"与"本来就没事"。
+//
+// **这条用例进默认跑批**（不设环境变量也跑）。它不会污染任何统计 ——
+// 判据是「本帧槽的退休栈里有没有那张票据」（:2997），**不看**校验层 VUID 条数；
+// 校验层报错只在 :3010 作附加观测，`after == before` 时仅打一行提示、不失败。
+//
+// 历史：它曾经默认关闭，理由是"故意制造校验层错误会污染 validation_error_count"。
+// 那个理由在三版返工把判据从"报错数"改成"退休栈票据"之后就已经失效了 ——
+// 判据换了，默认跳过却忘了跟着删。现在已删，本文件内无任何 skip 调用。
+TEST(StackInstanceSlotRing, NegativeControlDetectsDestroyWhileInFlight) {
+  // 负控**必须**在校验层打开的设备上做：error_count 是**按实例**记账的
+  // （vulkan_instance.h:14），software_desc() 里 enable_validation=false，
+  // 而校验层只在开启时才被附加（vulkan_instance.cpp:115-121）。
+  // 这里仍要求校验层真的开起来 —— 不是因为判据依赖它，而是"以为开了其实没开"
+  // 会让 :3010 那行附加观测变成无意义的自说自话。按纪律报错，不静默降级。
+  dev::DeviceDesc d = software_desc();
+  d.enable_validation = true;
+  auto dev_r = dev::create_render_device(d);
+  ASSERT_TRUE(dev_r.ok()) << dev_r.message();
+  auto device = std::move(dev_r).take();
+  ASSERT_NE(device, nullptr);
+  ASSERT_TRUE(device->validation_enabled())
+      << "校验层没能开起来（VK_LAYER_KHRONOS_validation 不可用？）。"
+         "负控在这种情况下**不成立**：没有校验层就没有 VUID，"
+         "本用例无法区分'机制生效'与'机制是死代码'——按纪律报错，不静默降级";
+  ASSERT_TRUE(reserve_pages(device.get())) << "预取显存页失败";
+
+  // 基准：先确认"正确的调用顺序"下校验层是干净的。
+  // 否则后面那条 ASSERT_GT 可能只是在数别的既有错误，与负控无关。
+  const std::uint32_t before = device->validation_error_count();
+
+  const int W = 96, H = 72;
+  std::unique_ptr<mbp::ICamera> cam = make_oblique_camera(W, H);
+  ASSERT_NE(cam, nullptr);
+  mbst::GridSpec g = render_grid();
+  std::unique_ptr<mbst::IBlockSet> set = build_column(g);
+  ASSERT_NE(set, nullptr);
+
+  const std::uint32_t n = device->frame_sync()->in_flight_count();
+  ASSERT_GE(n, 2u);
+  const int frames = static_cast<int>(n) + 1;
+
+  auto r = mbst::create_stack_renderer();
+  ASSERT_NE(r, nullptr);
+  auto st = r->create_passes(device.get(), 1);
+  ASSERT_TRUE(st) << "create_passes 失败: " << st.text();
+
+  // ---- 坏路径：让一块实例缓冲在 **GPU 可能仍在读** 时被销毁，然后检查
+  //      "谁接管了它的销毁" ----
+  //
+  // 这条负控的判据**不是**"校验层报不报错"，而是**退休栈里有没有它的票据**。
+  // 为什么（三版试错的结论，别重蹈覆辙）：
+  //   ① 直接调 `r->record_frame(...)` 再析构 ⇒ 里面已先 `wait_slot(slot)` 排空队列，
+  //      GPU 早空闲，构不成 UAF。实测 before=0/after=0。
+  //   ② 手搓 bind→draw→submit 且不补 binding 0 / push constant ⇒ 校验层报的是
+  //      VUID-vkCmdDraw-None-04007（没绑 binding 0）与
+  //      VUID-vkCmdDraw-None-08601（没设 push constant），进程直接 0xC0000005。
+  //      **报的错是真的，但不是我要证的靶心** —— 拿它当"UAF 被拦住了"是错判。
+  //   ③ 真正的靶心是：提交时 `vulkan_render_device.cpp:837-849` 会把**本帧真的
+  //      绑定给 GPU 的**缓冲的票据压进当前槽的退休栈，`~VulkanBuffer`
+  //      （vulkan_buffer.cpp:106-112）据此**推迟** `vkDestroyBuffer`。
+  //      所以判据应当是"退休栈里确实多了这个句柄"，而不是"有没有报错"——
+  //      SwiftShader 对已删除 VkBuffer 的读取不一定报 VUID（实测 0 条 ERROR），
+  //      用报错数当判据在这台设备上是**恒假**的。
+  //
+  // 前置条件要补齐，否则报的是别的 VUID：binding 0（网格顶点）与 push constant
+  // 都由 `record_frame` 先准备好，我们只在它之后追加一块临时实例缓冲。
+  ASSERT_NE(r->passes().surface_pass, nullptr);
+  auto* vkdev = dynamic_cast<magicblocks::backend::VulkanRenderDevice*>(device.get());
+  ASSERT_NE(vkdev, nullptr) << "需要后端子类才能检查退休栈";
+  auto* core = vkdev->sync_core_impl();
+  ASSERT_NE(core, nullptr) << "同步核心不可用，退休栈无处可查";
+
+  for (int f = 0; f < frames; ++f) {
+    dev::TargetDesc td;
+    td.kind = dev::TargetDesc::Kind::Offscreen;
+    td.extent.width = static_cast<std::uint32_t>(W);
+    td.extent.height = static_cast<std::uint32_t>(H);
+    td.samples = 1;
+    td.with_depth = true;
+    auto tgt = device->create_offscreen_target(td);
+    ASSERT_TRUE(tgt.ok()) << tgt.message();
+
+    ASSERT_TRUE(r->build_instances(g, *set));
+
+    auto cl = device->create_command_list();
+    ASSERT_TRUE(cl.ok()) << cl.message();
+
+    mbst::StackFrameDesc fd{};
+    fd.set = set.get();
+    fd.width = static_cast<std::uint32_t>(W);
+    fd.height = static_cast<std::uint32_t>(H);
+    fd.clear_color[3] = 1.0f;
+    fd.inner_pass_enabled = true;
+    std::memcpy(fd.view_proj, cam->view_proj_matrix().m, sizeof(float) * 16);
+    // record_frame 会把 binding 0 / push constant / 两个 pass 都录好，
+    // 于是本帧的"合法部分"是干净的 —— 后面只看那块额外缓冲的去向。
+    ASSERT_TRUE(r->record_frame(*cl.value(), tgt.value().get(), fd));
+
+    // 一块额外缓冲：在 record_frame 之后**插进同一份命令列表**并绑定，
+    // 这样它也会进 stats.buffers，从而被退休栈接管。
+    res::BufferDesc bd;
+    bd.size = 256ull * 128ull;
+    bd.usage = res::BufferUsage::Vertex;
+    auto tmp_buf = device->create_buffer(bd);
+    ASSERT_TRUE(tmp_buf.ok()) << tmp_buf.message();
+    std::unique_ptr<res::IBuffer> evil = std::move(tmp_buf).take();
+    ASSERT_NE(evil, nullptr);
+    // 绑定到 binding 1（实例属性），不额外增删 draw —— 本帧的 draw 已由 record_frame 录好。
+    ASSERT_TRUE(cl.value()->bind_vertex_buffer(evil->id(), 1, 0).ok())
+        << "bind_vertex_buffer(binding=1) 失败";
+
+    ASSERT_TRUE(device->submit_command_list(*cl.value()).ok()) << "submit 失败";
+
+    // 提交后立刻查本帧槽的退休栈 —— 必须在 evil 析构**之前**看，
+    // 因为票据是提交时压进去的。
+    const std::uint32_t slot_now = core->last_submitted_slot();
+    ASSERT_LT(slot_now, core->slot_count());
+    const bool retire_has_something = !core->slot(slot_now).retire.empty();
+    EXPECT_TRUE(retire_has_something)
+        << "第 " << f << " 帧（槽 " << slot_now << "）：提交后本帧槽的退休栈是**空的**，"
+           "说明本帧绑定的缓冲没有被 `vulkan_render_device.cpp:837-849` 接管。"
+           "那么下面这行 evil.reset() 就是在 GPU 可能仍在读时调用 vkDestroyBuffer —— "
+           "这正是 t22 要消灭的 use-after-free，保护链没有接线";
+
+    // ★ 提交之后、GPU 可能仍在读时销毁。
+    evil.reset();
+  }
+
+  const std::uint32_t after = device->validation_error_count();
+  // 校验层报错数只作为**附加**观测，**不是**判据（判据是上面的退休栈断言）。
+  //
+  // 实测：SwiftShader 对"销毁在飞缓冲"给出 0 条 ERROR（before=0 after=0）。
+  // 所以">=before"在本仓是**常态**，不是异常 —— 这里只在**真报了错**时提示一句
+  // （说明这台设备比预期更能查，是好消息），其余情况保持安静，避免每次健康跑批
+  // 都往 stderr 吐一行会被误当成失败的噪音。
+  if (after > before) {
+    std::cerr << "[负控观测] 本设备对\"销毁在飞缓冲\"报出 " << (after - before)
+              << " 条校验层 ERROR（校验层共 " << after << " 条）。"
+                 "这不影响本用例结论 —— 判据是退休栈票据，不是 VUID 条数。\n";
   }
 }

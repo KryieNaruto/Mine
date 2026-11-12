@@ -15,6 +15,8 @@
 #include <cstring>
 
 #include "backend/vulkan/vulkan_resource_common.h"
+// 析构里的"从设备反查表摘掉自己"需要 VulkanRenderDevice 的完整定义(见 ~VulkanCubeMap)。
+#include "backend/vulkan/vulkan_render_device.h"
 
 namespace magicblocks::backend {
 
@@ -44,6 +46,12 @@ VulkanCubeMap::VulkanCubeMap(const VulkanContext& ctx, resources::IMemoryAllocat
     : ctx_(ctx), has_ctx_(true), allocator_(allocator), desc_(desc) {}
 
 VulkanCubeMap::~VulkanCubeMap() {
+  // 先从设备的 known_cubes_ 里摘掉自己(裸指针表,ResourceId 会被复用)。
+  // 理由见 ~VulkanBuffer 的同一段注释。设备先于资源析构时 owner 为 nullptr。
+  if (auto* paging = dynamic_cast<VulkanPagingAllocator*>(allocator_)) {
+    auto* owner = static_cast<VulkanRenderDevice*>(paging->owner_device());
+    if (owner != nullptr) owner->forget_known_cube_map(this);
+  }
   if (ctx_.device != VK_NULL_HANDLE) {
     if (vk_view_ != VK_NULL_HANDLE) vkDestroyImageView(ctx_.device, vk_view_, nullptr);
     if (vk_image_ != VK_NULL_HANDLE) vkDestroyImage(ctx_.device, vk_image_, nullptr);
